@@ -2,6 +2,7 @@ import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { createSignal, onMount, Show } from "solid-js";
 import AiChat from "./AiChat";
+import GitPanel from "./GitPanel";
 
 import "./App.css";
 
@@ -107,7 +108,7 @@ export default function App() {
         </div>
       </div>
 
-      {/* Right Panel: Chat Interface */}
+      {/* Center Panel: Chat Interface */}
       <div class="flex-1 flex flex-col min-w-0">
         <Show when={appState() !== "ready"}>
           <div class="flex flex-col items-center justify-center h-full">
@@ -125,6 +126,11 @@ export default function App() {
           <AiChat session={activeSession()!} />
         </Show>
       </div>
+
+      {/* Right Panel: Git File State */}
+      <Show when={activeSession()?.workspace_path}>
+        {(path) => <GitPanel workspacePath={path()} />}
+      </Show>
     </div>
   );
 }

@@ -8,7 +8,8 @@ mod codegraph;
 mod conversation_store;
 mod engine;
 mod agent;
-mod indexer; // Declare the new indexer module
+mod indexer;
+mod git_api;
 
 #[derive(Debug)]
 pub struct AppError(anyhow::Error);
@@ -128,7 +129,9 @@ pub fn run() {
             get_ai_connection,
             create_session,
             get_session_details,
-            agent::prompt_agent
+            agent::prompt_agent,
+            git_api::get_git_status,
+            git_api::get_git_diff
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
