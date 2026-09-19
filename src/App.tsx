@@ -1,51 +1,58 @@
-import { createSignal } from "solid-js";
-import logo from "./assets/logo.svg";
-import { invoke } from "@tauri-apps/api/core";
-import "./App.css";
+import { listen } from '@tauri-apps/api/event';
+import { invoke } from '@tauri-apps/api/core';
+import { createSignal, onMount, Show } from 'solid-js';
+import AiChat from './AiChat';
 
-function App() {
-  const [greetMsg, setGreetMsg] = createSignal("");
-  const [name, setName] = createSignal("");
-
-  async function greet() {
-    // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-    setGreetMsg(await invoke("greet", { name: name() }));
-  }
-
-  return (
-    <main class="container">
-      <h1>Welcome to Tauri + Solid</h1>
-
-      <div class="row">
-        <a href="https://vite.dev" target="_blank">
-          <img src="/vite.svg" class="logo vite" alt="Vite logo" />
-        </a>
-        <a href="https://tauri.app" target="_blank">
-          <img src="/tauri.svg" class="logo tauri" alt="Tauri logo" />
-        </a>
-        <a href="https://solidjs.com" target="_blank">
-          <img src={logo} class="logo solid" alt="Solid logo" />
-        </a>
-      </div>
-      <p>Click on the Tauri, Vite, and Solid logos to learn more.</p>
-
-      <form
-        class="row"
-        onSubmit={(e) => {
-          e.preventDefault();
-          greet();
-        }}
-      >
-        <input
-          id="greet-input"
-          onChange={(e) => setName(e.currentTarget.value)}
-          placeholder="Enter a name..."
-        />
-        <button type="submit">Greet</button>
-      </form>
-      <p>{greetMsg()}</p>
-    </main>
-  );
+interface AiConnectionDetails {
+  state: string;
+  port: number;
+  api_key: string;
 }
 
-export default App;
+export default function App() {
+  const [appState, setAppState] = createSignal("booting");
+  const [connDetails, setConnDetails] = createSignal<AiConnectionDetails | null>(null);
+
+  const fetchConnectionDetails = async () => {
+    // Calls the Rust #[tauri::command] fn get_ai_connection
+    const details = await invoke<AiConnectionDetails | null>("get_ai_connection");
+    if (details) {
+      setConnDetails(details);
+      setAppState(details.state);
+    }
+  };
+
+  onMount(async () => {
+    // 1. Listen for state changes. The payload from Rust is a lowercase string.
+    await listen<string>("ai-state", async (event) => {
+      const newState = event.payload;
+      setAppState(newState);
+      
+      if (newState === "ready") {
+        await fetchConnectionDetails();
+      }
+    });
+
+    // 2. Fetch immediately in case we missed the 'ready' event during startup
+    await fetchConnectionDetails();
+  });
+
+  return (
+    <div class="h-screen w-full bg-gray-900 text-white overflow-hidden">
+      
+      <Show when={appState() !== "ready"}>
+        <div class="flex flex-col items-center justify-center h-full">
+          <h1 class="text-xl font-medium animate-pulse">Initializing Local AI...</h1>
+          <Show when={appState() === "failed"}>
+            <p class="text-red-400 mt-2">Failed to start AI engine.</p>
+          </Show>
+        </div>
+      </Show>
+
+      <Show when={appState() === "ready" && connDetails() !== null}>
+        <AiChat connDetails={connDetails()!} />
+      </Show>
+      
+    </div>
+  );
+}
