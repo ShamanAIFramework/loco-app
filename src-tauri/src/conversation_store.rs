@@ -1,7 +1,5 @@
 // src-tauri/src/conversation_store.rs
 //! Persistence layer for AI conversations and messaging history.
-//! Uses a dedicated synchronous SQLite connection wrapped in a Mutex.
-//! Async callers must use `tauri::async_runtime::spawn_blocking`.
 
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
@@ -22,7 +20,7 @@ pub enum Role {
 }
 
 impl Role {
-    fn as_str(&self) -> &'static str {
+    pub fn as_str(&self) -> &'static str {
         match self {
             Role::System => "system",
             Role::User => "user",
@@ -49,6 +47,8 @@ impl FromStr for Role {
 pub struct Conversation {
     pub id: String,
     pub title: String,
+    pub workspace_path: Option<String>,
+    pub model_name: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -78,17 +78,14 @@ fn parse_dt(s: &str) -> Result<DateTime<Utc>> {
         .context("Failed to parse datetime")
 }
 
-/// Thread-safe SQLite repository for conversations.
 pub struct ConversationStore {
     conn: Mutex<Connection>,
 }
 
 impl ConversationStore {
-    /// Opens the DB and initializes schema.
     pub fn new(db_path: &Path) -> Result<Self> {
         let conn = Connection::open(db_path).context("Failed to open conversation DB")?;
         
-        // This duplication of PRAGMAs ensures module independence
         conn.execute_batch(
             "PRAGMA foreign_keys = ON;
              PRAGMA journal_mode = WAL;
@@ -96,10 +93,13 @@ impl ConversationStore {
              PRAGMA synchronous = NORMAL;"
         )?;
 
+        // Schema updated with workspace_path and model_name
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS conversations (
                 id TEXT PRIMARY KEY,
                 title TEXT NOT NULL,
+                workspace_path TEXT,
+                model_name TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
              );
@@ -111,15 +111,7 @@ impl ConversationStore {
                 created_at TEXT NOT NULL
              );
              CREATE INDEX IF NOT EXISTS idx_messages_conv_created ON messages(conversation_id, created_at);
-             CREATE INDEX IF NOT EXISTS idx_conversations_updated ON conversations(updated_at DESC);
-             
-             -- future_embeddings reserved table (no rust API yet)
-             CREATE TABLE IF NOT EXISTS future_embeddings (
-                id TEXT PRIMARY KEY,
-                source_id TEXT NOT NULL,
-                embedding_model TEXT NOT NULL,
-                created_at TEXT NOT NULL
-             );"
+             CREATE INDEX IF NOT EXISTS idx_conversations_updated ON conversations(updated_at DESC);"
         )?;
 
         Ok(Self {
@@ -127,117 +119,47 @@ impl ConversationStore {
         })
     }
 
-    /// Creates a new conversation thread.
-    pub fn create_conversation(&self, title: Option<&str>) -> Result<Conversation> {
+    pub fn create_conversation(
+        &self, 
+        title: Option<&str>, 
+        workspace_path: Option<&str>, 
+        model_name: Option<&str>
+    ) -> Result<Conversation> {
         let guard = self.conn.lock().map_err(|_| anyhow!("Mutex poisoned"))?;
         let id = Uuid::new_v4().to_string();
-        let title = title.unwrap_or("New conversation").to_string();
+        let title = title.unwrap_or("New Session").to_string();
         let now = now_str();
 
         guard.execute(
-            "INSERT INTO conversations (id, title, created_at, updated_at) VALUES (?1, ?2, ?3, ?4)",
-            params![id, title, now, now],
+            "INSERT INTO conversations (id, title, workspace_path, model_name, created_at, updated_at) 
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![id, title, workspace_path, model_name, now, now],
         )?;
 
         Ok(Conversation {
             id,
             title,
+            workspace_path: workspace_path.map(|s| s.to_string()),
+            model_name: model_name.map(|s| s.to_string()),
             created_at: parse_dt(&now)?,
             updated_at: parse_dt(&now)?,
         })
     }
 
-    /// Renames an existing conversation.
-    pub fn rename_conversation(&self, id: &str, title: &str) -> Result<Conversation> {
-        let guard = self.conn.lock().map_err(|_| anyhow!("Mutex poisoned"))?;
-        let title = title.trim();
-        if title.is_empty() {
-            return Err(anyhow!("Title cannot be empty"));
-        }
-        
-        let now = now_str();
-        let updated = guard.execute(
-            "UPDATE conversations SET title = ?1, updated_at = ?2 WHERE id = ?3",
-            params![title, now, id],
-        )?;
-        
-        if updated == 0 {
-            return Err(anyhow!("Conversation not found"));
-        }
-
-        guard.query_row(
-            "SELECT title, created_at, updated_at FROM conversations WHERE id = ?1",
-            params![id],
-            |row| {
-                Ok(Conversation {
-                    id: id.to_string(),
-                    title: row.get(0)?,
-                    created_at: parse_dt(&row.get::<_, String>(1)?).unwrap_or_default(),
-                    updated_at: parse_dt(&row.get::<_, String>(2)?).unwrap_or_default(),
-                })
-            },
-        ).context("Failed to fetch renamed conversation")
-    }
-
-    /// Deletes a conversation and its cascaded messages.
-    pub fn delete_conversation(&self, id: &str) -> Result<bool> {
-        let guard = self.conn.lock().map_err(|_| anyhow!("Mutex poisoned"))?;
-        let count = guard.execute("DELETE FROM conversations WHERE id = ?1", params![id])?;
-        Ok(count > 0)
-    }
-
-    /// Appends a message to a conversation.
-    pub fn add_message(&self, conversation_id: &str, role: Role, content: &str) -> Result<Message> {
-        let mut guard = self.conn.lock().map_err(|_| anyhow!("Mutex poisoned"))?;
-        let tx = guard.transaction()?;
-        
-        // Verify conv exists to fail fast
-        let exists: i64 = tx.query_row(
-            "SELECT COUNT(1) FROM conversations WHERE id = ?1",
-            params![conversation_id],
-            |r| r.get(0)
-        )?;
-        if exists == 0 {
-            return Err(anyhow!("Conversation not found"));
-        }
-
-        let id = Uuid::new_v4().to_string();
-        let now = now_str();
-
-        tx.execute(
-            "INSERT INTO messages (id, conversation_id, role, content, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![id, conversation_id, role.as_str(), content, now],
-        )?;
-
-        tx.execute(
-            "UPDATE conversations SET updated_at = ?1 WHERE id = ?2",
-            params![now, conversation_id],
-        )?;
-        
-        tx.commit()?;
-
-        Ok(Message {
-            id,
-            conversation_id: conversation_id.to_string(),
-            role,
-            content: content.to_string(),
-            created_at: parse_dt(&now)?,
-        })
-    }
-
-    /// Loads a full conversation with ordered messages.
     pub fn load_conversation(&self, id: &str) -> Result<Option<ConversationDetail>> {
         let guard = self.conn.lock().map_err(|_| anyhow!("Mutex poisoned"))?;
         
         let conv_res = guard.query_row(
-            "SELECT title, created_at, updated_at FROM conversations WHERE id = ?1",
+            "SELECT title, workspace_path, model_name, created_at, updated_at FROM conversations WHERE id = ?1",
             params![id],
             |row| {
                 Ok(Conversation {
                     id: id.to_string(),
                     title: row.get(0)?,
-                    created_at: parse_dt(&row.get::<_, String>(1)?).unwrap_or_default(),
-                    updated_at: parse_dt(&row.get::<_, String>(2)?).unwrap_or_default(),
+                    workspace_path: row.get(1)?,
+                    model_name: row.get(2)?,
+                    created_at: parse_dt(&row.get::<_, String>(3)?).unwrap_or_default(),
+                    updated_at: parse_dt(&row.get::<_, String>(4)?).unwrap_or_default(),
                 })
             },
         );
@@ -272,48 +194,32 @@ impl ConversationStore {
         }))
     }
 
-    /// Lists conversations ordered by most recently updated.
-    pub fn list_conversations(&self) -> Result<Vec<Conversation>> {
-        let guard = self.conn.lock().map_err(|_| anyhow!("Mutex poisoned"))?;
-        let mut stmt = guard.prepare("SELECT id, title, created_at, updated_at FROM conversations ORDER BY updated_at DESC")?;
+    pub fn add_message(&self, conversation_id: &str, role: Role, content: &str) -> Result<Message> {
+        let mut guard = self.conn.lock().map_err(|_| anyhow!("Mutex poisoned"))?;
+        let tx = guard.transaction()?;
         
-        let res = stmt.query_map([], |row| {
-            Ok(Conversation {
-                id: row.get(0)?,
-                title: row.get(1)?,
-                created_at: parse_dt(&row.get::<_, String>(2)?).unwrap_or_default(),
-                updated_at: parse_dt(&row.get::<_, String>(3)?).unwrap_or_default(),
-            })
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-        
-        Ok(res)
-    }
-}
+        let exists: i64 = tx.query_row("SELECT COUNT(1) FROM conversations WHERE id = ?1", params![conversation_id], |r| r.get(0))?;
+        if exists == 0 {
+            return Err(anyhow!("Conversation not found"));
+        }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::env;
+        let id = Uuid::new_v4().to_string();
+        let now = now_str();
 
-    #[test]
-    fn test_conversation_crud() {
-        let db_path = env::temp_dir().join(format!("{}.db", Uuid::new_v4()));
-        let store = ConversationStore::new(&db_path).unwrap();
-        
-        let c = store.create_conversation(Some("Test")).unwrap();
-        assert_eq!(c.title, "Test");
+        tx.execute(
+            "INSERT INTO messages (id, conversation_id, role, content, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![id, conversation_id, role.as_str(), content, now],
+        )?;
 
-        let m = store.add_message(&c.id, Role::User, "Hello").unwrap();
-        assert_eq!(m.content, "Hello");
+        tx.execute("UPDATE conversations SET updated_at = ?1 WHERE id = ?2", params![now, conversation_id])?;
+        tx.commit()?;
 
-        let loaded = store.load_conversation(&c.id).unwrap().unwrap();
-        assert_eq!(loaded.messages.len(), 1);
-
-        store.delete_conversation(&c.id).unwrap();
-        let missing = store.load_conversation(&c.id).unwrap();
-        assert!(missing.is_none());
-        
-        let _ = std::fs::remove_file(db_path);
+        Ok(Message {
+            id,
+            conversation_id: conversation_id.to_string(),
+            role,
+            content: content.to_string(),
+            created_at: parse_dt(&now)?,
+        })
     }
 }

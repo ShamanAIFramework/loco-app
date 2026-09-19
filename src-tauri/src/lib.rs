@@ -3,12 +3,12 @@
 //! Coordinates initialization, state management, and exposes commands to the frontend.
 
 use anyhow::Context;
-use std::path::PathBuf;
 use tauri::Manager;
 
 mod codegraph;
 mod conversation_store;
 mod engine;
+mod agent;
 
 /// Wrapper for anyhow::Error to allow returning it via Tauri commands.
 #[derive(Debug)]
@@ -23,9 +23,10 @@ impl serde::Serialize for AppError {
     }
 }
 
-impl<E: Into<anyhow::Error>> From<E> for AppError {
-    fn from(err: E) -> Self {
-        Self(err.into())
+// FIX: Direct implementation avoids E0119 trait conflict errors
+impl From<anyhow::Error> for AppError {
+    fn from(err: anyhow::Error) -> Self {
+        Self(err)
     }
 }
 
@@ -45,6 +46,47 @@ fn get_ai_connection(
     state: tauri::State<'_, engine::EngineState>,
 ) -> Option<engine::AiConnectionDetails> {
     state.connection_details()
+}
+
+// FIX: Use AppHandle instead of State to allow moving into a 'static blocking thread
+#[tauri::command]
+async fn create_session(
+    app: tauri::AppHandle,
+    workspace_path: Option<String>,
+) -> Result<conversation_store::Conversation, AppError> {
+    let path = workspace_path.clone();
+    
+    let app_clone = app.clone();
+    let conv = tauri::async_runtime::spawn_blocking(move || {
+        let state = app_clone.state::<AppState>();
+        state.conversations.create_conversation(
+            Some("Active Workspace"), 
+            path.as_deref(), 
+            Some("Qwen2.5-Coder")
+        )
+    })
+    .await
+    .context("Failed to join blocking task")??; // FIX: Bubble up thread JoinErrors securely
+    
+    Ok(conv)
+}
+
+// FIX: Use AppHandle instead of State
+#[tauri::command]
+async fn get_session_details(
+    app: tauri::AppHandle,
+    session_id: String,
+) -> Result<Option<conversation_store::ConversationDetail>, AppError> {
+    
+    let app_clone = app.clone();
+    let detail = tauri::async_runtime::spawn_blocking(move || {
+        let state = app_clone.state::<AppState>();
+        state.conversations.load_conversation(&session_id)
+    })
+    .await
+    .context("Failed to join blocking task")??;
+    
+    Ok(detail)
 }
 
 /// Main entry point for the Tauri application.
@@ -82,7 +124,13 @@ pub fn run() {
 
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![greet, get_ai_connection])
+        .invoke_handler(tauri::generate_handler![
+            greet,
+            get_ai_connection,
+            create_session,
+            get_session_details,
+            agent::prompt_agent
+        ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app, event| {

@@ -1,22 +1,13 @@
-import { createSignal, createEffect, Show, onCleanup } from "solid-js";
-import { fetch } from "@tauri-apps/plugin-http";
-import AIConversation from "./AIConversation";
+import { createSignal, createEffect, onCleanup, Show } from "solid-js";
+import { invoke, Channel } from "@tauri-apps/api/core";
+import AIConversation, { Message } from "./AIConversation";
+import { SessionDetails } from "./App";
 
-interface Message {
-  role: "user" | "assistant" | "system";
-  content: string;
+interface AiChatProps {
+  session: SessionDetails;
 }
 
-interface AiConnectionDetails {
-  state: string;
-  port: number;
-  api_key: string;
-}
-
-const MAX_HISTORY_MESSAGES = 12;
-const STREAM_FLUSH_MS = 50;
-
-export default function AiChat(props: { connDetails: AiConnectionDetails }) {
+export default function AiChat(props: AiChatProps) {
   const [messages, setMessages] = createSignal<Message[]>([
     {
       role: "system",
@@ -26,31 +17,16 @@ export default function AiChat(props: { connDetails: AiConnectionDetails }) {
 
   const [input, setInput] = createSignal("");
   const [isGenerating, setIsGenerating] = createSignal(false);
-
-  const [showDebug, setShowDebug] = createSignal(false);
-  const [debugPaused, setDebugPaused] = createSignal(false);
-
   let chatContainerRef: HTMLDivElement | undefined;
-
   let scrollPending = false;
-  let stopRequested = false;
-
-  const addDebug = (value: unknown) => {
-    if (debugPaused()) return;
-
-    console.log("REQUEST", JSON.stringify(value, null, 2));
-  };
 
   const scheduleScroll = () => {
     if (scrollPending) return;
-
     scrollPending = true;
-
     requestAnimationFrame(() => {
       if (chatContainerRef) {
         chatContainerRef.scrollTop = chatContainerRef.scrollHeight;
       }
-
       scrollPending = false;
     });
   };
@@ -62,255 +38,65 @@ export default function AiChat(props: { connDetails: AiConnectionDetails }) {
 
   onCleanup(() => {
     scrollPending = false;
-    stopRequested = true;
   });
-
-  function getConversationWindow(history: Message[]): Message[] {
-    return history.slice(-MAX_HISTORY_MESSAGES);
-  }
 
   async function handleSubmit(e?: Event) {
     e?.preventDefault();
-
     const currentInput = input().trim();
+    if (!currentInput || isGenerating()) return;
 
-    if (!currentInput || isGenerating()) {
-      return;
-    }
-
-    stopRequested = false;
-
-    const userMessage: Message = {
-      role: "user",
-      content: currentInput,
-    };
-
-    const updatedMessages = [...messages(), userMessage];
-
-    setMessages(updatedMessages);
+    // 1. Instantly append user message to UI
+    setMessages((prev) => [...prev, { role: "user", content: currentInput }]);
     setInput("");
     setIsGenerating(true);
 
-    addDebug("===== NEW REQUEST =====");
-
-    let isContinuing = false;
-    let continueCount = 0;
-    const MAX_CONTINUES = 5; // Safety ceiling to prevent infinite loops
+    // 2. Create empty assistant bubble
+    setMessages((prev) => [...prev, { role: "assistant", content: "" }]);
 
     try {
-      while (!stopRequested) {
-        let finishReason: string | null = null;
+      // 3. Create a Tauri IPC Channel to receive the stream
+      const onChunk = new Channel<string>();
 
-        // On continuation, pass the current history + a silent continuation instruction
-        const payloadMessages = !isContinuing
-          ? getConversationWindow(updatedMessages)
-          : getConversationWindow([
-              ...messages(),
-              {
-                role: "user",
-                content:
-                  "Continue generating exactly where you left off. Do not repeat any code or text, do not add conversational commentary, and do not repeat markdown code fences if already open. Continue directly with the next characters.",
-              },
-            ]);
-
-        const payload = {
-          model: "default",
-          messages: payloadMessages,
-          temperature: 0.1,
-          max_tokens: -1,
-          stream: true,
-        };
-
-        addDebug({
-          request: payload,
-          isContinuing,
-          continueCount,
+      onChunk.onmessage = (chunk: string) => {
+        setMessages((prev) => {
+          const updated = [...prev];
+          const lastIndex = updated.length - 1;
+          if (lastIndex >= 0 && updated[lastIndex].role === "assistant") {
+            updated[lastIndex] = {
+              ...updated[lastIndex],
+              content: updated[lastIndex].content + chunk,
+            };
+          }
+          return updated;
         });
+      };
 
-        const response = await fetch(
-          `http://127.0.0.1:${props.connDetails.port}/v1/chat/completions`,
-          {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              Authorization: `Bearer ${props.connDetails.api_key}`,
-            },
-            body: JSON.stringify(payload),
-          },
-        );
-
-        if (!response.ok) {
-          throw new Error(`HTTP error! status: ${response.status}`);
-        }
-
-        if (!response.body) {
-          throw new Error("No response body returned.");
-        }
-
-        // Only create a new assistant message bubble on the FIRST chunk
-        if (!isContinuing) {
-          setMessages((prev) => [
-            ...prev,
-            {
-              role: "assistant",
-              content: "",
-            },
-          ]);
-        }
-
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder();
-
-        let assistantBuffer = "";
-        let partialData = "";
-
-        const flushBuffer = () => {
-          if (!assistantBuffer) return;
-
-          const chunk = assistantBuffer;
-          assistantBuffer = "";
-
-          // Appends directly to the latest assistant message (works for continuations too)
-          setMessages((prev) => {
-            const updated = [...prev];
-            const lastIndex = updated.length - 1;
-
-            if (lastIndex >= 0 && updated[lastIndex].role === "assistant") {
-              updated[lastIndex] = {
-                ...updated[lastIndex],
-                content: updated[lastIndex].content + chunk,
-              };
-            }
-
-            return updated;
-          });
-        };
-
-        const flushTimer = setInterval(flushBuffer, STREAM_FLUSH_MS);
-
-        try {
-          while (true) {
-            if (stopRequested) {
-              addDebug("STREAM STOPPED BY USER");
-              break;
-            }
-
-            const { done, value } = await reader.read();
-
-            if (done) {
-              addDebug("STREAM COMPLETE");
-              break;
-            }
-
-            const chunk = decoder.decode(value, { stream: true });
-            partialData += chunk;
-
-            const events = partialData.split("\n\n");
-            partialData = events.pop() ?? "";
-
-            for (const event of events) {
-              if (stopRequested) break;
-
-              const lines = event.split("\n");
-
-              for (const line of lines) {
-                const trimmed = line.trim();
-
-                if (!trimmed.startsWith("data:")) continue;
-
-                const dataString = trimmed.slice(5).trim();
-
-                if (!dataString || dataString === "[DONE]") continue;
-
-                try {
-                  const data = JSON.parse(dataString);
-                  const choice = data?.choices?.[0];
-
-                  // 1. CAPTURE FINISH REASON
-                  if (choice?.finish_reason) {
-                    finishReason = choice.finish_reason;
-                  }
-
-                  if (choice?.delta?.tool_calls) {
-                    addDebug({ tool_calls: choice.delta.tool_calls });
-                  }
-
-                  if (choice?.delta?.function_call) {
-                    addDebug({ function_call: choice.delta.function_call });
-                  }
-
-                  const text = choice?.delta?.content ?? choice?.text ?? "";
-
-                  if (typeof text === "string" && text.length > 0) {
-                    assistantBuffer += text;
-                  }
-                } catch (err) {
-                  addDebug({
-                    parse_error: String(err),
-                    raw: dataString,
-                  });
-                }
-              }
-            }
-          }
-        } finally {
-          clearInterval(flushTimer);
-          flushBuffer();
-
-          try {
-            reader.releaseLock();
-          } catch {
-            // ignore
-          }
-        }
-
-        // 2. CHECK IF WE SHOULD LOOP OR STOP
-        if (
-          finishReason === "length" &&
-          !stopRequested &&
-          continueCount < MAX_CONTINUES
-        ) {
-          continueCount++;
-          isContinuing = true;
-          addDebug(
-            `Hit length limit. Triggering auto-continue (${continueCount}/${MAX_CONTINUES})...`,
-          );
-        } else {
-          // Finished naturally with "stop" or stopped by user
-          break;
-        }
-      }
+      // 4. Invoke the Rust brain!
+      await invoke("prompt_agent", {
+        sessionId: props.session.id,
+        question: currentInput,
+        onChunk: onChunk,
+      });
     } catch (error) {
       console.error("Inference Error:", error);
-
-      addDebug({
-        inference_error: String(error),
-      });
-
       setMessages((prev) => [
         ...prev,
         {
           role: "assistant",
-          content: "**Error:** Failed to reach the local engine.",
+          content: "**Error:** Failed to execute request via local engine.",
         },
       ]);
     } finally {
       setIsGenerating(false);
-      stopRequested = false;
     }
   }
 
-  const stopGeneration = () => {
-    stopRequested = true;
-    setIsGenerating(false);
-  };
-
   return (
-    <div class="flex flex-col h-full w-full max-w-4xl mx-auto bg-gray-900 border-x border-gray-800">
-      <div class="flex items-center justify-between p-4 border-b border-gray-800 bg-gray-900/95 sticky top-0">
-        <h2 class="text-sm font-semibold text-gray-200">Local AI Session</h2>
-
-        <div class="flex items-center gap-2"></div>
+    <div class="flex flex-col h-full w-full max-w-4xl mx-auto bg-gray-950">
+      <div class="flex items-center justify-between p-4 border-b border-gray-800 bg-gray-950/95 sticky top-0 z-10">
+        <h2 class="text-sm font-semibold text-gray-200">
+          {props.session.title}
+        </h2>
       </div>
 
       <div
@@ -319,16 +105,25 @@ export default function AiChat(props: { connDetails: AiConnectionDetails }) {
       >
         <AIConversation messages={messages()} />
 
-        {/* Keep your loading indicator below the conversation */}
         <Show when={isGenerating()}>
           <div class="flex justify-start px-4">
-            {/* ... your bouncing dots loader ... */}
+            <div class="bg-gray-800 border border-gray-700 rounded-2xl rounded-bl-sm px-5 py-3 flex items-center gap-1">
+              <span class="w-1.5 h-1.5 bg-gray-500 rounded-full animate-bounce"></span>
+              <span
+                class="w-1.5 h-1.5 bg-gray-500 rounded-full animate-bounce"
+                style="animation-delay:150ms"
+              ></span>
+              <span
+                class="w-1.5 h-1.5 bg-gray-500 rounded-full animate-bounce"
+                style="animation-delay:300ms"
+              ></span>
+            </div>
           </div>
         </Show>
       </div>
 
-      <div class="p-4 bg-gray-900 border-t border-gray-800">
-        <form onSubmit={handleSubmit} class="relative">
+      <div class="p-4 bg-gray-950 border-t border-gray-800">
+        <form onSubmit={handleSubmit} class="relative max-w-3xl mx-auto">
           <textarea
             value={input()}
             onInput={(e) => setInput(e.currentTarget.value)}
@@ -338,33 +133,35 @@ export default function AiChat(props: { connDetails: AiConnectionDetails }) {
                 handleSubmit();
               }
             }}
-            placeholder=""
-            class="w-full bg-gray-800 border border-gray-700 text-gray-100 rounded-xl px-4 py-3 pr-14 focus:outline-none focus:ring-1 focus:ring-blue-500 resize-none"
+            placeholder="Ask about your codebase..."
+            class="w-full bg-gray-900 border border-gray-700 text-gray-100 rounded-xl px-4 py-3 pr-14 focus:outline-none focus:border-gray-500 resize-none shadow-inner"
             rows="1"
             disabled={isGenerating()}
           />
 
-          <Show
-            when={!isGenerating()}
-            fallback={
-              <button
-                type="button"
-                onClick={stopGeneration}
-                class="absolute right-2 bottom-2 px-3 py-1 rounded bg-red-600 text-white text-xs"
-              >
-                Stop
-              </button>
-            }
+          <button
+            type="submit"
+            disabled={!input().trim() || isGenerating()}
+            class="absolute right-2 bottom-2 p-2 text-gray-400 hover:text-gray-200 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
           >
-            <button
-              type="submit"
-              disabled={!input().trim()}
-              class="absolute right-0 bottom-2 p-2 text-gray-400 hover:text-blue-400 transition-colors"
+            <svg
+              xmlns="http://www.w3.org/2000/svg"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              class="w-5 h-5"
             >
-              Send
-            </button>
-          </Show>
+              <line x1="22" y1="2" x2="11" y2="13"></line>
+              <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+            </svg>
+          </button>
         </form>
+        <p class="text-center text-xs text-gray-600 mt-3">
+          Shift + Enter for newline.
+        </p>
       </div>
     </div>
   );
