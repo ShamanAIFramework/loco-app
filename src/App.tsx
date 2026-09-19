@@ -1,7 +1,9 @@
-import { listen } from '@tauri-apps/api/event';
-import { invoke } from '@tauri-apps/api/core';
-import { createSignal, onMount, Show } from 'solid-js';
-import AiChat from './AiChat';
+import { listen } from "@tauri-apps/api/event";
+import { invoke } from "@tauri-apps/api/core";
+import { createSignal, onMount, Show } from "solid-js";
+import AiChat from "./AiChat";
+
+import "./App.css";
 
 interface AiConnectionDetails {
   state: string;
@@ -11,11 +13,14 @@ interface AiConnectionDetails {
 
 export default function App() {
   const [appState, setAppState] = createSignal("booting");
-  const [connDetails, setConnDetails] = createSignal<AiConnectionDetails | null>(null);
+  const [connDetails, setConnDetails] =
+    createSignal<AiConnectionDetails | null>(null);
 
   const fetchConnectionDetails = async () => {
     // Calls the Rust #[tauri::command] fn get_ai_connection
-    const details = await invoke<AiConnectionDetails | null>("get_ai_connection");
+    const details = await invoke<AiConnectionDetails | null>(
+      "get_ai_connection",
+    );
     if (details) {
       setConnDetails(details);
       setAppState(details.state);
@@ -27,7 +32,7 @@ export default function App() {
     await listen<string>("ai-state", async (event) => {
       const newState = event.payload;
       setAppState(newState);
-      
+
       if (newState === "ready") {
         await fetchConnectionDetails();
       }
@@ -39,10 +44,11 @@ export default function App() {
 
   return (
     <div class="h-screen w-full bg-gray-900 text-white overflow-hidden">
-      
       <Show when={appState() !== "ready"}>
         <div class="flex flex-col items-center justify-center h-full">
-          <h1 class="text-xl font-medium animate-pulse">Initializing Local AI...</h1>
+          <h1 class="text-xl font-medium animate-pulse">
+            Initializing Local AI...
+          </h1>
           <Show when={appState() === "failed"}>
             <p class="text-red-400 mt-2">Failed to start AI engine.</p>
           </Show>
@@ -52,7 +58,6 @@ export default function App() {
       <Show when={appState() === "ready" && connDetails() !== null}>
         <AiChat connDetails={connDetails()!} />
       </Show>
-      
     </div>
   );
 }

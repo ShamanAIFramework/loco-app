@@ -310,18 +310,7 @@ export default function AiChat(props: { connDetails: AiConnectionDetails }) {
       <div class="flex items-center justify-between p-4 border-b border-gray-800 bg-gray-900/95 sticky top-0">
         <h2 class="text-sm font-semibold text-gray-200">Local AI Session</h2>
 
-        <div class="flex items-center gap-2">
-          <button
-            onClick={() => setShowDebug(!showDebug())}
-            class="text-xs px-2 py-1 rounded bg-gray-800 border border-gray-700 text-gray-300"
-          >
-            Debug
-          </button>
-
-          <span class="text-xs text-gray-500 font-mono">
-            Port: {props.connDetails.port}
-          </span>
-        </div>
+        <div class="flex items-center gap-2"></div>
       </div>
 
       <div
@@ -349,7 +338,7 @@ export default function AiChat(props: { connDetails: AiConnectionDetails }) {
                 handleSubmit();
               }
             }}
-            placeholder="Ask about your codebase..."
+            placeholder=""
             class="w-full bg-gray-800 border border-gray-700 text-gray-100 rounded-xl px-4 py-3 pr-14 focus:outline-none focus:ring-1 focus:ring-blue-500 resize-none"
             rows="1"
             disabled={isGenerating()}
@@ -370,16 +359,12 @@ export default function AiChat(props: { connDetails: AiConnectionDetails }) {
             <button
               type="submit"
               disabled={!input().trim()}
-              class="absolute right-2 bottom-2 p-2 text-gray-400 hover:text-blue-400 transition-colors"
+              class="absolute right-0 bottom-2 p-2 text-gray-400 hover:text-blue-400 transition-colors"
             >
               Send
             </button>
           </Show>
         </form>
-
-        <p class="text-center text-xs text-gray-500 mt-2">
-          Shift + Enter for newline. Debug panel captures raw SSE events.
-        </p>
       </div>
     </div>
   );

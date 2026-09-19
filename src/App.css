@@ -1,27 +1,47 @@
 @import "tailwindcss";
 @plugin "@tailwindcss/typography";
 
-.logo.vite:hover {
-  filter: drop-shadow(0 0 2em #747bff);
-}
-
-.logo.solid:hover {
-  filter: drop-shadow(0 0 2em #2f5d90);
-}
 :root {
+  --border-radius: 14px;
+  --box-padding: 4ch;
+  --box-gutter: 1ch;
+
+  --app-bg-color: #FFFFFF;
+  --app-text-color: #000000;
+
+  --code-bg-color: #000000;
+
   font-family: Inter, Avenir, Helvetica, Arial, sans-serif;
   font-size: 16px;
   line-height: 24px;
   font-weight: 400;
-
-  color: #0f0f0f;
-  background-color: #f6f6f6;
 
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
   -webkit-text-size-adjust: 100%;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+  --app-bg-color: #000;
+  --app-text-color: #FFF;
+
+  --code-bg-color: #999;
+  }
+}
+
+html {
+  background-color: var(--app-bg-color);
+}
+
+.logo.vite:hover {
+  filter: drop-shadow(0 0 2em #747bff);
+}
+
+.logo.solid:hover {
+  filter: drop-shadow(0 0 2em #2f5d90);
 }
 
 .container {
@@ -99,11 +119,6 @@ button {
 }
 
 @media (prefers-color-scheme: dark) {
-  :root {
-    color: #f6f6f6;
-    background-color: #2f2f2f;
-  }
-
   a:hover {
     color: #24c8db;
   }
