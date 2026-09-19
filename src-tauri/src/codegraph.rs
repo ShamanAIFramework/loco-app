@@ -258,6 +258,33 @@ impl CodeGraphStore {
         .collect::<Result<Vec<_>, _>>()?;
         Ok(res)
     }
+
+    /// Returns files matching the query snippet (path or filename).
+    pub fn search_files(&self, project_id: &str, query: &str) -> Result<Vec<SourceFile>> {
+        let guard = self.conn.lock().map_err(|_| anyhow::anyhow!("Mutex poisoned"))?;
+        
+        // Wrap the query in wildcards for substring matching
+        let like_query = format!("%{}%", query);
+        let mut stmt = guard.prepare(
+            "SELECT id, project_id, path, checksum, last_indexed 
+             FROM files 
+             WHERE project_id = ?1 AND path LIKE ?2 
+             ORDER BY path ASC LIMIT 20"
+        )?;
+        
+        let res = stmt.query_map(rusqlite::params![project_id, like_query], |row| {
+            Ok(SourceFile {
+                id: row.get(0)?,
+                project_id: row.get(1)?,
+                path: row.get(2)?,
+                checksum: row.get(3)?,
+                last_indexed: parse_opt_dt(row.get(4)?),
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+        
+        Ok(res)
+    }
 }
 
 #[cfg(test)]

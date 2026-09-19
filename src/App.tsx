@@ -37,9 +37,9 @@ export default function App() {
       // If the engine is ready, initialize our first workspace session
       if (details.state === "ready" && !activeSession()) {
         try {
-          // For now, we statically set the path. We will make this dynamic later.
+          // Replace this with your actual absolute path (e.g., "C:\\Users\\Matt\\projects\\loco" or "/home/matt/projects/loco")
           const session = await invoke<SessionDetails>("create_session", {
-            workspacePath: "/Users/matt/projects/loco",
+            workspacePath: "/Users/ruckus/workspace/loco/loco-app",
           });
           setActiveSession(session);
         } catch (e) {

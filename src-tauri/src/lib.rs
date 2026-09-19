@@ -1,6 +1,5 @@
 // src-tauri/src/lib.rs
 //! Main application module connecting the AI engine and local persistence stores.
-//! Coordinates initialization, state management, and exposes commands to the frontend.
 
 use anyhow::Context;
 use tauri::Manager;
@@ -9,8 +8,8 @@ mod codegraph;
 mod conversation_store;
 mod engine;
 mod agent;
+mod indexer; // Declare the new indexer module
 
-/// Wrapper for anyhow::Error to allow returning it via Tauri commands.
 #[derive(Debug)]
 pub struct AppError(anyhow::Error);
 
@@ -23,14 +22,12 @@ impl serde::Serialize for AppError {
     }
 }
 
-// FIX: Direct implementation avoids E0119 trait conflict errors
 impl From<anyhow::Error> for AppError {
     fn from(err: anyhow::Error) -> Self {
         Self(err)
     }
 }
 
-/// Global application state holding synchronous store instances.
 pub struct AppState {
     pub conversations: conversation_store::ConversationStore,
     pub codegraph: codegraph::CodeGraphStore,
@@ -48,17 +45,25 @@ fn get_ai_connection(
     state.connection_details()
 }
 
-// FIX: Use AppHandle instead of State to allow moving into a 'static blocking thread
 #[tauri::command]
 async fn create_session(
     app: tauri::AppHandle,
     workspace_path: Option<String>,
 ) -> Result<conversation_store::Conversation, AppError> {
     let path = workspace_path.clone();
-    
     let app_clone = app.clone();
+    
     let conv = tauri::async_runtime::spawn_blocking(move || {
         let state = app_clone.state::<AppState>();
+        
+        // If a path is provided, register the project and trigger the indexer immediately
+        if let Some(p) = &path {
+            let path_obj = std::path::Path::new(p);
+            if let Ok(project) = state.codegraph.register_project("Active Workspace", path_obj) {
+                let _ = crate::indexer::index_workspace(&state.codegraph, &project.id, path_obj);
+            }
+        }
+        
         state.conversations.create_conversation(
             Some("Active Workspace"), 
             path.as_deref(), 
@@ -66,18 +71,16 @@ async fn create_session(
         )
     })
     .await
-    .context("Failed to join blocking task")??; // FIX: Bubble up thread JoinErrors securely
+    .context("Failed to join blocking task")??;
     
     Ok(conv)
 }
 
-// FIX: Use AppHandle instead of State
 #[tauri::command]
 async fn get_session_details(
     app: tauri::AppHandle,
     session_id: String,
 ) -> Result<Option<conversation_store::ConversationDetail>, AppError> {
-    
     let app_clone = app.clone();
     let detail = tauri::async_runtime::spawn_blocking(move || {
         let state = app_clone.state::<AppState>();
@@ -89,7 +92,6 @@ async fn get_session_details(
     Ok(detail)
 }
 
-/// Main entry point for the Tauri application.
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -100,14 +102,12 @@ pub fn run() {
         .setup(|app| {
             let app_handle = app.handle().clone();
 
-            // Set up local database directory
             let home_dir = dirs::home_dir().context("Could not determine home directory")?;
             let db_dir = home_dir.join(".loco");
             std::fs::create_dir_all(&db_dir)
                 .context("Failed to create application data directory")?;
             let db_path = db_dir.join("loco.db");
 
-            // Initialize stores
             let conversations = conversation_store::ConversationStore::new(&db_path)
                 .context("Failed to initialize conversation store")?;
             let codegraph = codegraph::CodeGraphStore::new(&db_path)
@@ -118,7 +118,6 @@ pub fn run() {
                 codegraph,
             });
 
-            // Initialize Engine
             app.manage(engine::EngineState::new());
             engine::initialize(app_handle);
 

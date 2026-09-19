@@ -7,6 +7,12 @@ interface AiChatProps {
   session: SessionDetails;
 }
 
+// Define the structured event we expect from Rust
+interface AgentEvent {
+  type: "Status" | "Chunk";
+  data: string;
+}
+
 export default function AiChat(props: AiChatProps) {
   const [messages, setMessages] = createSignal<Message[]>([
     {
@@ -17,6 +23,8 @@ export default function AiChat(props: AiChatProps) {
 
   const [input, setInput] = createSignal("");
   const [isGenerating, setIsGenerating] = createSignal(false);
+  const [activeStatus, setActiveStatus] = createSignal<string | null>(null);
+
   let chatContainerRef: HTMLDivElement | undefined;
   let scrollPending = false;
 
@@ -33,6 +41,7 @@ export default function AiChat(props: AiChatProps) {
 
   createEffect(() => {
     messages();
+    activeStatus(); // Also scroll if the status pill changes
     scheduleScroll();
   });
 
@@ -49,29 +58,38 @@ export default function AiChat(props: AiChatProps) {
     setMessages((prev) => [...prev, { role: "user", content: currentInput }]);
     setInput("");
     setIsGenerating(true);
+    setActiveStatus("Thinking..."); // Initial status before stream begins
 
     // 2. Create empty assistant bubble
     setMessages((prev) => [...prev, { role: "assistant", content: "" }]);
 
     try {
-      // 3. Create a Tauri IPC Channel to receive the stream
-      const onChunk = new Channel<string>();
+      // 3. Create a Tauri IPC Channel expecting our typed event
+      const onChunk = new Channel<AgentEvent>();
 
-      onChunk.onmessage = (chunk: string) => {
-        setMessages((prev) => {
-          const updated = [...prev];
-          const lastIndex = updated.length - 1;
-          if (lastIndex >= 0 && updated[lastIndex].role === "assistant") {
-            updated[lastIndex] = {
-              ...updated[lastIndex],
-              content: updated[lastIndex].content + chunk,
-            };
-          }
-          return updated;
-        });
+      onChunk.onmessage = (event: AgentEvent) => {
+        if (event.type === "Status") {
+          // Update the status pill for tool execution
+          setActiveStatus(event.data);
+        } else if (event.type === "Chunk") {
+          // As soon as real text arrives, clear the status pill
+          if (activeStatus()) setActiveStatus(null);
+
+          setMessages((prev) => {
+            const updated = [...prev];
+            const lastIndex = updated.length - 1;
+            if (lastIndex >= 0 && updated[lastIndex].role === "assistant") {
+              updated[lastIndex] = {
+                ...updated[lastIndex],
+                content: updated[lastIndex].content + event.data,
+              };
+            }
+            return updated;
+          });
+        }
       };
 
-      // 4. Invoke the Rust brain!
+      // 4. Invoke the Rust brain
       await invoke("prompt_agent", {
         sessionId: props.session.id,
         question: currentInput,
@@ -88,6 +106,7 @@ export default function AiChat(props: AiChatProps) {
       ]);
     } finally {
       setIsGenerating(false);
+      setActiveStatus(null);
     }
   }
 
@@ -105,7 +124,24 @@ export default function AiChat(props: AiChatProps) {
       >
         <AIConversation messages={messages()} />
 
-        <Show when={isGenerating()}>
+        {/* Dynamic Status Pill for Tool Execution */}
+        <Show when={activeStatus()}>
+          <div class="flex justify-start px-4">
+            <div class="inline-flex items-center gap-2 px-3 py-1.5 rounded-full bg-gray-800/80 border border-gray-700 text-xs text-gray-400">
+              <span class="w-1.5 h-1.5 rounded-full bg-blue-400 animate-ping"></span>
+              <span>{activeStatus()}</span>
+            </div>
+          </div>
+        </Show>
+
+        {/* Default pulsing dots before stream begins (only if no status pill is showing) */}
+        <Show
+          when={
+            isGenerating() &&
+            !activeStatus() &&
+            messages()[messages().length - 1]?.content === ""
+          }
+        >
           <div class="flex justify-start px-4">
             <div class="bg-gray-800 border border-gray-700 rounded-2xl rounded-bl-sm px-5 py-3 flex items-center gap-1">
               <span class="w-1.5 h-1.5 bg-gray-500 rounded-full animate-bounce"></span>
