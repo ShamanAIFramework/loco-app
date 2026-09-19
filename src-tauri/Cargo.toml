@@ -35,6 +35,7 @@ anyhow = "1"
 dirs = "6"
 tauri-plugin-log = "2.9.1"
 log = "0.4.34"
+notify-debouncer-mini = "0.7.0"
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

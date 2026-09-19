@@ -251,7 +251,7 @@ pub async fn prompt_agent(
                     }
                 }));
                 
-                let mut result_str = String::new();
+                let result_str;
 
                 if tc.name == "search_files" {
                     let args: serde_json::Value = serde_json::from_str(&tc.arguments).unwrap_or(json!({}));

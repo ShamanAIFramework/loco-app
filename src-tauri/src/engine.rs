@@ -63,6 +63,7 @@ impl EngineState {
     }
 
     /// True if the engine is ready for inference.
+    #[allow(dead_code)]
     pub fn is_ready(&self) -> bool {
         let guard = match self.inner.lock() {
             Ok(g) => g,

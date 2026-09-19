@@ -3,6 +3,9 @@
 
 use anyhow::Context;
 use tauri::Manager;
+use notify_debouncer_mini::notify::RecommendedWatcher;
+use notify_debouncer_mini::Debouncer;
+use std::sync::Mutex;
 
 mod codegraph;
 mod conversation_store;
@@ -32,6 +35,7 @@ impl From<anyhow::Error> for AppError {
 pub struct AppState {
     pub conversations: conversation_store::ConversationStore,
     pub codegraph: codegraph::CodeGraphStore,
+    pub active_watcher: Mutex<Option<Debouncer<RecommendedWatcher>>>,
 }
 
 #[tauri::command]
@@ -61,7 +65,14 @@ async fn create_session(
         if let Some(p) = &path {
             let path_obj = std::path::Path::new(p);
             if let Ok(project) = state.codegraph.register_project("Active Workspace", path_obj) {
+                // 1. Do the initial full index
                 let _ = crate::indexer::index_workspace(&state.codegraph, &project.id, path_obj);
+                
+                // 2. Start the incremental watcher
+                if let Ok(watcher) = crate::indexer::start_watcher(app_clone.clone(), project.id, path_obj.to_path_buf()) {
+                    let mut guard = state.active_watcher.lock().unwrap();
+                    *guard = Some(watcher);
+                }
             }
         }
         
@@ -117,6 +128,7 @@ pub fn run() {
             app.manage(AppState {
                 conversations,
                 codegraph,
+                active_watcher: Mutex::new(None),
             });
 
             app.manage(engine::EngineState::new());
