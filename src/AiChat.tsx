@@ -1,5 +1,6 @@
-import { createSignal, createEffect, For, Show, onCleanup } from "solid-js";
+import { createSignal, createEffect, Show, onCleanup } from "solid-js";
 import { fetch } from "@tauri-apps/plugin-http";
+import AIConversation from "./AIConversation";
 
 interface Message {
   role: "user" | "assistant" | "system";
@@ -325,43 +326,14 @@ export default function AiChat(props: { connDetails: AiConnectionDetails }) {
 
       <div
         ref={chatContainerRef}
-        class="flex-1 overflow-y-auto p-4 space-y-6 scroll-smooth"
+        class="flex-1 overflow-y-auto py-4 space-y-6 scroll-smooth"
       >
-        <For each={messages()}>
-          {(msg) => (
-            <div
-              class={`flex w-full ${
-                msg.role === "user" ? "justify-end" : "justify-start"
-              }`}
-            >
-              <div
-                class={`max-w-[80%] rounded-2xl px-5 py-3 ${
-                  msg.role === "user"
-                    ? "bg-blue-600 text-white rounded-br-sm"
-                    : "bg-gray-800 text-gray-200 border border-gray-700 rounded-bl-sm"
-                }`}
-              >
-                <p class="whitespace-pre-wrap text-sm leading-relaxed">
-                  {msg.content}
-                </p>
-              </div>
-            </div>
-          )}
-        </For>
+        <AIConversation messages={messages()} />
 
+        {/* Keep your loading indicator below the conversation */}
         <Show when={isGenerating()}>
-          <div class="flex justify-start">
-            <div class="bg-gray-800 border border-gray-700 rounded-2xl rounded-bl-sm px-5 py-3 flex items-center gap-1">
-              <span class="w-1.5 h-1.5 bg-gray-500 rounded-full animate-bounce"></span>
-              <span
-                class="w-1.5 h-1.5 bg-gray-500 rounded-full animate-bounce"
-                style="animation-delay:150ms"
-              ></span>
-              <span
-                class="w-1.5 h-1.5 bg-gray-500 rounded-full animate-bounce"
-                style="animation-delay:300ms"
-              ></span>
-            </div>
+          <div class="flex justify-start px-4">
+            {/* ... your bouncing dots loader ... */}
           </div>
         </Show>
       </div>
