@@ -21,6 +21,13 @@ export default function GitPanel(props: { workspacePath: string }) {
         workspacePath: props.workspacePath,
       });
       setFiles(result);
+
+      const currentSelected = selectedFile();
+      if (currentSelected && !result.some((f) => f.path === currentSelected)) {
+        setSelectedFile(null);
+        setDiffHtml("");
+      }
+      // ----------------------
     } catch (e) {
       console.error("Failed to fetch git status:", e);
     }
