@@ -13,6 +13,8 @@ mod engine;
 mod agent;
 mod indexer;
 mod git_api;
+mod agentv2;
+mod orchestrator; 
 
 #[derive(Debug)]
 pub struct AppError(anyhow::Error);
@@ -142,6 +144,7 @@ pub fn run() {
             create_session,
             get_session_details,
             agent::prompt_agent,
+            orchestrator::prompt_agent_v2,
             git_api::get_git_status,
             git_api::get_git_diff
         ])

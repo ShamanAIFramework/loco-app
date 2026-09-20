@@ -90,7 +90,7 @@ export default function AiChat(props: AiChatProps) {
       };
 
       // 4. Invoke the Rust brain
-      await invoke("prompt_agent", {
+      await invoke("prompt_agent_v2", {
         sessionId: props.session.id,
         question: currentInput,
         onChunk: onChunk,
@@ -111,7 +111,7 @@ export default function AiChat(props: AiChatProps) {
   }
 
   return (
-    <div class="flex flex-col h-full w-full max-w-4xl mx-auto bg-gray-950">
+    <div class="flex flex-col h-full w-full mx-auto bg-gray-950">
       <div class="flex items-center justify-between p-4 border-b border-gray-800 bg-gray-950/95 sticky top-0 z-10">
         <h2 class="text-sm font-semibold text-gray-200">
           {props.session.title}

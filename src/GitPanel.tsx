@@ -78,7 +78,7 @@ export default function GitPanel(props: { workspacePath: string }) {
   };
 
   return (
-    <div class="flex flex-col h-full w-80 bg-gray-900 border-l border-gray-800 text-sm overflow-hidden">
+    <div class="flex flex-col h-full w-80 bg-gray-900 border-l border-gray-800 text-sm overflow-hidden w-[20vw]">
       {/* Header */}
       <div class="p-4 border-b border-gray-800 flex justify-between items-center bg-gray-950/50">
         <h2 class="font-semibold text-gray-200">Source Control</h2>

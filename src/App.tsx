@@ -65,7 +65,7 @@ export default function App() {
   return (
     <div class="flex h-screen w-full bg-gray-950 text-white overflow-hidden">
       {/* Left Panel: Workspace & Session Details */}
-      <div class="w-64 bg-gray-900 border-r border-gray-800 flex flex-col">
+      <div class="w-[20vw] bg-gray-900 border-r border-gray-800 flex flex-col">
         <div class="p-4 border-b border-gray-800">
           <h1 class="font-bold text-gray-200 tracking-wide">LOCO</h1>
           <p class="text-xs text-gray-500 mt-1">Local-First AI Agent</p>
@@ -109,7 +109,7 @@ export default function App() {
       </div>
 
       {/* Center Panel: Chat Interface */}
-      <div class="flex-1 flex flex-col min-w-0">
+      <div class="w-[60vw] flex-1 flex flex-col min-w-0">
         <Show when={appState() !== "ready"}>
           <div class="flex flex-col items-center justify-center h-full">
             <h1 class="text-xl font-medium animate-pulse text-gray-400">

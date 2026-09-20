@@ -156,7 +156,7 @@ function AssistantBubble(props: { content: string }) {
 
   return (
     <div class="flex w-full justify-start px-4">
-      <div class="flex gap-4 w-full max-w-4xl rounded-xl p-2 -ml-2">
+      <div class="flex gap-4 w-full rounded-xl p-2 -ml-2">
         <div
           ref={contentRef}
           class="flex-1 min-w-0 prose prose-invert prose-sm md:prose-base prose-pre:bg-[#0d1117] prose-pre:border prose-pre:border-gray-800 prose-pre:rounded-xl text-gray-300 max-w-none"

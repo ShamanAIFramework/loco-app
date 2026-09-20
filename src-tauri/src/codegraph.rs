@@ -286,7 +286,7 @@ impl CodeGraphStore {
         Ok(res)
     }
 
-/// Removes a file from the index (e.g., when it is deleted on disk).
+    /// Removes a file from the index (e.g., when it is deleted on disk).
     pub fn remove_file(&self, project_id: &str, rel_path: &str) -> anyhow::Result<()> {
         let guard = self.conn.lock().map_err(|_| anyhow::anyhow!("Mutex poisoned"))?;
         guard.execute(
