@@ -17,6 +17,7 @@ pub struct LlmRequest {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct LlmUsage {
+    pub queue_wait_ms: Option<u64>,
     pub prompt_tokens_total: Option<u64>,
     pub prompt_tokens_evaluated: Option<u64>,
     pub prompt_tokens_cached: Option<u64>,

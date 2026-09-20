@@ -113,7 +113,14 @@ impl Notebook {
         phase: Phase,
         tags: impl IntoIterator<Item = String>,
     ) -> EntryId {
-        self.append(EntryKind::Fact, statement, provenance, phase, Vec::new(), tags)
+        self.append(
+            EntryKind::Fact,
+            statement,
+            provenance,
+            phase,
+            Vec::new(),
+            tags,
+        )
     }
 
     pub fn append_model_inference(
@@ -212,7 +219,9 @@ impl Notebook {
     }
 
     pub fn iter_in_append_order(&self) -> impl Iterator<Item = &NotebookEntry> {
-        self.append_order.iter().filter_map(|id| self.entries.get(id))
+        self.append_order
+            .iter()
+            .filter_map(|id| self.entries.get(id))
     }
 
     fn append(

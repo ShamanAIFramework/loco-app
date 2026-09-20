@@ -6,8 +6,8 @@ use crate::prompt::{
 use crate::trace::{Trace, TraceEvent};
 use crate::traits::{AgentProgress, CodeSearch, FileReader, LlmClient, LlmRequest, ProgressSink};
 use crate::types::{
-    AgentAnswer, EvidenceSlice, ExtractOutput, IntakeOutput, LeaseStatus, MissingEvidenceKind, Phase,
-    StopReason, SymbolHit, SynthesizeOutput, TaskRequest, TaskType,
+    AgentAnswer, EvidenceSlice, ExtractOutput, IntakeOutput, LeaseStatus, MissingEvidenceKind,
+    Phase, StopReason, SymbolHit, SynthesizeOutput, TaskRequest, TaskType,
 };
 use anyhow::{anyhow, Context, Result};
 use serde::de::DeserializeOwned;
@@ -75,8 +75,8 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
         request: intake_req,
         response: intake_resp.clone(),
     });
-    let mut intake: IntakeOutput = parse_json(&intake_resp.raw_json)
-        .unwrap_or_else(|_| fallback_intake(&task.question));
+    let mut intake: IntakeOutput =
+        parse_json(&intake_resp.raw_json).unwrap_or_else(|_| fallback_intake(&task.question));
 
     normalize_intake(&mut intake, &task);
     notebook.append_decision(
@@ -91,7 +91,9 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
 
     if intake.task_type == TaskType::Unclear {
         let answer = AgentAnswer {
-            content: "I need a more specific code question before I can inspect the workspace usefully.".to_string(),
+            content:
+                "I need a more specific code question before I can inspect the workspace usefully."
+                    .to_string(),
             stop_reason: StopReason::NeedsUser,
             cited_entries: Vec::new(),
             notebook,
@@ -104,7 +106,9 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
 
     runtime
         .progress
-        .emit(AgentProgress::Status("Searching indexed files...".to_string()))
+        .emit(AgentProgress::Status(
+            "Searching indexed files...".to_string(),
+        ))
         .await;
 
     let mut file_paths = BTreeMap::<String, i64>::new();
@@ -223,20 +227,29 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
         }
     }
 
-    for (path, _) in sorted_paths.into_iter().take(task.budgets.max_files_to_read) {
+    for (path, _) in sorted_paths
+        .into_iter()
+        .take(task.budgets.max_files_to_read)
+    {
         if read_paths.contains(&path) && !evidence.is_empty() {
             continue;
         }
         match runtime
             .file_reader
-            .read_file(&path, task.budgets.max_evidence_chars / task.budgets.max_files_to_read.max(1))
+            .read_file(
+                &path,
+                task.budgets.max_evidence_chars / task.budgets.max_files_to_read.max(1),
+            )
             .await
         {
             Ok(slice) => {
                 let fact_id = notebook.append_tool_fact(
                     format!(
                         "Read {} lines {}-{} under lease {}",
-                        slice.lease.path, slice.lease.range.start, slice.lease.range.end, slice.lease.id.0
+                        slice.lease.path,
+                        slice.lease.range.start,
+                        slice.lease.range.end,
+                        slice.lease.id.0
                     ),
                     Provenance::File {
                         path: slice.lease.path.clone(),
@@ -330,8 +343,8 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
             response: extract_resp.clone(),
         });
 
-        let extract: ExtractOutput = parse_json(&extract_resp.raw_json)
-            .unwrap_or_else(|_| fallback_extract(&evidence));
+        let extract: ExtractOutput =
+            parse_json(&extract_resp.raw_json).unwrap_or_else(|_| fallback_extract(&evidence));
         let lease_index = evidence
             .iter()
             .map(|slice| (slice.lease.id.clone(), slice.lease.clone()))
@@ -413,11 +426,18 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
 
     runtime
         .progress
-        .emit(AgentProgress::Status("Synthesizing cited answer...".to_string()))
+        .emit(AgentProgress::Status(
+            "Synthesizing cited answer...".to_string(),
+        ))
         .await;
 
     if llm_calls >= task.budgets.max_llm_calls {
-        let content = fallback_answer(&task, &notebook, &inference_entry_ids, StopReason::BudgetExhausted);
+        let content = fallback_answer(
+            &task,
+            &notebook,
+            &inference_entry_ids,
+            StopReason::BudgetExhausted,
+        );
         let answer = AgentAnswer {
             content,
             stop_reason: StopReason::BudgetExhausted,
@@ -529,18 +549,8 @@ fn normalize_intake(intake: &mut IntakeOutput, task: &TaskRequest) {
 fn looks_actionable_code_request(question: &str) -> bool {
     let lower = question.to_lowercase();
     let action_words = [
-        "update",
-        "change",
-        "fix",
-        "add",
-        "remove",
-        "make",
-        "wrap",
-        "display",
-        "show",
-        "inspect",
-        "explain",
-        "locate",
+        "update", "change", "fix", "add", "remove", "make", "wrap", "display", "show", "inspect",
+        "explain", "locate",
     ];
     let code_words = [
         "ui",

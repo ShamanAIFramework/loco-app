@@ -8,15 +8,17 @@ use crate::{AppError, AppState};
 use agent_core::{
     AgentProgress, AgentRuntime, Budgets, CodeSearch, ConversationTurn, EvidenceLease,
     EvidenceSlice, FileHit, FileReader, LeaseStatus, LineRange, LlmClient, LlmRequest, LlmResponse,
-    LlmUsage, ProgressSink, SymbolHit, TaskRequest,
+    LlmUsage, ProgressSink, RuntimeMetadata, SymbolHit, TaskRequest, TraceEvent,
 };
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tauri::ipc::Channel;
 use tauri::Manager;
+use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 #[tauri::command]
@@ -87,7 +89,9 @@ pub async fn prompt_agent_v2(
         client: reqwest::Client::new(),
         port: conn.port,
         api_key: conn.api_key,
+        slot: app.state::<AppState>().llm_slot.clone(),
     };
+    let metadata = llm.runtime_metadata().await;
     let search = TauriCodeSearch {
         app: app.clone(),
         project_id,
@@ -99,7 +103,7 @@ pub async fn prompt_agent_v2(
         channel: on_chunk.clone(),
     };
 
-    let result = agent_core::run_agent(
+    let mut result = agent_core::run_agent(
         task,
         AgentRuntime {
             llm: &llm,
@@ -110,6 +114,10 @@ pub async fn prompt_agent_v2(
     )
     .await?;
 
+    result
+        .trace
+        .events
+        .insert(1, TraceEvent::RuntimeMetadata { metadata });
     write_trace(&run_id, &result.trace).await?;
 
     let final_response = render_answer_with_citations(&result.answer);
@@ -132,11 +140,53 @@ struct LlamaServerClient {
     client: reqwest::Client,
     port: u16,
     api_key: String,
+    slot: Arc<Semaphore>,
+}
+
+impl LlamaServerClient {
+    async fn runtime_metadata(&self) -> RuntimeMetadata {
+        let endpoint = format!("http://127.0.0.1:{}", self.port);
+        RuntimeMetadata {
+            host: "tauri-sidecar".to_string(),
+            endpoint: endpoint.clone(),
+            model_id: self.fetch_model_id(&endpoint).await,
+            server_version: None,
+            queue: "single-slot".to_string(),
+        }
+    }
+
+    async fn fetch_model_id(&self, endpoint: &str) -> Option<String> {
+        let value: serde_json::Value = self
+            .client
+            .get(format!("{endpoint}/v1/models"))
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .send()
+            .await
+            .ok()?
+            .json()
+            .await
+            .ok()?;
+        value
+            .get("data")
+            .and_then(|data| data.as_array())
+            .and_then(|models| models.first())
+            .and_then(|model| model.get("id"))
+            .and_then(|id| id.as_str())
+            .map(ToString::to_string)
+    }
 }
 
 #[async_trait]
 impl LlmClient for LlamaServerClient {
     async fn complete_json(&self, request: LlmRequest) -> Result<LlmResponse> {
+        let queued = std::time::Instant::now();
+        let _permit = self
+            .slot
+            .acquire()
+            .await
+            .context("LLM queue semaphore closed")?;
+        let queue_wait_ms = queued.elapsed().as_millis() as u64;
+
         let response_format = json!({
             "type": "json_schema",
             "json_schema": {
@@ -186,6 +236,7 @@ impl LlmClient for LlamaServerClient {
             call_id: request.call_id,
             raw_json,
             usage: LlmUsage {
+                queue_wait_ms: Some(queue_wait_ms),
                 prompt_tokens_total: usage["prompt_tokens"].as_u64(),
                 prompt_tokens_evaluated: usage["prompt_tokens_evaluated"].as_u64(),
                 prompt_tokens_cached: usage["prompt_tokens_cached"].as_u64(),

@@ -4,11 +4,23 @@ use crate::{LeaseId, Notebook};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RuntimeMetadata {
+    pub host: String,
+    pub endpoint: String,
+    pub model_id: Option<String>,
+    pub server_version: Option<String>,
+    pub queue: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 pub enum TraceEvent {
     RunStarted {
         run_id: String,
         question: String,
+    },
+    RuntimeMetadata {
+        metadata: RuntimeMetadata,
     },
     PhaseStarted {
         phase: Phase,

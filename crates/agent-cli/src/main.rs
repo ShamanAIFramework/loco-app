@@ -17,9 +17,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Validate and summarize a saved trace JSONL file.
-    Replay {
-        trace_path: PathBuf,
-    },
+    Replay { trace_path: PathBuf },
     /// Run a deterministic no-LLM path baseline over an eval task JSONL file.
     Baseline {
         task_path: PathBuf,
@@ -76,6 +74,7 @@ struct TraceMetrics {
     stop_reason: Option<String>,
     llm_calls: usize,
     tool_calls: usize,
+    queue_wait_ms: u64,
     prompt_tokens_total: u64,
     decode_tokens: u64,
     wall_ms: u64,
@@ -102,6 +101,7 @@ fn replay(trace_path: &Path) -> Result<()> {
     for event in &trace.events {
         match event {
             TraceEvent::RunStarted { .. } => run_started += 1,
+            TraceEvent::RuntimeMetadata { .. } => {}
             TraceEvent::PhaseStarted { phase } => {
                 phases.insert(format!("{:?}", phase));
             }
@@ -115,7 +115,10 @@ fn replay(trace_path: &Path) -> Result<()> {
                     ));
                 }
                 if request.prompt.trim().is_empty() {
-                    return Err(anyhow!("LLM request {} has an empty prompt", request.call_id));
+                    return Err(anyhow!(
+                        "LLM request {} has an empty prompt",
+                        request.call_id
+                    ));
                 }
                 if let Some(parts) = &request.prompt_parts {
                     regenerated_prompts += 1;
@@ -143,10 +146,16 @@ fn replay(trace_path: &Path) -> Result<()> {
     }
 
     if run_started != 1 {
-        return Err(anyhow!("Expected exactly one RunStarted event, saw {}", run_started));
+        return Err(anyhow!(
+            "Expected exactly one RunStarted event, saw {}",
+            run_started
+        ));
     }
     if run_finished != 1 {
-        return Err(anyhow!("Expected exactly one RunFinished event, saw {}", run_finished));
+        return Err(anyhow!(
+            "Expected exactly one RunFinished event, saw {}",
+            run_finished
+        ));
     }
 
     println!(
@@ -447,6 +456,9 @@ fn trace_metrics(trace: &Trace) -> Result<TraceMetrics> {
                 if let Some(value) = response.usage.wall_ms {
                     metrics.wall_ms += value;
                 }
+                if let Some(value) = response.usage.queue_wait_ms {
+                    metrics.queue_wait_ms += value;
+                }
                 if let Ok(value) = serde_json::from_str::<serde_json::Value>(&response.raw_json) {
                     if let Some(ids) = value.get("cited_entries").and_then(|v| v.as_array()) {
                         cited_ids = ids
@@ -464,6 +476,7 @@ fn trace_metrics(trace: &Trace) -> Result<TraceMetrics> {
                 metrics.stop_reason = Some(format!("{:?}", stop_reason));
             }
             TraceEvent::RunStarted { .. }
+            | TraceEvent::RuntimeMetadata { .. }
             | TraceEvent::PhaseStarted { .. }
             | TraceEvent::LeaseInvalidated { .. } => {}
         }

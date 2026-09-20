@@ -85,40 +85,45 @@ Rebuild the orchestrator and `agentv2` behavior so deterministic Rust code contr
   - edge upsert/list APIs
   - symbol search can surface symbols connected to a queried target
   - indexer creates simple intra-file reference or call edges among parsed symbols
+- Added a shared single-slot LLM queue in Tauri app state so concurrent UI runs cannot overlap llama-server JSON calls.
+- Added `queue_wait_ms` to traced LLM usage.
+- Added runtime metadata trace events with the Tauri sidecar endpoint, best-effort `/v1/models` model id, and queue policy.
+- Added deterministic intake fallback for non-empty actionable code/UI prompts when the model incorrectly labels them `Unclear`.
+- Updated the left-panel workspace path text to wrap instead of truncating.
 
 ## Verified
 
 - `cargo test --workspace`
-  - 9 tests passed.
+  - 10 tests passed.
 - `cargo test --manifest-path src-tauri/Cargo.toml`
-  - 4 Tauri-side tests passed.
+  - 5 Tauri-side tests passed.
 - `cargo check --manifest-path src-tauri/Cargo.toml`
   - completed successfully.
 
 ## Intentional Temporary Limitations
 
-- `CodeGraphStore` now provides symbol ranges, but it does not yet provide call edges, references, or graph-distance ranking.
+- `CodeGraphStore` now provides symbol ranges and lightweight intra-file edges, but it does not yet provide robust cross-file call graphs, references, or graph-distance ranking.
 - Evidence leases can now cover symbol ranges when symbol hits are available. Symbol parsing is conservative and regex-free, so complex language constructs may still fall back to whole-file slices.
 - The Tauri adapter uses current file-path and symbol-name search, scored deterministically by simple matching.
 - The final answer is streamed to the UI as one chunk after synthesis rather than token-streamed.
 - Token counting is still approximate in `agent-core`; the host does not yet query llama-server tokenizer.
 - `agent-cli replay` can now regenerate prompt bytes from recorded prompt parts. It still does not replay from notebook snapshots alone.
-- Eval now scores files and symbols and can include trace-derived citation validity, outcome correctness, stop reasons, calls, tokens, and wall time when a task includes `trace_path`. It is still a baseline/evaluation harness, not a full task runner.
+- Eval now scores files and symbols and can include trace-derived citation validity, outcome correctness, stop reasons, calls, tokens, queue wait, and wall time when a task includes `trace_path`. It is still a baseline/evaluation harness, not a full task runner.
 - Lease verification is implemented against the current filesystem range hash. Whole-file fallback leases may be weaker for very large truncated files, so UI verification should focus first on symbol-range cases.
+- Runtime metadata currently records the OpenAI-compatible local endpoint and best-effort model id. The sidecar server version remains `null` until we add a stable llama-server version source.
 
 ## Next Milestones
 
-1. Capture llama.cpp/server version and exact timing/cache fields in traces.
-2. Add tokenizer-backed token counting instead of approximate counting.
-3. Add a single-slot queue around all LLM calls.
-4. Improve parsers and graph extraction beyond the conservative line scanner.
-5. Add UI smoke verification against a small workspace:
+1. Add tokenizer-backed token counting instead of approximate counting.
+2. Capture a stable llama.cpp/server version if the sidecar exposes one.
+3. Improve parsers and graph extraction beyond the conservative line scanner.
+4. Add UI smoke verification against a small workspace:
    - ask for a known symbol
    - edit that symbol while the app is open
    - ask again
    - confirm stale evidence is rejected
    - run `agent-cli replay` on the trace
-6. Consider removing or renaming the now-empty `src-tauri/src/agentv2.rs` compatibility module once all references have settled.
+5. Consider removing or renaming the now-empty `src-tauri/src/agentv2.rs` compatibility module once all references have settled.
 
 ## Resume Notes
 

@@ -3,9 +3,11 @@
 
 use anyhow::Context;
 use tauri::Manager;
-use notify_debouncer_mini::notify::RecommendedWatcher;
 use notify_debouncer_mini::Debouncer;
+use notify_debouncer_mini::notify::RecommendedWatcher;
+use std::sync::Arc;
 use std::sync::Mutex;
+use tokio::sync::Semaphore;
 
 mod codegraph;
 mod conversation_store;
@@ -38,6 +40,7 @@ pub struct AppState {
     pub conversations: conversation_store::ConversationStore,
     pub codegraph: codegraph::CodeGraphStore,
     pub active_watcher: Mutex<Option<Debouncer<RecommendedWatcher>>>,
+    pub llm_slot: Arc<Semaphore>,
 }
 
 #[tauri::command]
@@ -131,6 +134,7 @@ pub fn run() {
                 conversations,
                 codegraph,
                 active_watcher: Mutex::new(None),
+                llm_slot: Arc::new(Semaphore::new(1)),
             });
 
             app.manage(engine::EngineState::new());
