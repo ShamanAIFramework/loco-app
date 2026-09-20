@@ -1,27 +1,23 @@
 // src-tauri/src/orchestrator.rs
-//! Orchestrates the multi-turn speculative planning, parallel worker dispatch,
-//! and final synthesis pipeline for Loco.
+//! Tauri host adapter for the deterministic agent-core runtime.
 
 use crate::agent::AgentEvent;
-use crate::agentv2::{
-    call_model_stream, compress_context, execute_tool, get_worker_tools, PlanMutation, PlanTask,
-};
 use crate::conversation_store::Role;
 use crate::engine::EngineState;
 use crate::{AppError, AppState};
+use agent_core::{
+    AgentProgress, AgentRuntime, Budgets, CodeSearch, ConversationTurn, EvidenceLease,
+    EvidenceSlice, FileHit, FileReader, LeaseStatus, LineRange, LlmClient, LlmRequest, LlmResponse,
+    LlmUsage, ProgressSink, SymbolHit, TaskRequest,
+};
 use anyhow::{anyhow, Context, Result};
+use async_trait::async_trait;
+use serde::Deserialize;
 use serde_json::json;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
 use tauri::ipc::Channel;
 use tauri::Manager;
-use tokio::sync::{mpsc, Mutex};
-
-/// Events sent from parallel worker tasks back to the central orchestrator loop.
-enum OrchestratorEvent {
-    WorkerStatus(String),
-    PlanUpdate(PlanMutation),
-    TaskFinished { task_id: String, gathered_context: String },
-}
+use uuid::Uuid;
 
 #[tauri::command]
 pub async fn prompt_agent_v2(
@@ -39,10 +35,11 @@ pub async fn prompt_agent_v2(
     let session_id_clone = session_id.clone();
     let question_clone = question.clone();
 
-    // Persist user question and load context
     let (conversation, messages) = tauri::async_runtime::spawn_blocking(move || -> Result<_> {
         let state = app_clone.state::<AppState>();
-        state.conversations.add_message(&session_id_clone, Role::User, &question_clone)?;
+        state
+            .conversations
+            .add_message(&session_id_clone, Role::User, &question_clone)?;
         let detail = state
             .conversations
             .load_conversation(&session_id_clone)?
@@ -50,314 +47,513 @@ pub async fn prompt_agent_v2(
         Ok((detail.conversation, detail.messages))
     })
     .await
-    .context("Failed to join blocking task")??;
+    .context("Failed to join blocking conversation task")??;
 
-    let mut project_id_opt = None;
-    if let Some(wp) = &conversation.workspace_path {
+    let project_id = if let Some(workspace) = &conversation.workspace_path {
         let app_c = app.clone();
-        let wp_c = wp.clone();
-        let project = tauri::async_runtime::spawn_blocking(move || {
-            let state = app_c.state::<AppState>();
-            state.codegraph.register_project("Active Workspace", std::path::Path::new(&wp_c))
-        })
-        .await
-        .context("Failed to join project register thread")??;
-        project_id_opt = Some(project.id);
-    }
-
-    let client = reqwest::Client::new();
-    let _ = on_chunk.send(AgentEvent::Status("Formulating plan...".to_string()));
-
-    // -------------------------------------------------------------
-    // PHASE 1: SPECULATIVE INTENT & HIGH-LEVEL PLAN (LLM)
-    // -------------------------------------------------------------
-    let planner_system = format!(
-        "You are the planner for Loco, a local coding assistant.\n\
-         Workspace: {}\n\
-         Analyze the request and return a JSON array containing 1 to 3 targeted discovery tasks.\n\
-         Output ONLY raw JSON format.",
-        conversation.workspace_path.as_deref().unwrap_or("Unknown")
-    );
-
-    let planner_prompt = vec![
-        json!({ "role": "system", "content": planner_system }),
-        json!({ "role": "user", "content": format!("Create discovery plan for: {}", question) }),
-    ];
-
-    // Define the strict JSON schema that maps to our PlanTask struct
-    let plan_schema = json!({
-        "type": "json_schema",
-        "json_schema": {
-            "name": "plan_array",
-            "schema": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "id": { "type": "string" },
-                        "description": { "type": "string" },
-                        "status": { "type": "string" }
-                    },
-                    "required": ["id", "description"],
-                    "additionalProperties": false
-                }
-            },
-            "strict": true
-        }
-    });
-
-    // Pass `Some(plan_schema)` as the response_format
-    let (plan_raw, _) = call_model_stream(
-        &client, 
-        conn.port, 
-        &conn.api_key, 
-        &planner_prompt, 
-        None, 
-        Some(plan_schema), // <-- ENFORCE GRAMMAR HERE
-        |_| {}
-    ).await?;
-
-    let mut initial_tasks: Vec<PlanTask> = Vec::new();
-    if let Some(start) = plan_raw.find('[') {
-        if let Some(end) = plan_raw.rfind(']') {
-            let slice = &plan_raw[start..=end];
-            if let Ok(parsed) = serde_json::from_str::<Vec<PlanTask>>(slice) {
-                initial_tasks = parsed;
-            }
-        }
-    }
-
-    if initial_tasks.is_empty() {
-        initial_tasks.push(PlanTask {
-            id: "1".to_string(),
-            description: format!("Locate and inspect relevant files for: {}", question),
-            status: "pending".to_string(),
-        });
-    }
-
-    // -------------------------------------------------------------
-    // PHASE 2: CONCURRENT MPSC WORKER EXECUTION
-    // -------------------------------------------------------------
-    let (tx, mut rx) = mpsc::channel::<OrchestratorEvent>(32);
-    let plan_queue = Arc::new(Mutex::new(initial_tasks));
-    let accumulated_context = Arc::new(Mutex::new(Vec::<String>::new()));
-
-    let num_workers = 2;
-    for worker_idx in 0..num_workers {
-        let tx_c = tx.clone();
-        let plan_c = Arc::clone(&plan_queue);
-        let client_c = client.clone();
-        
-        // Properly isolate connection primitives for the thread
-        let port_c = conn.port;
-        let api_key_c = conn.api_key.clone();
-        
-        let app_c = app.clone();
-        let ws_c = conversation.workspace_path.clone();
-        let pid_c = project_id_opt.clone();
-
-        tokio::spawn(async move {
-            loop {
-                let next_task = {
-                    let mut lock = plan_c.lock().await;
-                    let task_pos = lock.iter().position(|t| t.status == "pending");
-                    if let Some(pos) = task_pos {
-                        lock[pos].status = "in_progress".to_string();
-                        Some(lock[pos].clone())
-                    } else {
-                        None
-                    }
-                };
-
-                let task = match next_task {
-                    Some(t) => t,
-                    None => break, // Queue exhausted, terminate worker
-                };
-
-                let _ = tx_c
-                    .send(OrchestratorEvent::WorkerStatus(format!(
-                        "Worker {}: {}",
-                        worker_idx + 1,
-                        task.description
-                    )))
-                    .await;
-
-                let worker_system = "You are a code investigator. Use search_files, read_file, or modify_plan. When finished, summarize findings concisely.";
-                let mut worker_messages = vec![
-                    json!({ "role": "system", "content": worker_system }),
-                    json!({ "role": "user", "content": format!("Investigate task: {}", task.description) }),
-                ];
-
-                let mut findings = String::new();
-                for _ in 0..2 {
-                    let (turn_response, tools_called) = match call_model_stream(
-                        &client_c,
-                        port_c,
-                        &api_key_c,
-                        &worker_messages,
-                        Some(get_worker_tools()),
-                        None,
-                        |_| {},
-                    )
-                    .await
-                    {
-                        Ok(res) => res,
-                        Err(_) => break,
-                    };
-
-                    if tools_called.is_empty() {
-                        break;
-                    }
-
-                    // --- CORRECTED: Append Assistant's tool_calls payload to history first ---
-                    let mut calls_for_llm = Vec::new();
-                    for tc in &tools_called {
-                        calls_for_llm.push(json!({
-                            "id": tc.id,
-                            "type": "function",
-                            "function": {
-                                "name": tc.name,
-                                "arguments": tc.arguments
-                            }
-                        }));
-                    }
-                    worker_messages.push(json!({
-                        "role": "assistant",
-                        "content": if turn_response.trim().is_empty() { serde_json::Value::Null } else { json!(turn_response.trim()) },
-                        "tool_calls": calls_for_llm
-                    }));
-                    // -------------------------------------------------------------------------
-
-                    // Execute tools and append results
-                    for tc in tools_called {
-                        let result = if tc.name == "modify_plan" {
-                            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
-                                if let Some(desc) = val["description"].as_str() {
-                                    let _ = tx_c
-                                        .send(OrchestratorEvent::PlanUpdate(PlanMutation::AddTask {
-                                            description: desc.to_string(),
-                                        }))
-                                        .await;
-                                }
-                            }
-                            "Plan updated successfully.".to_string()
-                        } else {
-                            execute_tool(
-                                &app_c,
-                                ws_c.as_deref(),
-                                pid_c.as_deref(),
-                                &tc.name,
-                                &tc.arguments,
-                            )
-                            .await
-                            .unwrap_or_else(|e| format!("Execution error: {}", e))
-                        };
-
-                        findings.push_str(&format!("\n[Tool: {}]\n{}\n", tc.name, result));
-                        worker_messages.push(json!({
-                            "role": "tool",
-                            "tool_call_id": tc.id,
-                            "content": result
-                        }));
-                    }
-                }
-
-                let _ = tx_c
-                    .send(OrchestratorEvent::TaskFinished {
-                        task_id: task.id,
-                        gathered_context: findings,
-                    })
-                    .await;
-            }
-        });
-    }
-
-    drop(tx); // Drop the main thread's copy of the Sender so the channel closes when workers finish
-
-    // Central Single-Consumer Loop
-    while let Some(event) = rx.recv().await {
-        match event {
-            OrchestratorEvent::WorkerStatus(status) => {
-                let _ = on_chunk.send(AgentEvent::Status(status));
-            }
-            OrchestratorEvent::PlanUpdate(mutation) => match mutation {
-                PlanMutation::AddTask { description } => {
-                    let mut lock = plan_queue.lock().await;
-                    let next_id = (lock.len() + 1).to_string();
-                    lock.push(PlanTask {
-                        id: next_id,
-                        description,
-                        status: "pending".to_string(),
-                    });
-                }
-                PlanMutation::CompleteTask { id } => {
-                    let mut lock = plan_queue.lock().await;
-                    if let Some(t) = lock.iter_mut().find(|t| t.id == id) {
-                        t.status = "completed".to_string();
-                    }
-                }
-            },
-            OrchestratorEvent::TaskFinished { task_id, gathered_context } => {
-                {
-                    let mut lock = plan_queue.lock().await;
-                    if let Some(t) = lock.iter_mut().find(|t| t.id == task_id) {
-                        t.status = "completed".to_string();
-                    }
-                }
-                if !gathered_context.trim().is_empty() {
-                    let mut ctx_lock = accumulated_context.lock().await;
-                    ctx_lock.push(compress_context(&gathered_context));
-                }
-            }
-        }
-    }
-
-    // -------------------------------------------------------------
-    // PHASE 3: FINAL STREAMING SYNTHESIS (LLM)
-    // -------------------------------------------------------------
-    let _ = on_chunk.send(AgentEvent::Status("Synthesizing solution...".to_string()));
-
-    let final_context = {
-        let lock = accumulated_context.lock().await;
-        lock.join("\n---\n")
+        let workspace_c = workspace.clone();
+        Some(
+            tauri::async_runtime::spawn_blocking(move || {
+                let state = app_c.state::<AppState>();
+                state
+                    .codegraph
+                    .register_project("Active Workspace", Path::new(&workspace_c))
+                    .map(|project| project.id)
+            })
+            .await
+            .context("Failed to join project registration task")??,
+        )
+    } else {
+        None
     };
 
-    let synthesis_system = format!(
-        "You are Loco, an expert local software engineer.\n\
-         Workspace: {}\n\
-         Below is verified codebase context gathered for this request:\n\
-         {}\n\
-         Use this verified context to author an accurate, well-structured solution. Do not guess.",
-        conversation.workspace_path.as_deref().unwrap_or("Unknown"),
-        if final_context.is_empty() { "No specific file context retrieved." } else { &final_context }
-    );
+    let run_id = Uuid::new_v4().to_string();
+    let task = TaskRequest {
+        run_id: run_id.clone(),
+        session_id: session_id.clone(),
+        workspace_path: conversation.workspace_path.as_ref().map(PathBuf::from),
+        question: question.clone(),
+        conversation: messages
+            .iter()
+            .map(|msg| ConversationTurn {
+                role: msg.role.as_str().to_string(),
+                content: msg.content.clone(),
+            })
+            .collect(),
+        budgets: load_budgets().await.unwrap_or_default(),
+    };
 
-    let mut synthesis_messages = vec![json!({ "role": "system", "content": synthesis_system })];
-    for msg in messages {
-        synthesis_messages.push(json!({ "role": msg.role.as_str(), "content": msg.content }));
-    }
+    let llm = LlamaServerClient {
+        client: reqwest::Client::new(),
+        port: conn.port,
+        api_key: conn.api_key,
+    };
+    let search = TauriCodeSearch {
+        app: app.clone(),
+        project_id,
+    };
+    let reader = WorkspaceFileReader {
+        workspace_path: conversation.workspace_path.clone().map(PathBuf::from),
+    };
+    let progress = TauriProgressSink {
+        channel: on_chunk.clone(),
+    };
 
-    let on_chunk_c = on_chunk.clone();
-    let (final_response, _) = call_model_stream(
-        &client,
-        conn.port,
-        &conn.api_key,
-        &synthesis_messages,
-        None,
-        None,
-        move |chunk| {
-            let _ = on_chunk_c.send(AgentEvent::Chunk(chunk));
+    let result = agent_core::run_agent(
+        task,
+        AgentRuntime {
+            llm: &llm,
+            code_search: &search,
+            file_reader: &reader,
+            progress: &progress,
         },
     )
     .await?;
 
+    write_trace(&run_id, &result.trace).await?;
+
+    let final_response = render_answer_with_citations(&result.answer);
+    let _ = on_chunk.send(AgentEvent::Chunk(final_response.clone()));
+
     tauri::async_runtime::spawn_blocking(move || -> Result<_> {
         let state = app.state::<AppState>();
-        state.conversations.add_message(&session_id, Role::Assistant, &final_response)?;
+        state
+            .conversations
+            .add_message(&session_id, Role::Assistant, &final_response)?;
         Ok(())
     })
     .await
-    .context("Failed to join blocking task")??;
+    .context("Failed to join blocking assistant persistence task")??;
 
     Ok(())
+}
+
+struct LlamaServerClient {
+    client: reqwest::Client,
+    port: u16,
+    api_key: String,
+}
+
+#[async_trait]
+impl LlmClient for LlamaServerClient {
+    async fn complete_json(&self, request: LlmRequest) -> Result<LlmResponse> {
+        let response_format = json!({
+            "type": "json_schema",
+            "json_schema": {
+                "name": request.schema_name,
+                "schema": request.schema,
+                "strict": true
+            }
+        });
+        let req_body = json!({
+            "messages": [
+                {
+                    "role": "user",
+                    "content": request.prompt
+                }
+            ],
+            "temperature": request.temperature,
+            "stream": false,
+            "max_tokens": 2048,
+            "response_format": response_format
+        });
+
+        let started = std::time::Instant::now();
+        let res = self
+            .client
+            .post(format!("http://127.0.0.1:{}/v1/chat/completions", self.port))
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .json(&req_body)
+            .send()
+            .await
+            .context("Failed to send deterministic LLM request")?;
+
+        let status = res.status();
+        let value: serde_json::Value = res
+            .json()
+            .await
+            .context("Failed to parse llama-server response JSON")?;
+        if !status.is_success() {
+            return Err(anyhow!("llama-server request failed with {}: {}", status, value));
+        }
+
+        let raw_json = value["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or("{}")
+            .to_string();
+        let usage = &value["usage"];
+        Ok(LlmResponse {
+            call_id: request.call_id,
+            raw_json,
+            usage: LlmUsage {
+                prompt_tokens_total: usage["prompt_tokens"].as_u64(),
+                prompt_tokens_evaluated: usage["prompt_tokens_evaluated"].as_u64(),
+                prompt_tokens_cached: usage["prompt_tokens_cached"].as_u64(),
+                decode_tokens: usage["completion_tokens"].as_u64(),
+                prefill_ms: usage["prompt_ms"].as_u64(),
+                decode_ms: usage["predicted_ms"].as_u64(),
+                wall_ms: Some(started.elapsed().as_millis() as u64),
+            },
+        })
+    }
+}
+
+struct TauriCodeSearch {
+    app: tauri::AppHandle,
+    project_id: Option<String>,
+}
+
+#[async_trait]
+impl CodeSearch for TauriCodeSearch {
+    async fn repo_map(&self, max_entries: usize) -> Result<Vec<String>> {
+        let Some(project_id) = self.project_id.clone() else {
+            return Ok(Vec::new());
+        };
+        let app = self.app.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            let state = app.state::<AppState>();
+            let mut files = state
+                .codegraph
+                .project_files(&project_id)?
+                .into_iter()
+                .map(|file| file.path)
+                .collect::<Vec<_>>();
+            files.sort();
+            files.truncate(max_entries);
+            Ok(files)
+        })
+        .await
+        .context("Failed to join repo map task")?
+    }
+
+    async fn search(&self, query: &str, limit: usize) -> Result<Vec<FileHit>> {
+        let Some(project_id) = self.project_id.clone() else {
+            return Ok(Vec::new());
+        };
+        let app = self.app.clone();
+        let query = query.to_string();
+        tauri::async_runtime::spawn_blocking(move || {
+            let state = app.state::<AppState>();
+            let mut hits = state
+                .codegraph
+                .search_files(&project_id, &query)?
+                .into_iter()
+                .map(|file| {
+                    let score = score_file_hit(&file.path, &query);
+                    FileHit {
+                        path: file.path,
+                        score,
+                    }
+                })
+                .collect::<Vec<_>>();
+            hits.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.path.cmp(&b.path)));
+            hits.truncate(limit);
+            Ok(hits)
+        })
+        .await
+        .context("Failed to join code search task")?
+    }
+
+    async fn search_symbols(&self, query: &str, limit: usize) -> Result<Vec<SymbolHit>> {
+        let Some(project_id) = self.project_id.clone() else {
+            return Ok(Vec::new());
+        };
+        let app = self.app.clone();
+        let query = query.to_string();
+        tauri::async_runtime::spawn_blocking(move || {
+            let state = app.state::<AppState>();
+            let mut hits = state
+                .codegraph
+                .search_symbols(&project_id, &query)?
+                .into_iter()
+                .map(|(file, symbol)| {
+                    let score = score_symbol_hit(&file.path, &symbol.name, &query);
+                    SymbolHit {
+                        path: file.path,
+                        symbol: symbol.name,
+                        kind: symbol.kind,
+                        start_line: symbol.start_line,
+                        end_line: symbol.end_line,
+                        score,
+                    }
+                })
+                .collect::<Vec<_>>();
+            hits.sort_by(|a, b| {
+                b.score
+                    .cmp(&a.score)
+                    .then_with(|| a.path.cmp(&b.path))
+                    .then_with(|| a.start_line.cmp(&b.start_line))
+                    .then_with(|| a.symbol.cmp(&b.symbol))
+            });
+            hits.truncate(limit);
+            Ok(hits)
+        })
+        .await
+        .context("Failed to join symbol search task")?
+    }
+}
+
+struct WorkspaceFileReader {
+    workspace_path: Option<PathBuf>,
+}
+
+#[async_trait]
+impl FileReader for WorkspaceFileReader {
+    async fn read_file(&self, path: &str, max_chars: usize) -> Result<EvidenceSlice> {
+        let workspace_path = self
+            .workspace_path
+            .clone()
+            .ok_or_else(|| anyhow!("No active workspace path configured"))?;
+        let rel_path = sanitize_relative_path(path)?;
+        tauri::async_runtime::spawn_blocking(move || {
+            let root = std::fs::canonicalize(&workspace_path)
+                .context("Failed to canonicalize workspace path")?;
+            let full_path = root.join(&rel_path);
+            let canonical = std::fs::canonicalize(&full_path)
+                .with_context(|| format!("Failed to canonicalize {}", rel_path.display()))?;
+            if !canonical.starts_with(&root) {
+                return Err(anyhow!("Refusing to read outside workspace"));
+            }
+
+            let mut content = std::fs::read_to_string(&canonical)
+                .with_context(|| format!("Failed to read {}", rel_path.display()))?;
+            if content.len() > max_chars {
+                content.truncate(max_chars);
+                content.push_str("\n...[TRUNCATED]...");
+            }
+            let line_count = content.lines().count().max(1);
+            let rel_display = rel_path.to_string_lossy().to_string();
+            Ok(EvidenceSlice {
+                lease: EvidenceLease::new(
+                    rel_display,
+                    None,
+                    LineRange {
+                        start: 1,
+                        end: line_count,
+                    },
+                    &content,
+                ),
+                content,
+            })
+        })
+        .await
+        .context("Failed to join file read task")?
+    }
+
+    async fn read_range(
+        &self,
+        path: &str,
+        symbol: Option<&str>,
+        start_line: u32,
+        end_line: u32,
+        max_chars: usize,
+    ) -> Result<EvidenceSlice> {
+        let workspace_path = self
+            .workspace_path
+            .clone()
+            .ok_or_else(|| anyhow!("No active workspace path configured"))?;
+        let rel_path = sanitize_relative_path(path)?;
+        let symbol = symbol.map(ToString::to_string);
+        tauri::async_runtime::spawn_blocking(move || {
+            let root = std::fs::canonicalize(&workspace_path)
+                .context("Failed to canonicalize workspace path")?;
+            let full_path = root.join(&rel_path);
+            let canonical = std::fs::canonicalize(&full_path)
+                .with_context(|| format!("Failed to canonicalize {}", rel_path.display()))?;
+            if !canonical.starts_with(&root) {
+                return Err(anyhow!("Refusing to read outside workspace"));
+            }
+
+            let content = std::fs::read_to_string(&canonical)
+                .with_context(|| format!("Failed to read {}", rel_path.display()))?;
+            let start = start_line.max(1);
+            let end = end_line.max(start);
+            let mut slice = content
+                .lines()
+                .enumerate()
+                .filter(|(idx, _)| {
+                    let line_no = (*idx + 1) as u32;
+                    line_no >= start && line_no <= end
+                })
+                .map(|(_, line)| line)
+                .collect::<Vec<_>>()
+                .join("\n");
+            if slice.len() > max_chars {
+                slice.truncate(max_chars);
+                slice.push_str("\n...[TRUNCATED]...");
+            }
+            let rel_display = rel_path.to_string_lossy().to_string();
+            Ok(EvidenceSlice {
+                lease: EvidenceLease::new(
+                    rel_display,
+                    symbol,
+                    LineRange {
+                        start: start as usize,
+                        end: end as usize,
+                    },
+                    &slice,
+                ),
+                content: slice,
+            })
+        })
+        .await
+        .context("Failed to join range read task")?
+    }
+
+    async fn verify_lease(&self, lease: &EvidenceLease) -> Result<LeaseStatus> {
+        let workspace_path = self
+            .workspace_path
+            .clone()
+            .ok_or_else(|| anyhow!("No active workspace path configured"))?;
+        let lease = lease.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            let root = std::fs::canonicalize(&workspace_path)
+                .context("Failed to canonicalize workspace path")?;
+            let rel_path = sanitize_relative_path(&lease.path)?;
+            let full_path = root.join(&rel_path);
+            let canonical = match std::fs::canonicalize(&full_path) {
+                Ok(path) => path,
+                Err(_) => return Ok(LeaseStatus::Expired),
+            };
+            if !canonical.starts_with(&root) {
+                return Ok(LeaseStatus::Expired);
+            }
+            let content = match std::fs::read_to_string(&canonical) {
+                Ok(content) => content,
+                Err(_) => return Ok(LeaseStatus::Expired),
+            };
+            let current = content
+                .lines()
+                .enumerate()
+                .filter(|(idx, _)| {
+                    let line_no = *idx + 1;
+                    line_no >= lease.range.start && line_no <= lease.range.end
+                })
+                .map(|(_, line)| line)
+                .collect::<Vec<_>>()
+                .join("\n");
+            if agent_core::hash_content(&current) == lease.content_hash {
+                Ok(LeaseStatus::Valid)
+            } else {
+                Ok(LeaseStatus::Expired)
+            }
+        })
+        .await
+        .context("Failed to join lease verification task")?
+    }
+}
+
+struct TauriProgressSink {
+    channel: Channel<AgentEvent>,
+}
+
+#[async_trait]
+impl ProgressSink for TauriProgressSink {
+    async fn emit(&self, progress: AgentProgress) {
+        match progress {
+            AgentProgress::Status(status) => {
+                let _ = self.channel.send(AgentEvent::Status(status));
+            }
+            AgentProgress::Trace(_) => {}
+        }
+    }
+}
+
+fn render_answer_with_citations(answer: &agent_core::AgentAnswer) -> String {
+    if answer.cited_entries.is_empty() {
+        return answer.content.clone();
+    }
+
+    let mut rendered = answer.content.clone();
+    rendered.push_str("\n\nSources:\n");
+    for entry_id in &answer.cited_entries {
+        if let Some(entry) = answer.notebook.get(entry_id) {
+            rendered.push_str(&format!("- `{}` {}\n", entry.id.0, entry.statement));
+        }
+    }
+    rendered
+}
+
+fn score_file_hit(path: &str, query: &str) -> i64 {
+    let path_lower = path.to_lowercase();
+    let query_lower = query.to_lowercase();
+    if path_lower == query_lower {
+        100
+    } else if path_lower.ends_with(&query_lower) {
+        75
+    } else if path_lower.contains(&query_lower) {
+        50
+    } else {
+        10
+    }
+}
+
+fn score_symbol_hit(path: &str, symbol: &str, query: &str) -> i64 {
+    let query_lower = query.to_lowercase();
+    let symbol_lower = symbol.to_lowercase();
+    let path_score = score_file_hit(path, query);
+    let symbol_score = if symbol_lower == query_lower {
+        120
+    } else if symbol_lower.contains(&query_lower) {
+        90
+    } else {
+        0
+    };
+    let score = path_score + symbol_score;
+    if score == 0 {
+        25
+    } else {
+        score
+    }
+}
+
+fn sanitize_relative_path(path: &str) -> Result<PathBuf> {
+    let trimmed = path.trim_start_matches(['/', '\\']);
+    let rel = PathBuf::from(trimmed);
+    if rel
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(anyhow!("Parent directory segments are not allowed"));
+    }
+    Ok(rel)
+}
+
+async fn write_trace(run_id: &str, trace: &agent_core::Trace) -> Result<()> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("Could not determine home directory"))?;
+    let dir = home.join(".loco").join("traces");
+    let path = dir.join(format!("{}.jsonl", run_id));
+    let jsonl = trace.to_jsonl();
+    tauri::async_runtime::spawn_blocking(move || {
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(&path, jsonl)?;
+        log::info!("Wrote agent trace to {}", path.display());
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    .context("Failed to join trace write task")??;
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentConfig {
+    budgets: Option<Budgets>,
+}
+
+async fn load_budgets() -> Result<Budgets> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("Could not determine home directory"))?;
+    let path = home.join(".loco").join("agent.toml");
+    if !path.exists() {
+        return Ok(Budgets::default());
+    }
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let raw = std::fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read {}", path.display()))?;
+        let config: AgentConfig = toml::from_str(&raw)
+            .with_context(|| format!("Failed to parse {}", path.display()))?;
+        Ok::<_, anyhow::Error>(config.budgets.unwrap_or_default())
+    })
+    .await
+    .context("Failed to join budget config read task")?
 }

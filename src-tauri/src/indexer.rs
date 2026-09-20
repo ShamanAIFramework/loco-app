@@ -2,13 +2,14 @@
 //! Scans the local filesystem to index source files into the CodeGraph store.
 //! Runs synchronously and ignores standard build and hidden directories.
 
-use crate::codegraph::CodeGraphStore;
+use crate::codegraph::{CodeGraphStore, Symbol};
 use anyhow::Result;
 use std::fs;
 use std::path::Path;
 use crate::AppState;
 use notify_debouncer_mini::{new_debouncer, notify::RecursiveMode, Debouncer};
 use notify_debouncer_mini::notify::RecommendedWatcher;
+use sha2::{Digest, Sha256};
 use std::time::Duration;
 use tauri::Manager;
 
@@ -43,8 +44,7 @@ fn walk_and_index(store: &CodeGraphStore, project_id: &str, current_dir: &Path, 
         } else if path.is_file() {
             if let Ok(rel_path) = path.strip_prefix(root_path) {
                 let rel_str = rel_path.to_string_lossy().to_string();
-                // Upsert the file metadata idempotently
-                let _ = store.upsert_file(project_id, &rel_str, None);
+                let _ = index_source_file(store, project_id, &path, &rel_str);
             }
         }
     }
@@ -101,7 +101,7 @@ pub fn start_watcher(
                             // 3. Incrementally update SQLite based on file existence
                             if path.exists() && path.is_file() {
                                 // File was created or modified
-                                let _ = state.codegraph.upsert_file(&project_id, &rel_str, None);
+                                let _ = index_source_file(&state.codegraph, &project_id, &path, &rel_str);
                             } else if !path.exists() {
                                 // File was deleted
                                 let _ = state.codegraph.remove_file(&project_id, &rel_str);
@@ -116,4 +116,239 @@ pub fn start_watcher(
 
     // Return the debouncer so it doesn't get dropped (which would stop the watching)
     Ok(debouncer)
+}
+
+fn file_checksum(path: &Path) -> Result<String> {
+    let bytes = fs::read(path)?;
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn index_source_file(
+    store: &CodeGraphStore,
+    project_id: &str,
+    path: &Path,
+    rel_path: &str,
+) -> Result<()> {
+    let checksum = file_checksum(path).ok();
+    let file = store.upsert_file(project_id, rel_path, checksum.as_deref())?;
+    store.clear_file_symbols(&file.id)?;
+
+    if !looks_like_source(rel_path) {
+        return Ok(());
+    }
+
+    let content = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(_) => return Ok(()),
+    };
+
+    let parsed_symbols = extract_symbols(&content);
+    let mut inserted_symbols = Vec::<(Symbol, ParsedSymbol)>::new();
+    for symbol in parsed_symbols {
+        let hash = symbol_hash(&content, symbol.start_line, symbol.end_line);
+        if let Ok(inserted) = store.upsert_symbol(
+            &file.id,
+            &symbol.name,
+            &symbol.kind,
+            symbol.start_line,
+            symbol.end_line,
+            hash.as_deref(),
+        ) {
+            inserted_symbols.push((inserted, symbol));
+        }
+    }
+
+    for (from_symbol, from_parsed) in &inserted_symbols {
+        let range_text = symbol_text(&content, from_parsed.start_line, from_parsed.end_line);
+        for (_, target) in &inserted_symbols {
+            if target.name == from_parsed.name {
+                continue;
+            }
+            if range_text.contains(&target.name) {
+                let kind = if range_text.contains(&format!("{}(", target.name)) {
+                    "call"
+                } else {
+                    "reference"
+                };
+                let _ = store.upsert_symbol_edge(&from_symbol.id, &target.name, kind);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[derive(Clone, Debug)]
+struct ParsedSymbol {
+    name: String,
+    kind: String,
+    start_line: u32,
+    end_line: u32,
+}
+
+fn extract_symbols(content: &str) -> Vec<ParsedSymbol> {
+    let lines = content.lines().collect::<Vec<_>>();
+    let mut starts = Vec::<ParsedSymbol>::new();
+
+    for (idx, line) in lines.iter().enumerate() {
+        let Some((kind, name)) = parse_symbol_start(line) else {
+            continue;
+        };
+        starts.push(ParsedSymbol {
+            name,
+            kind,
+            start_line: (idx + 1) as u32,
+            end_line: (idx + 1) as u32,
+        });
+    }
+
+    for idx in 0..starts.len() {
+        let next_start = starts
+            .get(idx + 1)
+            .map(|symbol| symbol.start_line.saturating_sub(1))
+            .unwrap_or(lines.len() as u32);
+        starts[idx].end_line = next_start.max(starts[idx].start_line);
+    }
+
+    starts
+}
+
+fn parse_symbol_start(line: &str) -> Option<(String, String)> {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with("//") || trimmed.starts_with('#') || trimmed.starts_with('*') {
+        return None;
+    }
+
+    parse_after_keyword(trimmed, "pub fn", "fn")
+        .or_else(|| parse_after_keyword(trimmed, "pub async fn", "fn"))
+        .or_else(|| parse_after_keyword(trimmed, "async fn", "fn"))
+        .or_else(|| parse_after_keyword(trimmed, "fn", "fn"))
+        .or_else(|| parse_after_keyword(trimmed, "pub struct", "struct"))
+        .or_else(|| parse_after_keyword(trimmed, "struct", "struct"))
+        .or_else(|| parse_after_keyword(trimmed, "pub enum", "enum"))
+        .or_else(|| parse_after_keyword(trimmed, "enum", "enum"))
+        .or_else(|| parse_after_keyword(trimmed, "pub trait", "trait"))
+        .or_else(|| parse_after_keyword(trimmed, "trait", "trait"))
+        .or_else(|| parse_after_keyword(trimmed, "pub impl", "impl"))
+        .or_else(|| parse_after_keyword(trimmed, "impl", "impl"))
+        .or_else(|| parse_after_keyword(trimmed, "export function", "function"))
+        .or_else(|| parse_after_keyword(trimmed, "function", "function"))
+        .or_else(|| parse_after_keyword(trimmed, "export class", "class"))
+        .or_else(|| parse_after_keyword(trimmed, "class", "class"))
+        .or_else(|| parse_const_arrow(trimmed))
+}
+
+fn parse_after_keyword(line: &str, keyword: &str, kind: &str) -> Option<(String, String)> {
+    let rest = line.strip_prefix(keyword)?.trim_start();
+    let name = rest
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$')
+        .collect::<String>();
+    if name.is_empty() {
+        None
+    } else {
+        Some((kind.to_string(), name))
+    }
+}
+
+fn parse_const_arrow(line: &str) -> Option<(String, String)> {
+    let rest = line
+        .strip_prefix("export const")
+        .or_else(|| line.strip_prefix("const"))?
+        .trim_start();
+    if !(rest.contains("=>") || rest.contains("function")) {
+        return None;
+    }
+    let name = rest
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$')
+        .collect::<String>();
+    if name.is_empty() {
+        None
+    } else {
+        Some(("function".to_string(), name))
+    }
+}
+
+fn symbol_hash(content: &str, start_line: u32, end_line: u32) -> Option<String> {
+    let slice = symbol_text(content, start_line, end_line);
+    if slice.is_empty() {
+        None
+    } else {
+        let mut hasher = Sha256::new();
+        hasher.update(slice.as_bytes());
+        Some(format!("{:x}", hasher.finalize()))
+    }
+}
+
+fn symbol_text(content: &str, start_line: u32, end_line: u32) -> String {
+    content
+        .lines()
+        .enumerate()
+        .filter(|(idx, _)| {
+            let line_no = (*idx + 1) as u32;
+            line_no >= start_line && line_no <= end_line
+        })
+        .map(|(_, line)| line)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn looks_like_source(path: &str) -> bool {
+    matches!(
+        Path::new(path).extension().and_then(|ext| ext.to_str()),
+        Some(
+            "rs" | "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" | "py" | "go" | "java" | "kt"
+                | "swift" | "c" | "h" | "cpp" | "hpp"
+        )
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_common_rust_symbols_with_ranges() {
+        let source = r#"
+pub struct AppState {
+}
+
+pub async fn run_app() {
+}
+
+impl AppState {
+}
+"#;
+        let symbols = extract_symbols(source);
+        assert_eq!(symbols.len(), 3);
+        assert_eq!(symbols[0].name, "AppState");
+        assert_eq!(symbols[0].kind, "struct");
+        assert_eq!(symbols[0].start_line, 2);
+        assert_eq!(symbols[0].end_line, 4);
+        assert_eq!(symbols[1].name, "run_app");
+    }
+
+    #[test]
+    fn extracts_common_typescript_symbols() {
+        let source = r#"
+export function useThing() {
+}
+const helper = () => {}
+export class Widget {}
+"#;
+        let symbols = extract_symbols(source);
+        assert_eq!(
+            symbols.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            vec!["useThing", "helper", "Widget"]
+        );
+    }
+
+    #[test]
+    fn symbol_text_extracts_requested_range() {
+        let text = "one\ntwo\nthree\nfour";
+        assert_eq!(symbol_text(text, 2, 3), "two\nthree");
+    }
 }

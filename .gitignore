@@ -2,3 +2,6 @@ node_modules
 dist
 binaries
 models
+target
+crates/*/target
+crates/*/Cargo.lock

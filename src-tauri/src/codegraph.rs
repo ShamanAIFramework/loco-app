@@ -25,6 +25,7 @@ pub struct SourceFile {
     pub project_id: String,
     pub path: String,
     pub checksum: Option<String>,
+    pub index_version: i64,
     pub last_indexed: Option<DateTime<Utc>>,
 }
 
@@ -35,6 +36,17 @@ pub struct Symbol {
     pub name: String,
     pub kind: String,
     pub line: u32,
+    pub start_line: u32,
+    pub end_line: u32,
+    pub content_hash: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SymbolEdge {
+    pub id: String,
+    pub from_symbol_id: String,
+    pub target_name: String,
+    pub kind: String,
 }
 
 fn now_str() -> String {
@@ -81,6 +93,7 @@ impl CodeGraphStore {
                 project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
                 path TEXT NOT NULL,
                 checksum TEXT,
+                index_version INTEGER NOT NULL DEFAULT 0,
                 last_indexed TEXT,
                 UNIQUE(project_id, path)
              );
@@ -90,11 +103,25 @@ impl CodeGraphStore {
                 name TEXT NOT NULL,
                 kind TEXT NOT NULL,
                 line INTEGER NOT NULL,
-                UNIQUE(file_id, name, kind, line)
+                start_line INTEGER NOT NULL DEFAULT 0,
+                end_line INTEGER NOT NULL DEFAULT 0,
+                content_hash TEXT,
+                UNIQUE(file_id, name, kind, start_line, end_line)
+             );
+             CREATE TABLE IF NOT EXISTS symbol_edges (
+                id TEXT PRIMARY KEY,
+                from_symbol_id TEXT NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
+                target_name TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                UNIQUE(from_symbol_id, target_name, kind)
              );
              CREATE INDEX IF NOT EXISTS idx_symbols_file_id ON symbols(file_id);
+             CREATE INDEX IF NOT EXISTS idx_symbol_edges_from ON symbol_edges(from_symbol_id);
+             CREATE INDEX IF NOT EXISTS idx_symbol_edges_target ON symbol_edges(target_name);
              CREATE INDEX IF NOT EXISTS idx_files_project_id ON files(project_id);"
         )?;
+
+        migrate_schema(&conn)?;
 
         Ok(Self {
             conn: Mutex::new(conn),
@@ -156,12 +183,16 @@ impl CodeGraphStore {
         let now = now_str();
 
         guard.query_row(
-            r#"INSERT INTO files (id, project_id, path, checksum, last_indexed)
-               VALUES (?1, ?2, ?3, ?4, ?5)
+            r#"INSERT INTO files (id, project_id, path, checksum, index_version, last_indexed)
+               VALUES (?1, ?2, ?3, ?4, 1, ?5)
                ON CONFLICT(project_id, path) DO UPDATE SET
+                   index_version = CASE
+                       WHEN files.checksum IS NOT excluded.checksum THEN files.index_version + 1
+                       ELSE files.index_version
+                   END,
                    checksum = excluded.checksum,
                    last_indexed = excluded.last_indexed
-               RETURNING id, project_id, path, checksum, last_indexed"#,
+               RETURNING id, project_id, path, checksum, index_version, last_indexed"#,
             params![generated_id, project_id, path, checksum, now],
             |row| {
                 Ok(SourceFile {
@@ -169,24 +200,35 @@ impl CodeGraphStore {
                     project_id: row.get(1)?,
                     path: row.get(2)?,
                     checksum: row.get(3)?,
-                    last_indexed: parse_opt_dt(row.get(4)?),
+                    index_version: row.get(4)?,
+                    last_indexed: parse_opt_dt(row.get(5)?),
                 })
             },
         ).context("Failed to upsert source file")
     }
 
     /// Upserts a parsed symbol for a specific file.
-    pub fn upsert_symbol(&self, file_id: &str, name: &str, kind: &str, line: u32) -> Result<Symbol> {
+    pub fn upsert_symbol(
+        &self,
+        file_id: &str,
+        name: &str,
+        kind: &str,
+        start_line: u32,
+        end_line: u32,
+        content_hash: Option<&str>,
+    ) -> Result<Symbol> {
         let guard = self.conn.lock().map_err(|_| anyhow!("Mutex poisoned"))?;
         let generated_id = Uuid::new_v4().to_string();
 
         guard.query_row(
-            r#"INSERT INTO symbols (id, file_id, name, kind, line)
-               VALUES (?1, ?2, ?3, ?4, ?5)
+            r#"INSERT INTO symbols (id, file_id, name, kind, line, start_line, end_line, content_hash)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7)
                ON CONFLICT(file_id, name, kind, line) DO UPDATE SET
-                   id = id -- Noop update to return the existing row
-               RETURNING id, file_id, name, kind, line"#,
-            params![generated_id, file_id, name, kind, line],
+                   start_line = excluded.start_line,
+                   end_line = excluded.end_line,
+                   content_hash = excluded.content_hash
+               RETURNING id, file_id, name, kind, line, start_line, end_line, content_hash"#,
+            params![generated_id, file_id, name, kind, start_line, end_line, content_hash],
             |row| {
                 Ok(Symbol {
                     id: row.get(0)?,
@@ -194,6 +236,9 @@ impl CodeGraphStore {
                     name: row.get(2)?,
                     kind: row.get(3)?,
                     line: row.get(4)?,
+                    start_line: row.get(5)?,
+                    end_line: row.get(6)?,
+                    content_hash: row.get(7)?,
                 })
             },
         ).context("Failed to upsert symbol")
@@ -204,6 +249,56 @@ impl CodeGraphStore {
         let guard = self.conn.lock().map_err(|_| anyhow!("Mutex poisoned"))?;
         let count = guard.execute("DELETE FROM symbols WHERE file_id = ?1", params![file_id])?;
         Ok(count)
+    }
+
+    pub fn upsert_symbol_edge(
+        &self,
+        from_symbol_id: &str,
+        target_name: &str,
+        kind: &str,
+    ) -> Result<SymbolEdge> {
+        let guard = self.conn.lock().map_err(|_| anyhow!("Mutex poisoned"))?;
+        let generated_id = Uuid::new_v4().to_string();
+
+        guard
+            .query_row(
+                r#"INSERT INTO symbol_edges (id, from_symbol_id, target_name, kind)
+                   VALUES (?1, ?2, ?3, ?4)
+                   ON CONFLICT(from_symbol_id, target_name, kind) DO UPDATE SET
+                       target_name = excluded.target_name
+                   RETURNING id, from_symbol_id, target_name, kind"#,
+                params![generated_id, from_symbol_id, target_name, kind],
+                |row| {
+                    Ok(SymbolEdge {
+                        id: row.get(0)?,
+                        from_symbol_id: row.get(1)?,
+                        target_name: row.get(2)?,
+                        kind: row.get(3)?,
+                    })
+                },
+            )
+            .context("Failed to upsert symbol edge")
+    }
+
+    pub fn symbol_edges(&self, from_symbol_id: &str) -> Result<Vec<SymbolEdge>> {
+        let guard = self.conn.lock().map_err(|_| anyhow!("Mutex poisoned"))?;
+        let mut stmt = guard.prepare(
+            "SELECT id, from_symbol_id, target_name, kind
+             FROM symbol_edges
+             WHERE from_symbol_id = ?1
+             ORDER BY target_name ASC, kind ASC",
+        )?;
+        let res = stmt
+            .query_map(params![from_symbol_id], |row| {
+                Ok(SymbolEdge {
+                    id: row.get(0)?,
+                    from_symbol_id: row.get(1)?,
+                    target_name: row.get(2)?,
+                    kind: row.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(res)
     }
 
     /// Lists all projects sorted alphabetically.
@@ -226,7 +321,7 @@ impl CodeGraphStore {
     /// Retrieves all registered files for a given project.
     pub fn project_files(&self, project_id: &str) -> Result<Vec<SourceFile>> {
         let guard = self.conn.lock().map_err(|_| anyhow!("Mutex poisoned"))?;
-        let mut stmt = guard.prepare("SELECT id, project_id, path, checksum, last_indexed FROM files WHERE project_id = ?1 ORDER BY path ASC")?;
+        let mut stmt = guard.prepare("SELECT id, project_id, path, checksum, index_version, last_indexed FROM files WHERE project_id = ?1 ORDER BY path ASC")?;
         
         let res = stmt.query_map(params![project_id], |row| {
             Ok(SourceFile {
@@ -234,7 +329,8 @@ impl CodeGraphStore {
                 project_id: row.get(1)?,
                 path: row.get(2)?,
                 checksum: row.get(3)?,
-                last_indexed: parse_opt_dt(row.get(4)?),
+                index_version: row.get(4)?,
+                last_indexed: parse_opt_dt(row.get(5)?),
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -244,7 +340,7 @@ impl CodeGraphStore {
     /// Retrieves parsed symbols for a given file sorted by line number.
     pub fn file_symbols(&self, file_id: &str) -> Result<Vec<Symbol>> {
         let guard = self.conn.lock().map_err(|_| anyhow!("Mutex poisoned"))?;
-        let mut stmt = guard.prepare("SELECT id, file_id, name, kind, line FROM symbols WHERE file_id = ?1 ORDER BY line ASC, name ASC")?;
+        let mut stmt = guard.prepare("SELECT id, file_id, name, kind, line, start_line, end_line, content_hash FROM symbols WHERE file_id = ?1 ORDER BY start_line ASC, name ASC")?;
         
         let res = stmt.query_map(params![file_id], |row| {
             Ok(Symbol {
@@ -253,6 +349,9 @@ impl CodeGraphStore {
                 name: row.get(2)?,
                 kind: row.get(3)?,
                 line: row.get(4)?,
+                start_line: row.get(5)?,
+                end_line: row.get(6)?,
+                content_hash: row.get(7)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -266,7 +365,7 @@ impl CodeGraphStore {
         // Wrap the query in wildcards for substring matching
         let like_query = format!("%{}%", query);
         let mut stmt = guard.prepare(
-            "SELECT id, project_id, path, checksum, last_indexed 
+            "SELECT id, project_id, path, checksum, index_version, last_indexed 
              FROM files 
              WHERE project_id = ?1 AND path LIKE ?2 
              ORDER BY path ASC LIMIT 20"
@@ -278,11 +377,64 @@ impl CodeGraphStore {
                 project_id: row.get(1)?,
                 path: row.get(2)?,
                 checksum: row.get(3)?,
-                last_indexed: parse_opt_dt(row.get(4)?),
+                index_version: row.get(4)?,
+                last_indexed: parse_opt_dt(row.get(5)?),
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
         
+        Ok(res)
+    }
+
+    /// Returns symbols matching a name or file-path query.
+    pub fn search_symbols(&self, project_id: &str, query: &str) -> Result<Vec<(SourceFile, Symbol)>> {
+        let guard = self.conn.lock().map_err(|_| anyhow::anyhow!("Mutex poisoned"))?;
+        let like_query = format!("%{}%", query);
+        let mut stmt = guard.prepare(
+            "SELECT
+                f.id, f.project_id, f.path, f.checksum, f.index_version, f.last_indexed,
+                s.id, s.file_id, s.name, s.kind, s.line, s.start_line, s.end_line, s.content_hash
+             FROM symbols s
+             JOIN files f ON f.id = s.file_id
+             WHERE f.project_id = ?1
+               AND (
+                   s.name LIKE ?2
+                   OR f.path LIKE ?2
+                   OR EXISTS (
+                       SELECT 1 FROM symbol_edges e
+                       WHERE e.from_symbol_id = s.id
+                         AND e.target_name LIKE ?2
+                   )
+               )
+             ORDER BY f.path ASC, s.start_line ASC, s.name ASC
+             LIMIT 50",
+        )?;
+
+        let res = stmt
+            .query_map(params![project_id, like_query], |row| {
+                Ok((
+                    SourceFile {
+                        id: row.get(0)?,
+                        project_id: row.get(1)?,
+                        path: row.get(2)?,
+                        checksum: row.get(3)?,
+                        index_version: row.get(4)?,
+                        last_indexed: parse_opt_dt(row.get(5)?),
+                    },
+                    Symbol {
+                        id: row.get(6)?,
+                        file_id: row.get(7)?,
+                        name: row.get(8)?,
+                        kind: row.get(9)?,
+                        line: row.get(10)?,
+                        start_line: row.get(11)?,
+                        end_line: row.get(12)?,
+                        content_hash: row.get(13)?,
+                    },
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
         Ok(res)
     }
 
@@ -295,6 +447,62 @@ impl CodeGraphStore {
         )?;
         Ok(())
     }
+}
+
+fn migrate_schema(conn: &Connection) -> Result<()> {
+    ensure_column(conn, "files", "index_version", "INTEGER NOT NULL DEFAULT 0")?;
+    ensure_column(conn, "symbols", "start_line", "INTEGER NOT NULL DEFAULT 0")?;
+    ensure_column(conn, "symbols", "end_line", "INTEGER NOT NULL DEFAULT 0")?;
+    ensure_column(conn, "symbols", "content_hash", "TEXT")?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS symbol_edges (
+            id TEXT PRIMARY KEY,
+            from_symbol_id TEXT NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
+            target_name TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            UNIQUE(from_symbol_id, target_name, kind)
+         )",
+        [],
+    )?;
+    conn.execute(
+        "UPDATE symbols SET start_line = line WHERE start_line = 0",
+        [],
+    )?;
+    conn.execute(
+        "UPDATE symbols SET end_line = line WHERE end_line = 0",
+        [],
+    )?;
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_symbols_legacy_identity ON symbols(file_id, name, kind, line)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_symbols_range ON symbols(file_id, start_line, end_line)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_symbol_edges_from ON symbol_edges(from_symbol_id)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_symbol_edges_target ON symbol_edges(target_name)",
+        [],
+    )?;
+    Ok(())
+}
+
+fn ensure_column(conn: &Connection, table: &str, column: &str, declaration: &str) -> Result<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({})", table))?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if !columns.iter().any(|existing| existing == column) {
+        conn.execute(
+            &format!("ALTER TABLE {} ADD COLUMN {} {}", table, column, declaration),
+            [],
+        )?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -321,9 +529,30 @@ mod tests {
         assert_eq!(file.id, file_dup.id);
         assert_eq!(file_dup.checksum.as_deref(), Some("def"));
 
-        let _sym = store.upsert_symbol(&file.id, "main", "fn", 1).unwrap();
+        assert_eq!(file.index_version, 1);
+        assert_eq!(file_dup.index_version, 2);
+
+        let _sym = store
+            .upsert_symbol(&file.id, "main", "fn", 1, 4, Some("hash"))
+            .unwrap();
         let syms = store.file_symbols(&file.id).unwrap();
         assert_eq!(syms.len(), 1);
+        assert_eq!(syms[0].start_line, 1);
+        assert_eq!(syms[0].end_line, 4);
+        assert_eq!(syms[0].content_hash.as_deref(), Some("hash"));
+
+        let hits = store.search_symbols(&proj.id, "main").unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].1.name, "main");
+
+        let edge = store
+            .upsert_symbol_edge(&syms[0].id, "println", "call")
+            .unwrap();
+        assert_eq!(edge.target_name, "println");
+        assert_eq!(store.symbol_edges(&syms[0].id).unwrap().len(), 1);
+        let edge_hits = store.search_symbols(&proj.id, "println").unwrap();
+        assert_eq!(edge_hits.len(), 1);
+        assert_eq!(edge_hits[0].1.name, "main");
 
         store.clear_file_symbols(&file.id).unwrap();
         assert!(store.file_symbols(&file.id).unwrap().is_empty());
