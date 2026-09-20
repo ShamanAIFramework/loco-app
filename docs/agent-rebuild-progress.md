@@ -90,11 +90,23 @@ Rebuild the orchestrator and `agentv2` behavior so deterministic Rust code contr
 - Added runtime metadata trace events with the Tauri sidecar endpoint, best-effort `/v1/models` model id, and queue policy.
 - Added deterministic intake fallback for non-empty actionable code/UI prompts when the model incorrectly labels them `Unclear`.
 - Updated the left-panel workspace path text to wrap instead of truncating.
+- Improved location-answer quality:
+  - evidence snippets now include line numbers in prompts
+  - notebook context now includes file provenance and line ranges
+  - broad file reads use a larger per-slice budget so nearby render blocks are less likely to be truncated
+  - whole-file evidence for location-style questions is deterministically narrowed to the best matching section before extraction
+  - synthesis/extraction prompts ask for exact file and line ranges on UI/code location questions
+  - final citation ordering prefers the narrowest active file range
+  - rendered sources now include file and line provenance, not only notebook ids
+- Added regression coverage for line-numbered evidence, wider UI-location slice budgets, deterministic GitPanel-style JSX section focusing, non-location whole-file preservation, and citation specificity ordering.
+- Improved chat progress visibility:
+  - agent-core emits more fine-grained status updates for model calls, searches, reads, focusing, lease checks, and synthesis
+  - chat UI shows an elapsed timer for the current progress step
 
 ## Verified
 
 - `cargo test --workspace`
-  - 10 tests passed.
+  - 15 tests passed.
 - `cargo test --manifest-path src-tauri/Cargo.toml`
   - 5 Tauri-side tests passed.
 - `cargo check --manifest-path src-tauri/Cargo.toml`

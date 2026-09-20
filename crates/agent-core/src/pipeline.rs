@@ -40,7 +40,9 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
 
     runtime
         .progress
-        .emit(AgentProgress::Status("Classifying request...".to_string()))
+        .emit(AgentProgress::Status(
+            "Figuring out what kind of code question this is...".to_string(),
+        ))
         .await;
     trace.push(TraceEvent::PhaseStarted {
         phase: Phase::Intake,
@@ -69,6 +71,12 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
         phase: Phase::Intake,
         notebook: notebook.deterministic_checkpoint(),
     });
+    runtime
+        .progress
+        .emit(AgentProgress::Status(
+            "Asking the local model to choose a search strategy...".to_string(),
+        ))
+        .await;
     let intake_resp = runtime.llm.complete_json(intake_req.clone()).await?;
     llm_calls += 1;
     trace.push(TraceEvent::LlmCall {
@@ -106,9 +114,13 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
 
     runtime
         .progress
-        .emit(AgentProgress::Status(
-            "Searching indexed files...".to_string(),
-        ))
+        .emit(AgentProgress::Status(format!(
+            "Looking through the workspace with {} focused queries...",
+            intake
+                .search_queries
+                .len()
+                .min(task.budgets.max_search_queries)
+        )))
         .await;
 
     let mut file_paths = BTreeMap::<String, i64>::new();
@@ -118,6 +130,13 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
         .iter()
         .take(task.budgets.max_search_queries)
     {
+        runtime
+            .progress
+            .emit(AgentProgress::Status(format!(
+                "Checking indexed files for `{}`...",
+                query
+            )))
+            .await;
         let hits = runtime
             .code_search
             .search(query, task.budgets.max_files_to_read)
@@ -135,6 +154,13 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
                 .or_insert(hit.score);
         }
 
+        runtime
+            .progress
+            .emit(AgentProgress::Status(format!(
+                "Checking symbols and definitions for `{}`...",
+                query
+            )))
+            .await;
         let symbols = runtime
             .code_search
             .search_symbols(query, task.budgets.max_files_to_read)
@@ -176,6 +202,13 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
         .into_iter()
         .take(task.budgets.max_files_to_read)
     {
+        runtime
+            .progress
+            .emit(AgentProgress::Status(format!(
+                "Reading the `{}` definition in `{}` lines {}-{}...",
+                hit.symbol, hit.path, hit.start_line, hit.end_line
+            )))
+            .await;
         match runtime
             .file_reader
             .read_range(
@@ -183,7 +216,7 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
                 Some(&hit.symbol),
                 hit.start_line,
                 hit.end_line,
-                task.budgets.max_evidence_chars / task.budgets.max_files_to_read.max(1),
+                per_slice_budget(&task),
             )
             .await
         {
@@ -234,15 +267,27 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
         if read_paths.contains(&path) && !evidence.is_empty() {
             continue;
         }
+        runtime
+            .progress
+            .emit(AgentProgress::Status(format!(
+                "Opening `{}` to inspect the relevant code...",
+                path
+            )))
+            .await;
         match runtime
             .file_reader
-            .read_file(
-                &path,
-                task.budgets.max_evidence_chars / task.budgets.max_files_to_read.max(1),
-            )
+            .read_file(&path, per_slice_budget(&task))
             .await
         {
             Ok(slice) => {
+                runtime
+                    .progress
+                    .emit(AgentProgress::Status(format!(
+                        "Narrowing `{}` to the most relevant section...",
+                        slice.lease.path
+                    )))
+                    .await;
+                let slice = focus_location_slice(slice, &task.question, &intake.search_queries);
                 let fact_id = notebook.append_tool_fact(
                     format!(
                         "Read {} lines {}-{} under lease {}",
@@ -305,7 +350,7 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
         runtime
             .progress
             .emit(AgentProgress::Status(format!(
-                "Extracting cited findings round {}...",
+                "Pulling out cited findings, pass {}...",
                 round + 1
             )))
             .await;
@@ -319,7 +364,7 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
             task: task_block(&task),
             notebook: notebook_block(&notebook, &target_tags, 32),
             evidence: evidence_block(&evidence),
-            question: "QUESTION\nExtract only claims supported by the leased evidence. Each inference must cite one provided lease_id. Say what is missing without retrieving it.".to_string(),
+            question: "QUESTION\nExtract only claims supported by the leased evidence. Each inference must cite one provided lease_id and preserve the most specific file path, line range, and UI/code block purpose in the statement. For UI location questions, identify the exact JSX/render block when present. Say what is missing without retrieving it.".to_string(),
         };
         let extract_prompt = extract_parts.render();
 
@@ -336,6 +381,13 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
             phase: Phase::Extract,
             notebook: notebook.deterministic_checkpoint(),
         });
+        runtime
+            .progress
+            .emit(AgentProgress::Status(format!(
+                "Asking the local model to turn evidence into cited findings, pass {}...",
+                round + 1
+            )))
+            .await;
         let extract_resp = runtime.llm.complete_json(extract_req.clone()).await?;
         llm_calls += 1;
         trace.push(TraceEvent::LlmCall {
@@ -353,6 +405,13 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
         let before_count = inference_entry_ids.len();
         for inference in extract.inferences {
             if let Some(lease) = lease_index.get(&inference.lease_id) {
+                runtime
+                    .progress
+                    .emit(AgentProgress::Status(format!(
+                        "Checking that `{}` lines {}-{} are still current...",
+                        lease.path, lease.range.start, lease.range.end
+                    )))
+                    .await;
                 if runtime.file_reader.verify_lease(lease).await? == LeaseStatus::Expired {
                     notebook.mark_stale_by_lease(&lease.id);
                     trace.push(TraceEvent::LeaseInvalidated {
@@ -427,7 +486,7 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
     runtime
         .progress
         .emit(AgentProgress::Status(
-            "Synthesizing cited answer...".to_string(),
+            "Putting the cited findings together...".to_string(),
         ))
         .await;
 
@@ -457,13 +516,19 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
     trace.push(TraceEvent::PhaseStarted {
         phase: Phase::Synthesize,
     });
+    runtime
+        .progress
+        .emit(AgentProgress::Status(
+            "Choosing the strongest notebook entries to cite...".to_string(),
+        ))
+        .await;
     let synth_parts = PromptParts {
         global_prefix: global,
         phase_prefix: phase_prefix(Phase::Synthesize, "SynthesizeOutput"),
         task: task_block(&task),
         notebook: notebook_block(&notebook, &target_tags, 64),
         evidence: "EPHEMERAL EVIDENCE\nUse notebook entries as the citation surface. Do not cite leases directly in the final answer.".to_string(),
-        question: "QUESTION\nWrite a concise final answer. Cite notebook entry ids that support the answer. If evidence is weak, say what is uncertain.".to_string(),
+        question: "QUESTION\nWrite a concise final answer. For location questions, name the exact file and line range, then explain what that block does. Prefer the most specific active notebook entry for citations, especially entries with the narrowest file range. If evidence is weak, say what is uncertain.".to_string(),
     };
     let synth_prompt = synth_parts.render();
 
@@ -480,6 +545,12 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
         phase: Phase::Synthesize,
         notebook: notebook.deterministic_checkpoint(),
     });
+    runtime
+        .progress
+        .emit(AgentProgress::Status(
+            "Asking the local model to write the final answer...".to_string(),
+        ))
+        .await;
     let synth_resp = runtime.llm.complete_json(synth_req.clone()).await?;
     trace.push(TraceEvent::LlmCall {
         request: synth_req,
@@ -488,16 +559,19 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
 
     let synth: SynthesizeOutput = parse_json(&synth_resp.raw_json)
         .unwrap_or_else(|_| fallback_synthesize(&task, &notebook, &inference_entry_ids));
-    let cited_entries = synth
-        .cited_entries
-        .into_iter()
-        .filter(|id| {
-            notebook
-                .get(id)
-                .map(|entry| entry.status == crate::notebook::EntryStatus::Active)
-                .unwrap_or(false)
-        })
-        .collect::<Vec<_>>();
+    let cited_entries = sort_citations_by_specificity(
+        &notebook,
+        synth
+            .cited_entries
+            .into_iter()
+            .filter(|id| {
+                notebook
+                    .get(id)
+                    .map(|entry| entry.status == crate::notebook::EntryStatus::Active)
+                    .unwrap_or(false)
+            })
+            .collect::<Vec<_>>(),
+    );
     let stop_reason = synth.stop_reason;
     let answer = AgentAnswer {
         content: synth.answer,
@@ -574,7 +648,10 @@ fn fallback_extract(evidence: &[EvidenceSlice]) -> ExtractOutput {
             .iter()
             .take(3)
             .map(|slice| crate::types::ModelInference {
-                statement: format!("Relevant evidence was found in {}", slice.lease.path),
+                statement: format!(
+                    "Relevant evidence was found in {} lines {}-{}",
+                    slice.lease.path, slice.lease.range.start, slice.lease.range.end
+                ),
                 lease_id: slice.lease.id.clone(),
                 tags: vec![slice.lease.path.clone()],
             })
@@ -620,14 +697,178 @@ fn fallback_answer(
 }
 
 fn active_entries(notebook: &Notebook, ids: Vec<EntryId>) -> Vec<EntryId> {
-    ids.into_iter()
-        .filter(|id| {
-            notebook
-                .get(id)
-                .map(|entry| entry.status == crate::notebook::EntryStatus::Active)
-                .unwrap_or(false)
+    sort_citations_by_specificity(
+        notebook,
+        ids.into_iter()
+            .filter(|id| {
+                notebook
+                    .get(id)
+                    .map(|entry| entry.status == crate::notebook::EntryStatus::Active)
+                    .unwrap_or(false)
+            })
+            .collect(),
+    )
+}
+
+fn sort_citations_by_specificity(notebook: &Notebook, mut ids: Vec<EntryId>) -> Vec<EntryId> {
+    ids.sort_by_key(|id| {
+        notebook
+            .get(id)
+            .map(|entry| match &entry.provenance {
+                Provenance::File { range, symbol, .. } => {
+                    let width = range.end.saturating_sub(range.start);
+                    (0usize, symbol.is_none(), width, range.start)
+                }
+                _ => (1usize, true, usize::MAX, usize::MAX),
+            })
+            .unwrap_or((2usize, true, usize::MAX, usize::MAX))
+    });
+    ids
+}
+
+fn per_slice_budget(task: &TaskRequest) -> usize {
+    let fair_share = task.budgets.max_evidence_chars / task.budgets.max_files_to_read.max(1);
+    fair_share.max(8_000).min(task.budgets.max_evidence_chars)
+}
+
+fn focus_location_slice(
+    slice: EvidenceSlice,
+    question: &str,
+    search_queries: &[String],
+) -> EvidenceSlice {
+    if !looks_like_location_question(question) || slice.lease.symbol.is_some() {
+        return slice;
+    }
+
+    let lines = slice.content.lines().collect::<Vec<_>>();
+    if lines.len() <= 80 {
+        return slice;
+    }
+
+    let terms = location_terms(question, search_queries);
+    if terms.is_empty() {
+        return slice;
+    }
+
+    let Some(best_idx) = best_matching_line(&lines, &terms) else {
+        return slice;
+    };
+    let (start_idx, end_idx) = focused_line_window(&lines, best_idx);
+    if start_idx == 0 && end_idx + 1 == lines.len() {
+        return slice;
+    }
+
+    let content = lines[start_idx..=end_idx].join("\n");
+    let range = LineRange {
+        start: slice.lease.range.start + start_idx,
+        end: slice.lease.range.start + end_idx,
+    };
+    EvidenceSlice {
+        lease: EvidenceLease::new(slice.lease.path, None, range, &content),
+        content,
+    }
+}
+
+fn looks_like_location_question(question: &str) -> bool {
+    let lower = question.to_lowercase();
+    ["where", "display", "render", "show", "locate", "which file"]
+        .iter()
+        .any(|needle| lower.contains(needle))
+}
+
+fn location_terms(question: &str, search_queries: &[String]) -> Vec<String> {
+    let mut terms =
+        question
+            .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
+            .chain(search_queries.iter().flat_map(|query| {
+                query.split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
+            }))
+            .map(|term| term.to_lowercase())
+            .filter(|term| term.len() > 2)
+            .filter(|term| {
+                !matches!(
+                    term.as_str(),
+                    "where"
+                        | "which"
+                        | "what"
+                        | "the"
+                        | "our"
+                        | "does"
+                        | "display"
+                        | "render"
+                        | "show"
+                        | "locate"
+                        | "file"
+                        | "code"
+                )
+            })
+            .flat_map(|term| {
+                let stem = term
+                    .trim_end_matches("ing")
+                    .trim_end_matches("ed")
+                    .trim_end_matches('s')
+                    .to_string();
+                if stem != term && stem.len() > 2 {
+                    vec![term, stem]
+                } else {
+                    vec![term]
+                }
+            })
+            .collect::<Vec<_>>();
+    dedup(&mut terms);
+    terms
+}
+
+fn best_matching_line(lines: &[&str], terms: &[String]) -> Option<usize> {
+    lines
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, line)| {
+            let lower = line.to_lowercase();
+            let mut score = terms
+                .iter()
+                .filter(|term| lower.contains(term.as_str()))
+                .count() as i64;
+            if lower.contains("list") {
+                score += 1;
+            }
+            if lower.contains("files") || lower.contains("file") {
+                score += 1;
+            }
+            if lower.contains("{/*") {
+                score += 2;
+            }
+            if score > 0 {
+                Some((idx, score))
+            } else {
+                None
+            }
         })
-        .collect()
+        .max_by(|(left_idx, left_score), (right_idx, right_score)| {
+            left_score
+                .cmp(right_score)
+                .then_with(|| right_idx.cmp(left_idx))
+        })
+        .map(|(idx, _)| idx)
+}
+
+fn focused_line_window(lines: &[&str], best_idx: usize) -> (usize, usize) {
+    let mut start = best_idx.saturating_sub(34);
+    let mut end = (best_idx + 34).min(lines.len().saturating_sub(1));
+
+    if lines[best_idx].contains("{/*") {
+        start = best_idx;
+        if let Some(next_comment) = lines
+            .iter()
+            .enumerate()
+            .skip(best_idx + 1)
+            .find_map(|(idx, line)| line.contains("{/*").then_some(idx))
+        {
+            end = next_comment.saturating_sub(2).max(start);
+        }
+    }
+
+    (start, end)
 }
 
 fn parse_json<T: DeserializeOwned>(raw: &str) -> Result<T> {
@@ -911,5 +1152,123 @@ mod tests {
 
         assert_eq!(intake.task_type, TaskType::Explain);
         assert!(!intake.search_queries.is_empty());
+    }
+
+    #[test]
+    fn citations_prefer_narrower_file_ranges() {
+        let lease = EvidenceLease::new(
+            "src/GitPanel.tsx".to_string(),
+            None,
+            LineRange { start: 1, end: 160 },
+            "whole file",
+        );
+        let narrow_lease = EvidenceLease::new(
+            "src/GitPanel.tsx".to_string(),
+            Some("ChangedFilesList".to_string()),
+            LineRange {
+                start: 106,
+                end: 140,
+            },
+            "changed files list",
+        );
+        let mut notebook = Notebook::default();
+        let broad = notebook.append_tool_fact(
+            "Read src/GitPanel.tsx lines 1-160",
+            Provenance::File {
+                path: lease.path,
+                symbol: lease.symbol,
+                range: lease.range,
+                lease_id: lease.id,
+            },
+            Phase::Extract,
+            vec!["src/GitPanel.tsx".to_string()],
+        );
+        let narrow = notebook.append_tool_fact(
+            "Read src/GitPanel.tsx lines 106-140",
+            Provenance::File {
+                path: narrow_lease.path,
+                symbol: narrow_lease.symbol,
+                range: narrow_lease.range,
+                lease_id: narrow_lease.id,
+            },
+            Phase::Extract,
+            vec!["src/GitPanel.tsx".to_string()],
+        );
+
+        let sorted = sort_citations_by_specificity(&notebook, vec![broad, narrow.clone()]);
+
+        assert_eq!(sorted.first(), Some(&narrow));
+    }
+
+    #[test]
+    fn per_slice_budget_keeps_ui_render_blocks_in_view() {
+        let task = TaskRequest {
+            run_id: "run".to_string(),
+            session_id: "session".to_string(),
+            workspace_path: None,
+            question: "where in the UI do we display git change file list?".to_string(),
+            conversation: Vec::new(),
+            budgets: Budgets::default(),
+        };
+
+        assert!(per_slice_budget(&task) >= 8_000);
+    }
+
+    #[test]
+    fn location_question_focuses_whole_file_slice_to_matching_jsx_section() {
+        let mut lines = Vec::new();
+        for idx in 1..=228 {
+            let line = match idx {
+                106 => "      {/* Changed Files List (Top Half) */}".to_string(),
+                107 => "      <div class=\"shrink-0 max-h-60 overflow-y-auto\">".to_string(),
+                113 => "        <For each={files()}>".to_string(),
+                127 => {
+                    "              <span class=\"truncate block\" title={file.path}>".to_string()
+                }
+                133 => "                class={`font-mono text-xs ${getStatusColor(file.status)}`}"
+                    .to_string(),
+                140 => "      </div>".to_string(),
+                142 => "      {/* Diff Viewer (Bottom Half) */}".to_string(),
+                _ => format!("      <div>line {idx}</div>"),
+            };
+            lines.push(line);
+        }
+        let content = lines.join("\n");
+        let slice = EvidenceSlice {
+            lease: EvidenceLease::new(
+                "src/GitPanel.tsx".to_string(),
+                None,
+                LineRange { start: 1, end: 228 },
+                &content,
+            ),
+            content,
+        };
+
+        let focused = focus_location_slice(
+            slice,
+            "where in the UI do we display git change file list?",
+            &["git change file list".to_string()],
+        );
+
+        assert_eq!(focused.lease.range.start, 106);
+        assert_eq!(focused.lease.range.end, 140);
+        assert!(focused.content.contains("<For each={files()}>"));
+        assert!(!focused.content.contains("Diff Viewer"));
+    }
+
+    #[test]
+    fn non_location_question_keeps_whole_file_slice() {
+        let slice = lease_for_text(
+            "src/GitPanel.tsx".to_string(),
+            &(1..=100)
+                .map(|idx| format!("line {idx}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+
+        let focused = focus_location_slice(slice, "explain this file", &[]);
+
+        assert_eq!(focused.lease.range.start, 1);
+        assert_eq!(focused.lease.range.end, 100);
     }
 }

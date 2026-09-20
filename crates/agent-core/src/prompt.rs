@@ -1,4 +1,4 @@
-use crate::notebook::Notebook;
+use crate::notebook::{Notebook, Provenance};
 use crate::types::{EvidenceSlice, Phase, TaskRequest};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -66,8 +66,12 @@ pub fn notebook_block(notebook: &Notebook, target_tags: &[String], limit: usize)
     let mut lines = Vec::new();
     for entry in entries {
         lines.push(format!(
-            "- {} {:?} {:?}: {}",
-            entry.id.0, entry.kind, entry.status, entry.statement
+            "- {} {:?} {:?} {}: {}",
+            entry.id.0,
+            entry.kind,
+            entry.status,
+            provenance_label(&entry.provenance),
+            entry.statement
         ));
     }
     format!("NOTEBOOK\n{}", lines.join("\n"))
@@ -87,10 +91,40 @@ pub fn evidence_block(evidence: &[EvidenceSlice]) -> String {
             slice.lease.range.start,
             slice.lease.range.end,
             slice.lease.content_hash,
-            slice.content
+            line_numbered_content(slice)
         ));
     }
     format!("EPHEMERAL EVIDENCE\n{}", chunks.join("\n\n"))
+}
+
+fn line_numbered_content(slice: &EvidenceSlice) -> String {
+    slice
+        .content
+        .lines()
+        .enumerate()
+        .map(|(idx, line)| format!("{:>5}: {}", slice.lease.range.start + idx, line))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn provenance_label(provenance: &Provenance) -> String {
+    match provenance {
+        Provenance::File {
+            path,
+            symbol,
+            range,
+            ..
+        } => {
+            let symbol = symbol
+                .as_ref()
+                .map(|value| format!(" symbol={}", value))
+                .unwrap_or_default();
+            format!("[{} lines {}-{}{}]", path, range.start, range.end, symbol)
+        }
+        Provenance::CodeGraph { query, .. } => format!("[codegraph query={}]", query),
+        Provenance::Model { call_id } => format!("[model call={}]", call_id),
+        Provenance::Tool { name, .. } => format!("[tool={}]", name),
+    }
 }
 
 pub fn schema_intake() -> serde_json::Value {
@@ -217,6 +251,28 @@ mod tests {
         assert!(first.starts_with(&stable));
         assert!(second.starts_with(&stable));
         assert!(common_prefix_len(&first, &second) >= stable.len());
+    }
+
+    #[test]
+    fn evidence_block_adds_line_numbers() {
+        let slice = EvidenceSlice {
+            lease: crate::notebook::EvidenceLease::new(
+                "src/GitPanel.tsx".to_string(),
+                None,
+                crate::notebook::LineRange {
+                    start: 106,
+                    end: 108,
+                },
+                "first\nsecond\nthird",
+            ),
+            content: "first\nsecond\nthird".to_string(),
+        };
+
+        let rendered = evidence_block(&[slice]);
+
+        assert!(rendered.contains("LINES 106-108"));
+        assert!(rendered.contains("  106: first"));
+        assert!(rendered.contains("  108: third"));
     }
 
     fn common_prefix_len(left: &str, right: &str) -> usize {

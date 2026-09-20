@@ -519,10 +519,37 @@ fn render_answer_with_citations(answer: &agent_core::AgentAnswer) -> String {
     rendered.push_str("\n\nSources:\n");
     for entry_id in &answer.cited_entries {
         if let Some(entry) = answer.notebook.get(entry_id) {
-            rendered.push_str(&format!("- `{}` {}\n", entry.id.0, entry.statement));
+            rendered.push_str(&format!(
+                "- `{}` {} — {}\n",
+                entry.id.0,
+                render_provenance(&entry.provenance),
+                entry.statement
+            ));
         }
     }
     rendered
+}
+
+fn render_provenance(provenance: &agent_core::Provenance) -> String {
+    match provenance {
+        agent_core::Provenance::File {
+            path,
+            symbol,
+            range,
+            ..
+        } => {
+            let symbol = symbol
+                .as_ref()
+                .map(|value| format!(" `{}`", value))
+                .unwrap_or_default();
+            format!("`{}:{}-{}`{}", path, range.start, range.end, symbol)
+        }
+        agent_core::Provenance::CodeGraph { query, .. } => {
+            format!("codegraph query `{}`", query)
+        }
+        agent_core::Provenance::Model { call_id } => format!("model call `{}`", call_id),
+        agent_core::Provenance::Tool { name, .. } => format!("tool `{}`", name),
+    }
 }
 
 fn score_file_hit(path: &str, query: &str) -> i64 {

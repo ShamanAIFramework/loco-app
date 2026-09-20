@@ -24,9 +24,27 @@ export default function AiChat(props: AiChatProps) {
   const [input, setInput] = createSignal("");
   const [isGenerating, setIsGenerating] = createSignal(false);
   const [activeStatus, setActiveStatus] = createSignal<string | null>(null);
+  const [statusElapsedMs, setStatusElapsedMs] = createSignal(0);
 
   let chatContainerRef: HTMLDivElement | undefined;
   let scrollPending = false;
+  let statusStartedAt = 0;
+  let statusTimer: number | undefined;
+
+  const formatElapsed = (ms: number) => {
+    const totalSeconds = Math.floor(ms / 1000);
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = totalSeconds % 60;
+    return minutes > 0
+      ? `${minutes}:${seconds.toString().padStart(2, "0")}`
+      : `${seconds}s`;
+  };
+
+  const updateStatus = (status: string | null) => {
+    setActiveStatus(status);
+    statusStartedAt = status ? Date.now() : 0;
+    setStatusElapsedMs(0);
+  };
 
   const scheduleScroll = () => {
     if (scrollPending) return;
@@ -47,7 +65,16 @@ export default function AiChat(props: AiChatProps) {
 
   onCleanup(() => {
     scrollPending = false;
+    if (statusTimer) window.clearInterval(statusTimer);
   });
+
+  statusTimer = window.setInterval(() => {
+    if (!activeStatus() || statusStartedAt === 0) {
+      setStatusElapsedMs(0);
+      return;
+    }
+    setStatusElapsedMs(Date.now() - statusStartedAt);
+  }, 1000);
 
   async function handleSubmit(e?: Event) {
     e?.preventDefault();
@@ -58,7 +85,7 @@ export default function AiChat(props: AiChatProps) {
     setMessages((prev) => [...prev, { role: "user", content: currentInput }]);
     setInput("");
     setIsGenerating(true);
-    setActiveStatus("Thinking..."); // Initial status before stream begins
+    updateStatus("Getting the request ready..."); // Initial status before stream begins
 
     // 2. Create empty assistant bubble
     setMessages((prev) => [...prev, { role: "assistant", content: "" }]);
@@ -70,10 +97,10 @@ export default function AiChat(props: AiChatProps) {
       onChunk.onmessage = (event: AgentEvent) => {
         if (event.type === "Status") {
           // Update the status pill for tool execution
-          setActiveStatus(event.data);
+          updateStatus(event.data);
         } else if (event.type === "Chunk") {
           // As soon as real text arrives, clear the status pill
-          if (activeStatus()) setActiveStatus(null);
+          if (activeStatus()) updateStatus(null);
 
           setMessages((prev) => {
             const updated = [...prev];
@@ -106,7 +133,7 @@ export default function AiChat(props: AiChatProps) {
       ]);
     } finally {
       setIsGenerating(false);
-      setActiveStatus(null);
+      updateStatus(null);
     }
   }
 
@@ -127,9 +154,14 @@ export default function AiChat(props: AiChatProps) {
         {/* Dynamic Status Pill for Tool Execution */}
         <Show when={activeStatus()}>
           <div class="flex justify-start px-4">
-            <div class="inline-flex items-center gap-2 px-3 py-1.5 rounded-full bg-gray-800/80 border border-gray-700 text-xs text-gray-400">
-              <span class="w-1.5 h-1.5 rounded-full bg-blue-400 animate-ping"></span>
-              <span>{activeStatus()}</span>
+            <div class="flex max-w-[min(48rem,100%)] items-start gap-2 rounded-2xl border border-gray-700 bg-gray-800/80 px-3 py-2 text-xs leading-relaxed text-gray-400">
+              <span class="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-blue-400 animate-ping"></span>
+              <span class="min-w-0 whitespace-normal break-words">
+                {activeStatus()}
+              </span>
+              <span class="ml-1 shrink-0 tabular-nums text-gray-500">
+                {formatElapsed(statusElapsedMs())}
+              </span>
             </div>
           </div>
         </Show>
