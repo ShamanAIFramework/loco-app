@@ -75,7 +75,7 @@ pub async fn prompt_agent_v2(
         "You are the planner for Loco, a local coding assistant.\n\
          Workspace: {}\n\
          Analyze the request and return a JSON array containing 1 to 3 targeted discovery tasks.\n\
-         Output ONLY raw JSON format: [ {{\"id\": \"1\", \"description\": \"search or read target\"}} ]",
+         Output ONLY raw JSON format.",
         conversation.workspace_path.as_deref().unwrap_or("Unknown")
     );
 
@@ -84,7 +84,38 @@ pub async fn prompt_agent_v2(
         json!({ "role": "user", "content": format!("Create discovery plan for: {}", question) }),
     ];
 
-    let (plan_raw, _) = call_model_stream(&client, conn.port, &conn.api_key, &planner_prompt, None, |_| {}).await?;
+    // Define the strict JSON schema that maps to our PlanTask struct
+    let plan_schema = json!({
+        "type": "json_schema",
+        "json_schema": {
+            "name": "plan_array",
+            "schema": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string" },
+                        "description": { "type": "string" },
+                        "status": { "type": "string" }
+                    },
+                    "required": ["id", "description"],
+                    "additionalProperties": false
+                }
+            },
+            "strict": true
+        }
+    });
+
+    // Pass `Some(plan_schema)` as the response_format
+    let (plan_raw, _) = call_model_stream(
+        &client, 
+        conn.port, 
+        &conn.api_key, 
+        &planner_prompt, 
+        None, 
+        Some(plan_schema), // <-- ENFORCE GRAMMAR HERE
+        |_| {}
+    ).await?;
 
     let mut initial_tasks: Vec<PlanTask> = Vec::new();
     if let Some(start) = plan_raw.find('[') {
@@ -165,6 +196,7 @@ pub async fn prompt_agent_v2(
                         &api_key_c,
                         &worker_messages,
                         Some(get_worker_tools()),
+                        None,
                         |_| {},
                     )
                     .await
@@ -311,6 +343,7 @@ pub async fn prompt_agent_v2(
         conn.port,
         &conn.api_key,
         &synthesis_messages,
+        None,
         None,
         move |chunk| {
             let _ = on_chunk_c.send(AgentEvent::Chunk(chunk));

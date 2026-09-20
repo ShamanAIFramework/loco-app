@@ -102,6 +102,8 @@ pub async fn call_model_stream(
     api_key: &str,
     messages: &[serde_json::Value],
     tools: Option<serde_json::Value>,
+    // --- ADD THIS PARAMETER ---
+    response_format: Option<serde_json::Value>,
     mut chunk_callback: impl FnMut(String),
 ) -> Result<(String, Vec<ExtractedToolCall>)> {
     let mut req_body = json!({
@@ -115,6 +117,11 @@ pub async fn call_model_stream(
     if let Some(t) = tools {
         req_body["tools"] = t;
         req_body["tool_choice"] = json!("auto");
+    }
+
+    // --- ADD THIS INJECTION ---
+    if let Some(format) = response_format {
+        req_body["response_format"] = format;
     }
 
     let mut res = client
