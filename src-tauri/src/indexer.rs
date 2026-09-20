@@ -29,13 +29,7 @@ fn walk_and_index(store: &CodeGraphStore, project_id: &str, current_dir: &Path, 
         let file_name = entry.file_name();
         let file_name_str = file_name.to_string_lossy();
 
-        // Skip hidden files and common massive build directories
-        if file_name_str.starts_with('.') 
-            || file_name_str == "node_modules" 
-            || file_name_str == "target" 
-            || file_name_str == "dist" 
-            || file_name_str == "build" 
-        {
+        if should_skip_entry(&file_name_str) {
             continue;
         }
 
@@ -44,7 +38,7 @@ fn walk_and_index(store: &CodeGraphStore, project_id: &str, current_dir: &Path, 
         } else if path.is_file() {
             if let Ok(rel_path) = path.strip_prefix(root_path) {
                 let rel_str = rel_path.to_string_lossy().to_string();
-                let _ = index_source_file(store, project_id, &path, &rel_str);
+                let _ = index_workspace_file(store, project_id, &path, &rel_str);
             }
         }
     }
@@ -89,7 +83,11 @@ pub fn start_watcher(
                             || path_str.contains("/node_modules/") 
                             || path_str.contains("\\node_modules\\") 
                             || path_str.contains("/target/") 
-                            || path_str.contains("\\target\\") 
+                            || path_str.contains("\\target\\")
+                            || path_str.contains("/models/")
+                            || path_str.contains("\\models\\")
+                            || path_str.contains("/binaries/")
+                            || path_str.contains("\\binaries\\")
                         {
                             continue;
                         }
@@ -101,7 +99,7 @@ pub fn start_watcher(
                             // 3. Incrementally update SQLite based on file existence
                             if path.exists() && path.is_file() {
                                 // File was created or modified
-                                let _ = index_source_file(&state.codegraph, &project_id, &path, &rel_str);
+                                let _ = index_workspace_file(&state.codegraph, &project_id, &path, &rel_str);
                             } else if !path.exists() {
                                 // File was deleted
                                 let _ = state.codegraph.remove_file(&project_id, &rel_str);
@@ -125,17 +123,18 @@ fn file_checksum(path: &Path) -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn index_source_file(
+fn index_workspace_file(
     store: &CodeGraphStore,
     project_id: &str,
     path: &Path,
     rel_path: &str,
 ) -> Result<()> {
-    let checksum = file_checksum(path).ok();
+    let is_source = looks_like_source(rel_path);
+    let checksum = if is_source { file_checksum(path).ok() } else { None };
     let file = store.upsert_file(project_id, rel_path, checksum.as_deref())?;
     store.clear_file_symbols(&file.id)?;
 
-    if !looks_like_source(rel_path) {
+    if !is_source {
         return Ok(());
     }
 
@@ -306,6 +305,20 @@ fn looks_like_source(path: &str) -> bool {
     )
 }
 
+fn should_skip_entry(name: &str) -> bool {
+    name.starts_with('.')
+        || matches!(
+            name,
+            "node_modules"
+                | "target"
+                | "dist"
+                | "build"
+                | "models"
+                | "binaries"
+                | "resources"
+        )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -350,5 +363,14 @@ export class Widget {}
     fn symbol_text_extracts_requested_range() {
         let text = "one\ntwo\nthree\nfour";
         assert_eq!(symbol_text(text, 2, 3), "two\nthree");
+    }
+
+    #[test]
+    fn skips_large_generated_and_resource_directories() {
+        assert!(should_skip_entry("node_modules"));
+        assert!(should_skip_entry("target"));
+        assert!(should_skip_entry("models"));
+        assert!(should_skip_entry("resources"));
+        assert!(!should_skip_entry("src"));
     }
 }

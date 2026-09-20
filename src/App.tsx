@@ -26,6 +26,28 @@ export default function App() {
   const [activeSession, setActiveSession] = createSignal<SessionDetails | null>(
     null,
   );
+  const [isCreatingSession, setIsCreatingSession] = createSignal(false);
+  const [sessionError, setSessionError] = createSignal<string | null>(null);
+
+  const workspacePath = "/Users/ruckus/workspace/loco/loco-app";
+
+  const initializeSession = async () => {
+    if (activeSession() || isCreatingSession()) return;
+
+    setIsCreatingSession(true);
+    setSessionError(null);
+    try {
+      const session = await invoke<SessionDetails>("create_session", {
+        workspacePath,
+      });
+      setActiveSession(session);
+    } catch (e) {
+      console.error("Failed to create session:", e);
+      setSessionError(String(e));
+    } finally {
+      setIsCreatingSession(false);
+    }
+  };
 
   const fetchConnectionDetails = async () => {
     const details = await invoke<AiConnectionDetails | null>(
@@ -35,17 +57,8 @@ export default function App() {
       setConnDetails(details);
       setAppState(details.state);
 
-      // If the engine is ready, initialize our first workspace session
-      if (details.state === "ready" && !activeSession()) {
-        try {
-          // Replace this with your actual absolute path (e.g., "C:\\Users\\Matt\\projects\\loco" or "/home/matt/projects/loco")
-          const session = await invoke<SessionDetails>("create_session", {
-            workspacePath: "/Users/ruckus/workspace/loco/loco-app",
-          });
-          setActiveSession(session);
-        } catch (e) {
-          console.error("Failed to create session:", e);
-        }
+      if (details.state === "ready") {
+        await initializeSession();
       }
     }
   };
@@ -122,8 +135,30 @@ export default function App() {
         </Show>
 
         <Show when={appState() === "ready" && activeSession() !== null}>
-          {/* We now pass the session details instead of the raw connection details */}
           <AiChat session={activeSession()!} />
+        </Show>
+
+        <Show when={appState() === "ready" && activeSession() === null}>
+          <div class="flex flex-col items-center justify-center h-full px-8 text-center">
+            <h1 class="text-xl font-medium text-gray-300">
+              {isCreatingSession()
+                ? "Preparing workspace..."
+                : "Workspace session unavailable"}
+            </h1>
+            <p class="text-sm text-gray-500 mt-2 max-w-xl">
+              {isCreatingSession()
+                ? "Indexing the local project and starting file watching."
+                : sessionError() || "The engine is ready, but no workspace session is active."}
+            </p>
+            <Show when={!isCreatingSession()}>
+              <button
+                class="mt-5 px-4 py-2 rounded-lg bg-gray-800 border border-gray-700 text-gray-200 hover:bg-gray-700"
+                onClick={initializeSession}
+              >
+                Retry session
+              </button>
+            </Show>
+          </div>
         </Show>
       </div>
 
