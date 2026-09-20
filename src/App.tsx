@@ -100,7 +100,7 @@ export default function App() {
               </h2>
               <div class="bg-gray-800/50 p-2.5 rounded-lg border border-gray-700/50">
                 <p
-                  class="text-sm text-gray-300 font-mono truncate"
+                  class="text-sm text-gray-300 font-mono whitespace-normal break-all leading-relaxed"
                   title={activeSession()?.workspace_path || "None"}
                 >
                   {activeSession()?.workspace_path || "No workspace"}

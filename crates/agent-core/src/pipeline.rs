@@ -512,8 +512,50 @@ fn normalize_intake(intake: &mut IntakeOutput, task: &TaskRequest) {
     if intake.search_queries.is_empty() {
         *intake = fallback_intake(&task.question);
     }
+    if intake.task_type == TaskType::Unclear && looks_actionable_code_request(&task.question) {
+        let fallback = fallback_intake(&task.question);
+        intake.task_type = fallback.task_type;
+        if intake.target_hints.is_empty() {
+            intake.target_hints = fallback.target_hints;
+        }
+        if intake.search_queries.is_empty() {
+            intake.search_queries = fallback.search_queries;
+        }
+    }
     dedup(&mut intake.search_queries);
     dedup(&mut intake.target_hints);
+}
+
+fn looks_actionable_code_request(question: &str) -> bool {
+    let lower = question.to_lowercase();
+    let action_words = [
+        "update",
+        "change",
+        "fix",
+        "add",
+        "remove",
+        "make",
+        "wrap",
+        "display",
+        "show",
+        "inspect",
+        "explain",
+        "locate",
+    ];
+    let code_words = [
+        "ui",
+        "component",
+        "panel",
+        "workspace",
+        "app",
+        "tsx",
+        "rust",
+        "tauri",
+        "code",
+        "file",
+    ];
+    action_words.iter().any(|word| lower.contains(word))
+        && code_words.iter().any(|word| lower.contains(word))
 }
 
 fn fallback_extract(evidence: &[EvidenceSlice]) -> ExtractOutput {
@@ -836,5 +878,28 @@ mod tests {
             .notebook
             .iter_in_append_order()
             .all(|entry| entry.kind != crate::notebook::EntryKind::Inference));
+    }
+
+    #[test]
+    fn actionable_ui_prompt_overrides_unclear_intake() {
+        let task = TaskRequest {
+            run_id: "run".to_string(),
+            session_id: "session".to_string(),
+            workspace_path: None,
+            question: "can you update the workspace displayed in the left panel of our UI so it’s not truncated and wraps appropriately".to_string(),
+            conversation: Vec::new(),
+            budgets: Budgets::default(),
+        };
+        let mut intake = IntakeOutput {
+            task_type: TaskType::Unclear,
+            target_hints: Vec::new(),
+            constraints: Vec::new(),
+            search_queries: Vec::new(),
+        };
+
+        normalize_intake(&mut intake, &task);
+
+        assert_eq!(intake.task_type, TaskType::Explain);
+        assert!(!intake.search_queries.is_empty());
     }
 }
