@@ -8,9 +8,9 @@ use serde::Serialize;
 use std::net::TcpListener;
 use std::sync::Mutex;
 use std::time::Duration;
+use tauri::path::BaseDirectory;
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_shell::{process::CommandEvent, ShellExt};
-use tauri::path::BaseDirectory;
 
 const SIDECAR_NAME: &str = "llama-server";
 const MODEL_RESOURCE_PATH: &str = "resources/models/Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf";
@@ -92,7 +92,12 @@ impl EngineState {
         }
     }
 
-    fn update_details(&self, port: u16, api_key: String, child: tauri_plugin_shell::process::CommandChild) {
+    fn update_details(
+        &self,
+        port: u16,
+        api_key: String,
+        child: tauri_plugin_shell::process::CommandChild,
+    ) {
         if let Ok(mut guard) = self.inner.lock() {
             guard.port = Some(port);
             guard.api_key = Some(api_key);
@@ -123,25 +128,32 @@ pub fn initialize(app_handle: AppHandle) {
 
 async fn initialize_inner(app: &AppHandle) -> Result<()> {
     let engine_state = app.state::<EngineState>();
-    
+
     // 1. Emit starting
     let _ = app.emit("ai-state", "starting");
 
-    // 2. Pick a free port. There is a small race condition here between dropping the 
+    // 2. Pick a free port. There is a small race condition here between dropping the
     // listener and the sidecar claiming it, but it is standard for local orchestration.
     let listener = TcpListener::bind((HOST, 0)).context("Failed to bind to dynamic port")?;
-    let port = listener.local_addr().context("Failed to get local addr")?.port();
+    let port = listener
+        .local_addr()
+        .context("Failed to get local addr")?
+        .port();
     drop(listener);
 
     // 3. Generate session API key
-    let api_key = format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple());
+    let api_key = format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    );
 
     // 4. Resolve the model
     let model_path = app
         .path()
         .resolve(MODEL_RESOURCE_PATH, BaseDirectory::Resource)
         .context("Failed to resolve model resource path")?;
-        
+
     if !model_path.exists() {
         return Err(anyhow!("Model file missing at {:?}", model_path));
     }
@@ -153,12 +165,17 @@ async fn initialize_inner(app: &AppHandle) -> Result<()> {
         .context("Failed to locate sidecar binary")?
         .args([
             "serve",
-            "--host", HOST,
-            "--port", &port.to_string(),
-            "--api-key", &api_key,
+            "--host",
+            HOST,
+            "--port",
+            &port.to_string(),
+            "--api-key",
+            &api_key,
             "--no-ui",
-            "--model", &model_path.to_string_lossy(),
-            "--ctx-size", CTX_SIZE,
+            "--model",
+            &model_path.to_string_lossy(),
+            "--ctx-size",
+            CTX_SIZE,
         ])
         .spawn()
         .context("Failed to spawn llama-server sidecar")?;
@@ -189,7 +206,10 @@ async fn initialize_inner(app: &AppHandle) -> Result<()> {
                         }
                     };
                     if is_failed {
-                        log::error!("llama-server terminated unexpectedly with code: {:?}", payload.code);
+                        log::error!(
+                            "llama-server terminated unexpectedly with code: {:?}",
+                            payload.code
+                        );
                         state.set_state(AiState::Failed);
                         let _ = app_handle_for_task.emit("ai-state", "failed");
                     }
@@ -205,28 +225,38 @@ async fn initialize_inner(app: &AppHandle) -> Result<()> {
         .timeout(REQUEST_TIMEOUT)
         .build()
         .context("Failed to build HTTP client")?;
-    
+
     let url = format!("http://{}:{}/v1/models", HOST, port);
     let start = tokio::time::Instant::now();
-    
+
     loop {
         if start.elapsed() > STARTUP_TIMEOUT {
             if let Some(child) = engine_state.take_child() {
                 let _ = child.kill();
             }
-            return Err(anyhow!("Timed out waiting for llama-server to become ready"));
+            return Err(anyhow!(
+                "Timed out waiting for llama-server to become ready"
+            ));
         }
 
         // Fast abort if process crashed
         let current_state = {
-            let guard = engine_state.inner.lock().map_err(|_| anyhow!("Mutex poisoned"))?;
+            let guard = engine_state
+                .inner
+                .lock()
+                .map_err(|_| anyhow!("Mutex poisoned"))?;
             guard.state
         };
         if current_state == AiState::Failed {
             return Err(anyhow!("Engine process failed before becoming ready"));
         }
 
-        match client.get(&url).header("Authorization", format!("Bearer {}", api_key)).send().await {
+        match client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", api_key))
+            .send()
+            .await
+        {
             Ok(res) if res.status().is_success() => {
                 engine_state.set_state(AiState::Ready);
                 let _ = app.emit("ai-state", "ready");

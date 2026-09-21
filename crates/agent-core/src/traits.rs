@@ -1,6 +1,8 @@
 use crate::prompt::PromptParts;
-use crate::types::{ContentHit, EvidenceSlice, FileHit, LeaseStatus, Phase, SymbolHit};
-use anyhow::Result;
+use crate::types::{
+    ContentHit, EvidenceSlice, FileHit, LeaseStatus, Phase, SymbolHit, SymbolRelation,
+};
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
@@ -42,14 +44,70 @@ pub trait LlmClient: Send + Sync {
 #[async_trait]
 pub trait CodeSearch: Send + Sync {
     async fn repo_map(&self, max_entries: usize) -> Result<Vec<String>>;
+    async fn changed_files(&self, _limit: usize) -> Result<Vec<FileHit>> {
+        Ok(Vec::new())
+    }
+    async fn search_adjacent_files(
+        &self,
+        _seed_paths: &[String],
+        _limit: usize,
+    ) -> Result<Vec<FileHit>> {
+        Ok(Vec::new())
+    }
+    async fn search_imported_files(
+        &self,
+        _seed_paths: &[String],
+        _limit: usize,
+    ) -> Result<Vec<FileHit>> {
+        Ok(Vec::new())
+    }
+    async fn search_importing_files(
+        &self,
+        _seed_paths: &[String],
+        _limit: usize,
+    ) -> Result<Vec<FileHit>> {
+        Ok(Vec::new())
+    }
+    async fn search_scope_files(
+        &self,
+        _seed_paths: &[String],
+        _limit: usize,
+    ) -> Result<Vec<FileHit>> {
+        Ok(Vec::new())
+    }
+    async fn search_context_docs(
+        &self,
+        _queries: &[String],
+        _seed_paths: &[String],
+        _limit: usize,
+    ) -> Result<Vec<FileHit>> {
+        Ok(Vec::new())
+    }
+    async fn search_directory_files(
+        &self,
+        _directories: &[String],
+        _limit: usize,
+    ) -> Result<Vec<FileHit>> {
+        Ok(Vec::new())
+    }
     async fn search(&self, query: &str, limit: usize) -> Result<Vec<FileHit>>;
     async fn search_symbols(&self, query: &str, limit: usize) -> Result<Vec<SymbolHit>>;
+    async fn search_related_symbols(
+        &self,
+        relation: SymbolRelation,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<SymbolHit>>;
     async fn search_content(&self, query: &str, limit: usize) -> Result<Vec<ContentHit>>;
 }
 
 #[async_trait]
 pub trait FileReader: Send + Sync {
     async fn read_file(&self, path: &str, max_chars: usize) -> Result<EvidenceSlice>;
+    async fn read_diff(&self, path: &str, max_chars: usize) -> Result<EvidenceSlice> {
+        let _ = (path, max_chars);
+        Err(anyhow!("Diff reads are not supported by this file reader"))
+    }
     async fn read_range(
         &self,
         path: &str,

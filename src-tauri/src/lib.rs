@@ -2,21 +2,21 @@
 //! Main application module connecting the AI engine and local persistence stores.
 
 use anyhow::Context;
-use tauri::Manager;
-use notify_debouncer_mini::Debouncer;
 use notify_debouncer_mini::notify::RecommendedWatcher;
+use notify_debouncer_mini::Debouncer;
 use std::sync::Arc;
 use std::sync::Mutex;
+use tauri::Manager;
 use tokio::sync::Semaphore;
 
+mod agent;
+mod agentv2;
 mod codegraph;
 mod conversation_store;
 mod engine;
-mod agent;
-mod indexer;
 mod git_api;
-mod agentv2;
-mod orchestrator; 
+mod indexer;
+mod orchestrator;
 
 #[derive(Debug)]
 pub struct AppError(anyhow::Error);
@@ -62,34 +62,41 @@ async fn create_session(
 ) -> Result<conversation_store::Conversation, AppError> {
     let path = workspace_path.clone();
     let app_clone = app.clone();
-    
+
     let conv = tauri::async_runtime::spawn_blocking(move || {
         let state = app_clone.state::<AppState>();
-        
+
         // If a path is provided, register the project and trigger the indexer immediately
         if let Some(p) = &path {
             let path_obj = std::path::Path::new(p);
-            if let Ok(project) = state.codegraph.register_project("Active Workspace", path_obj) {
+            if let Ok(project) = state
+                .codegraph
+                .register_project("Active Workspace", path_obj)
+            {
                 // 1. Do the initial full index
                 let _ = crate::indexer::index_workspace(&state.codegraph, &project.id, path_obj);
-                
+
                 // 2. Start the incremental watcher
-                if let Ok(watcher) = crate::indexer::start_watcher(app_clone.clone(), project.id, path_obj.to_path_buf()) {
+                if let Ok(watcher) = crate::indexer::start_watcher(
+                    app_clone.clone(),
+                    project.id,
+                    path_obj.to_path_buf(),
+                ) {
                     let mut guard = state.active_watcher.lock().unwrap();
                     *guard = Some(watcher);
                 }
             }
         }
-        
+
         state.conversations.create_conversation(
-            Some("Active Workspace"), 
-            path.as_deref(), 
-            Some("Qwen2.5-Coder")
+            Some("Active Workspace"),
+            path.as_deref(),
+            Some("Qwen2.5-Coder"),
         )
     })
     .await
     .context("Failed to join blocking task")??;
-    
+
     Ok(conv)
 }
 
@@ -105,7 +112,7 @@ async fn get_session_details(
     })
     .await
     .context("Failed to join blocking task")??;
-    
+
     Ok(detail)
 }
 
@@ -147,7 +154,6 @@ pub fn run() {
             get_ai_connection,
             create_session,
             get_session_details,
-            agent::prompt_agent,
             orchestrator::prompt_agent_v2,
             git_api::get_git_status,
             git_api::get_git_diff

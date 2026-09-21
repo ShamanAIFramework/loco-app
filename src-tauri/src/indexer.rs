@@ -3,13 +3,13 @@
 //! Runs synchronously and ignores standard build and hidden directories.
 
 use crate::codegraph::{CodeGraphStore, Symbol};
+use crate::AppState;
 use anyhow::Result;
+use notify_debouncer_mini::notify::RecommendedWatcher;
+use notify_debouncer_mini::{new_debouncer, notify::RecursiveMode, Debouncer};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::Path;
-use crate::AppState;
-use notify_debouncer_mini::{new_debouncer, notify::RecursiveMode, Debouncer};
-use notify_debouncer_mini::notify::RecommendedWatcher;
-use sha2::{Digest, Sha256};
 use std::time::Duration;
 use tauri::Manager;
 use tree_sitter::{Node, Parser};
@@ -20,7 +20,12 @@ pub fn index_workspace(store: &CodeGraphStore, project_id: &str, root_path: &Pat
     refresh_project_symbol_edges(store, project_id, root_path)
 }
 
-fn walk_and_index(store: &CodeGraphStore, project_id: &str, current_dir: &Path, root_path: &Path) -> Result<()> {
+fn walk_and_index(
+    store: &CodeGraphStore,
+    project_id: &str,
+    current_dir: &Path,
+    root_path: &Path,
+) -> Result<()> {
     let entries = match fs::read_dir(current_dir) {
         Ok(e) => e,
         Err(_) => return Ok(()), // Ignore inaccessible directories safely
@@ -53,14 +58,13 @@ pub fn start_watcher(
     project_id: String,
     root_path: std::path::PathBuf,
 ) -> Result<Debouncer<RecommendedWatcher>> {
-    
     // Create an MPSC channel to receive debounced events
     let (tx, rx) = std::sync::mpsc::channel();
-    
+
     // Debounce events every 500ms to ignore editor temp-file spam
     let mut debouncer = new_debouncer(Duration::from_millis(500), tx)
         .map_err(|e| anyhow::anyhow!("Failed to create watcher: {}", e))?;
-        
+
     debouncer
         .watcher()
         .watch(&root_path, RecursiveMode::Recursive)
@@ -74,17 +78,17 @@ pub fn start_watcher(
             match res {
                 Ok(events) => {
                     let state = app.state::<AppState>();
-                    
+
                     for event in events {
                         let path = event.path;
                         let path_str = path.to_string_lossy();
 
                         // 1. Ignore build directories and hidden files
-                        if path_str.contains("/.") 
+                        if path_str.contains("/.")
                             || path_str.contains("\\.")
-                            || path_str.contains("/node_modules/") 
-                            || path_str.contains("\\node_modules\\") 
-                            || path_str.contains("/target/") 
+                            || path_str.contains("/node_modules/")
+                            || path_str.contains("\\node_modules\\")
+                            || path_str.contains("/target/")
                             || path_str.contains("\\target\\")
                             || path_str.contains("/models/")
                             || path_str.contains("\\models\\")
@@ -101,7 +105,12 @@ pub fn start_watcher(
                             // 3. Incrementally update SQLite based on file existence
                             if path.exists() && path.is_file() {
                                 // File was created or modified
-                                let _ = index_workspace_file(&state.codegraph, &project_id, &path, &rel_str);
+                                let _ = index_workspace_file(
+                                    &state.codegraph,
+                                    &project_id,
+                                    &path,
+                                    &rel_str,
+                                );
                             } else if !path.exists() {
                                 // File was deleted
                                 let _ = state.codegraph.remove_file(&project_id, &rel_str);
@@ -132,7 +141,11 @@ fn index_workspace_file(
     rel_path: &str,
 ) -> Result<()> {
     let is_source = looks_like_source(rel_path);
-    let checksum = if is_source { file_checksum(path).ok() } else { None };
+    let checksum = if is_source {
+        file_checksum(path).ok()
+    } else {
+        None
+    };
     let file = store.upsert_file(project_id, rel_path, checksum.as_deref())?;
     store.clear_file_symbols(&file.id)?;
 
@@ -530,8 +543,21 @@ fn looks_like_source(path: &str) -> bool {
     matches!(
         Path::new(path).extension().and_then(|ext| ext.to_str()),
         Some(
-            "rs" | "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" | "py" | "go" | "java" | "kt"
-                | "swift" | "c" | "h" | "cpp" | "hpp"
+            "rs" | "ts"
+                | "tsx"
+                | "js"
+                | "jsx"
+                | "mjs"
+                | "cjs"
+                | "py"
+                | "go"
+                | "java"
+                | "kt"
+                | "swift"
+                | "c"
+                | "h"
+                | "cpp"
+                | "hpp"
         )
     )
 }
@@ -540,13 +566,7 @@ fn should_skip_entry(name: &str) -> bool {
     name.starts_with('.')
         || matches!(
             name,
-            "node_modules"
-                | "target"
-                | "dist"
-                | "build"
-                | "models"
-                | "binaries"
-                | "resources"
+            "node_modules" | "target" | "dist" | "build" | "models" | "binaries" | "resources"
         )
 }
 
@@ -698,8 +718,14 @@ export default function GitPanel(props: { workspacePath: string }) {
             symbol_occurrence_kind("const selected = helper;", "helper"),
             Some("reference")
         );
-        assert_eq!(symbol_occurrence_kind("const helperText = '';", "helper"), None);
-        assert_eq!(symbol_occurrence_kind("const my_helper = 1;", "helper"), None);
+        assert_eq!(
+            symbol_occurrence_kind("const helperText = '';", "helper"),
+            None
+        );
+        assert_eq!(
+            symbol_occurrence_kind("const my_helper = 1;", "helper"),
+            None
+        );
     }
 
     #[test]

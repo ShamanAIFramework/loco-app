@@ -19,6 +19,15 @@ This project is a local-first coding agent built around a deterministic Rust har
 - Plan mode may draft an implementation plan, affected files, risks, and validation commands. It must not draft replacement code, claim edits were applied, or mutate files.
 - If edit artifacts are added later, prefer a host-mediated whole-file or block-level replacement workflow before attempting diff/search-replace formats. The host must validate and apply changes; the model should not directly mutate files.
 
+## Prompt Portability Rules
+
+- Prompt text in `agent-core` must be generalized for software engineering across languages, frameworks, runtimes, and app shapes. Do not hard-code this repository's stack, paths, filenames, frameworks, languages, UI library, package manager, or server architecture into reusable agent prompts.
+- Framework, language, and architecture-specific guidance may appear only when it is derived from the current user request, indexed repository evidence, manifests/config files, file extensions, or leased evidence. Prefer host-side detection and context injection over static prompt wording.
+- Use generic software surfaces in reusable prompts: entrypoints, screens/views, components/widgets, templates, styles, routing/navigation, APIs, services, persistence, configuration, build scripts, tests, command/event boundaries, and generated artifacts.
+- Deterministic query expansion must use stack-neutral concepts unless a specific stack clue appears in the user request or repo evidence. Never add fixed paths such as this app's frontend files, Tauri config, Rust modules, or model/agent files as generic hints.
+- Plan-mode affected files must stay evidence-backed. If the model proposes files not supported by active leased evidence, host logic should omit them or mark the uncertainty rather than rendering them as likely targets.
+- Prompt tests should include portability checks: no static framework/language/path examples in reusable prompt strings unless the test is explicitly about detected evidence or a fixture-local fake path.
+
 ## Source And Evidence Rules
 
 - Leased evidence and active notebook entries are the code truth. Repo maps are navigation hints only.

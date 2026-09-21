@@ -140,6 +140,14 @@ pub enum MissingEvidenceKind {
     Search,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SymbolRelation {
+    Definition,
+    References,
+    Callers,
+    Callees,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SynthesizeOutput {
     pub answer: String,

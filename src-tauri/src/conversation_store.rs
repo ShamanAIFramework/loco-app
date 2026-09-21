@@ -85,12 +85,12 @@ pub struct ConversationStore {
 impl ConversationStore {
     pub fn new(db_path: &Path) -> Result<Self> {
         let conn = Connection::open(db_path).context("Failed to open conversation DB")?;
-        
+
         conn.execute_batch(
             "PRAGMA foreign_keys = ON;
              PRAGMA journal_mode = WAL;
              PRAGMA busy_timeout = 5000;
-             PRAGMA synchronous = NORMAL;"
+             PRAGMA synchronous = NORMAL;",
         )?;
 
         // Schema updated with workspace_path and model_name
@@ -120,10 +120,10 @@ impl ConversationStore {
     }
 
     pub fn create_conversation(
-        &self, 
-        title: Option<&str>, 
-        workspace_path: Option<&str>, 
-        model_name: Option<&str>
+        &self,
+        title: Option<&str>,
+        workspace_path: Option<&str>,
+        model_name: Option<&str>,
     ) -> Result<Conversation> {
         let guard = self.conn.lock().map_err(|_| anyhow!("Mutex poisoned"))?;
         let id = Uuid::new_v4().to_string();
@@ -148,7 +148,7 @@ impl ConversationStore {
 
     pub fn load_conversation(&self, id: &str) -> Result<Option<ConversationDetail>> {
         let guard = self.conn.lock().map_err(|_| anyhow!("Mutex poisoned"))?;
-        
+
         let conv_res = guard.query_row(
             "SELECT title, workspace_path, model_name, created_at, updated_at FROM conversations WHERE id = ?1",
             params![id],
@@ -173,20 +173,21 @@ impl ConversationStore {
         let mut stmt = guard.prepare(
             "SELECT id, role, content, created_at FROM messages 
              WHERE conversation_id = ?1 
-             ORDER BY created_at ASC, rowid ASC"
+             ORDER BY created_at ASC, rowid ASC",
         )?;
-        
-        let messages = stmt.query_map(params![id], |row| {
-            let role_str: String = row.get(1)?;
-            Ok(Message {
-                id: row.get(0)?,
-                conversation_id: id.to_string(),
-                role: Role::from_str(&role_str).unwrap_or(Role::System),
-                content: row.get(2)?,
-                created_at: parse_dt(&row.get::<_, String>(3)?).unwrap_or_default(),
-            })
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
+
+        let messages = stmt
+            .query_map(params![id], |row| {
+                let role_str: String = row.get(1)?;
+                Ok(Message {
+                    id: row.get(0)?,
+                    conversation_id: id.to_string(),
+                    role: Role::from_str(&role_str).unwrap_or(Role::System),
+                    content: row.get(2)?,
+                    created_at: parse_dt(&row.get::<_, String>(3)?).unwrap_or_default(),
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
 
         Ok(Some(ConversationDetail {
             conversation: conv,
@@ -197,8 +198,12 @@ impl ConversationStore {
     pub fn add_message(&self, conversation_id: &str, role: Role, content: &str) -> Result<Message> {
         let mut guard = self.conn.lock().map_err(|_| anyhow!("Mutex poisoned"))?;
         let tx = guard.transaction()?;
-        
-        let exists: i64 = tx.query_row("SELECT COUNT(1) FROM conversations WHERE id = ?1", params![conversation_id], |r| r.get(0))?;
+
+        let exists: i64 = tx.query_row(
+            "SELECT COUNT(1) FROM conversations WHERE id = ?1",
+            params![conversation_id],
+            |r| r.get(0),
+        )?;
         if exists == 0 {
             return Err(anyhow!("Conversation not found"));
         }
@@ -211,7 +216,10 @@ impl ConversationStore {
             params![id, conversation_id, role.as_str(), content, now],
         )?;
 
-        tx.execute("UPDATE conversations SET updated_at = ?1 WHERE id = ?2", params![now, conversation_id])?;
+        tx.execute(
+            "UPDATE conversations SET updated_at = ?1 WHERE id = ?2",
+            params![now, conversation_id],
+        )?;
         tx.commit()?;
 
         Ok(Message {

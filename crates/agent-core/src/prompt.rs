@@ -34,7 +34,7 @@ pub fn global_prefix(repo_map: &[String]) -> String {
         repo_map.join("\n")
     };
     format!(
-        "SYSTEM\nYou are Loco's local coding reasoning coprocessor. Deterministic Rust host code controls workflow, tools, search, file reads, budgets, leases, source display, and stopping. You are in a separated harness phase, not a ReAct loop. You never edit files, never call tools, never claim to have run tools, and never invent code facts. Treat the repo map as navigation only; leased evidence and active notebook entries are the source of truth. Return only JSON matching the requested schema.\n\nREPO MAP SNAPSHOT\n{}",
+        "SYSTEM\nYou are Loco's local coding reasoning coprocessor. Deterministic host code controls workflow, tools, search, file reads, budgets, leases, source display, and stopping. You are in a separated harness phase, not a ReAct loop. You never edit files, never call tools, never claim to have run tools, and never invent code facts. Treat the repo map as navigation only; leased evidence and active notebook entries are the source of truth. Return only JSON matching the requested schema.\n\nREPO MAP SNAPSHOT\n{}",
         repo
     )
 }
@@ -114,7 +114,7 @@ pub fn intake_instruction() -> String {
         "QUESTION",
         "Classify the local coding request and propose deterministic code-search queries for the host to run.",
         "Use `Edit` for requests to add, update, fix, remove, refactor, style, or otherwise change code. Use `Locate` for where/which-file questions, `Explain` for how/what/why/update-analysis questions, and `Unclear` only when the request has no actionable code target.",
-        "Prefer to proceed on short local-code questions if they mention UI, git, components, files, functions, panels, workspace, Tauri, Rust, TypeScript, or concrete change intent.",
+        "Prefer to proceed on short local-code questions if they mention UI, git, components, files, functions, panels, workspace, a programming language, framework, runtime, or concrete change intent.",
         "Produce 3-6 short search queries likely to match paths, symbols, UI labels, component names, or domain nouns. Include exact identifiers and useful variants; omit filler words.",
         "Do not answer the user here.",
     ]
@@ -127,8 +127,9 @@ pub fn plan_instruction() -> String {
         "Draft a safe implementation plan for this local coding change. Do not propose an edit artifact yet and do not claim files were changed.",
         "Use only active notebook entries and leased evidence. If evidence is incomplete, make the plan narrow and name the uncertainty in risks.",
         "Affected files should include only files that current evidence supports as likely touch points.",
+        "For user-facing, startup, loading, layout, styling, interaction, or display changes, prefer evidence-backed entrypoints, screens/views, components/widgets, templates, styles, routing/navigation, app shell, and app/window/display configuration. Do not involve unrelated orchestration, search, service, build, or model/AI plumbing files unless cited evidence shows they are directly required.",
         "Steps should be concrete implementation actions the host could later turn into edit artifacts.",
-        "Validation commands should be commands the user or host can run in this workspace after edits, such as package scripts, cargo checks, or focused tests inferred from evidence.",
+        "Validation commands should be commands the user or host can run in this workspace after edits. Infer them from evidence such as project manifests, scripts, build files, test files, or existing repository conventions; do not assume a language or framework.",
     ]
     .join("\n")
 }
@@ -139,8 +140,8 @@ pub fn extract_instruction() -> String {
         "Extract only atomic claims supported by leased evidence. Do not propose edits.",
         "Every inference must cite exactly one provided lease_id. Copy lease ids exactly.",
         "Each statement should preserve the most specific file path, line range, symbol/block name, and user-facing UI/code purpose available.",
-        "For UI location questions, identify the exact JSX/render block, list/map/conditional, or component section when present.",
-        "For implementation questions, distinguish definitions, callers, state, IPC commands, and rendering code.",
+        "For user-facing location questions, identify the exact render/output block, screen/view section, list/map/loop/conditional, template, component/widget, or display code when present.",
+        "For implementation questions, distinguish definitions, callers, state/data flow, API/command/event boundaries, configuration, persistence, and rendering/output code.",
         "Set sufficient=true when the evidence directly answers the request. Use missing only for concrete additional evidence the host should search for; do not ask the user for missing code evidence.",
     ]
     .join("\n")
@@ -245,7 +246,7 @@ pub fn schema_intake() -> serde_json::Value {
             "constraints": {
                 "type": "array",
                 "items": { "type": "string" },
-                "description": "User constraints such as no edits, UI-only, backend-only, or exact behavior to inspect."
+                "description": "User constraints such as no edits, user-facing-only, service-layer-only, configuration-only, or exact behavior to inspect."
             },
             "search_queries": {
                 "type": "array",
@@ -319,7 +320,7 @@ pub fn schema_extract() -> serde_json::Value {
                     "properties": {
                         "statement": {
                             "type": "string",
-                            "description": "One evidence-backed claim with exact file path, line range, symbol/block, and coding/UI purpose when available."
+                            "description": "One evidence-backed claim with exact file path, line range, symbol/block, and software purpose when available."
                         },
                         "lease_id": {
                             "type": "string",
@@ -455,10 +456,51 @@ mod tests {
         assert!(intake.contains("UI"));
         assert!(plan.contains("safe implementation plan"));
         assert!(plan.contains("Do not propose an edit artifact yet"));
-        assert!(extract.contains("exact JSX/render block"));
+        assert!(plan.contains("Do not involve unrelated orchestration"));
+        assert!(plan.contains("unless cited evidence shows"));
+        assert!(extract.contains("exact render/output block"));
         assert!(extract.contains("Copy lease ids exactly"));
         assert!(synthesize.contains("Do not include a markdown Sources section"));
         assert!(synthesize.contains("structured sources separately"));
+    }
+
+    #[test]
+    fn reusable_prompts_do_not_assume_a_specific_stack() {
+        let rendered = [
+            global_prefix(&[]),
+            intake_instruction(),
+            plan_instruction(),
+            extract_instruction(),
+            synthesize_instruction(),
+            schema_intake().to_string(),
+            schema_plan().to_string(),
+            schema_extract().to_string(),
+            schema_synthesize().to_string(),
+        ]
+        .join("\n");
+
+        for forbidden in [
+            "Tauri",
+            "Solid",
+            "React",
+            "Vue",
+            "Svelte",
+            "Rust",
+            "TypeScript",
+            "JavaScript",
+            "JSX",
+            "TSX",
+            "Cargo",
+            "npm",
+            "src/App",
+            "tauri.conf",
+            "orchestrator.rs",
+        ] {
+            assert!(
+                !rendered.contains(forbidden),
+                "reusable prompts should not contain stack-specific term `{forbidden}`"
+            );
+        }
     }
 
     #[test]

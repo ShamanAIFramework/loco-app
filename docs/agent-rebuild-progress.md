@@ -169,13 +169,157 @@ Rebuild the orchestrator and `agentv2` behavior so deterministic Rust code contr
   - symbol edge extraction now requires identifier-boundary matches instead of raw substring matches
   - call edges are detected from boundary-matched symbol names followed by an opening parenthesis
   - added regression coverage so `helperText` and `my_helper` do not create false `helper` references
+- Tightened plan-mode file selection:
+  - verified the active code graph included the relevant app files, so the splash/fullscreen miss was plan selection, not whole-repo indexing failure
+  - startup/splash/fullscreen requests now deterministically add stack-neutral boot/loading/window search concepts
+  - model-authored edit plans are post-processed so likely files must be backed by active leased file evidence
+  - plan prompts now warn not to involve unrelated orchestration, search, backend service, build, or model/AI plumbing files for UI/startup work unless cited evidence requires them
+  - added regression coverage for stack-neutral startup query expansion and dropping unsupported planned files such as an unrelated orchestration file
+- Completed a prompt portability audit:
+  - reusable `agent-core` prompts no longer name this repository's framework, language, paths, package manager, or app structure as static guidance
+  - framework/language-specific clues must come from the user request, repo map, indexed project evidence, manifests/config files, file extensions, or leased evidence
+  - extraction wording now uses stack-neutral render/output, screen/view, template, component/widget, API/command/event, configuration, persistence, and data-flow concepts
+  - fallback plans no longer emit hardcoded validation commands; model-authored validation commands are retained only when backed by active evidence
+  - legacy tool descriptions in `src-tauri/src/agent.rs` no longer include stack-specific path examples
+  - added prompt contract coverage that reusable prompt strings do not contain static framework/language/path examples
+- Fixed multi-word path search regression:
+  - path search now tokenizes coding queries and scores indexed paths by meaningful term matches instead of requiring the full query string to appear in the path
+  - repo-map context filters generated/build output such as `dist` entries before ranking, so app source files are not buried by generated assets
+  - added regression coverage for multi-word path scoring and generated-output filtering
+- Tightened the deterministic evidence loop after prompt review:
+  - extraction follow-up requests now reuse symbol search, content search, path search, range reads, leases, notebook facts, and trace events instead of falling back to path-only whole-file reads
+  - file and range leases now cover exactly the returned line-bounded content, preventing truncated evidence from self-expiring during freshness checks
+  - structured source chips keep cited sources even when the final prose does not name every supporting file
+  - removed the legacy model-selected tool loop from the Tauri invoke surface; `agent.rs` now only carries shared IPC event/source types
+- Added host-side validation context discovery:
+  - edit and validation-oriented requests now insert generic project manifest, test script, and build script queries early enough to fit the default query budget while preserving target-code discovery
+  - Tauri path scoring maps those stack-neutral queries to discovered manifest/config files such as package, Cargo, Python, Go, Java, Gradle, task-runner, and tool config files without putting stack-specific names in reusable prompts
+  - added regression coverage for budgeted validation-context query insertion and manifest/config path scoring
+- Improved multi-word symbol discovery:
+  - Tauri symbol search now expands phrase queries into meaningful terms before querying the CodeGraph, so symbols such as `StatusPanel` can be discovered from requests such as "status panel"
+  - symbol scoring now rewards symbols that contain all meaningful query terms, complementing the existing path/content multi-word matching
+  - added regression coverage for multi-word symbol candidate expansion and scoring
+- Improved identifier-style query matching:
+  - local path, symbol, and content scoring now normalize camelCase, snake_case, kebab-case, and compact identifier forms so queries like `status_pill`, `statusPill`, and "status pill" can converge on the same code
+  - added regression coverage for identifier term splitting, identifier-aware content search, and snake-to-camel symbol scoring
+- Tightened extraction loop stop conditions:
+  - extraction now stops instead of spending another local-model call when the model says evidence is insufficient but provides no concrete follow-up evidence target for the host to retrieve
+  - added regression coverage that no-new-evidence extraction runs only one extraction pass
+- Tightened the final source-display contract:
+  - synthesis now falls back to active notebook findings when the model omits citation ids, preserving structured source chips for the UI
+  - fallback answer prose now hides notebook entry ids while still presenting the relevant finding text
+  - added regression coverage for citation fallback and id-free fallback answers
+- Made structured missing-evidence requests actionable:
+  - `FileRange` follow-up requests now parse common `path:line-line` and `path lines line-line` targets and read the exact leased range instead of treating the target as plain search text
+  - range reads are token-budgeted, recorded as notebook facts, traced as host tool calls, and added to target tags for the next extraction pass
+  - added regression coverage for exact file-range follow-up reads and common range target parsing
+- Added relation-aware symbol follow-up retrieval:
+  - `Definition`, `References`, `Callers`, and `Callees` missing-evidence requests now use a typed symbol-relation search before falling back to generic symbol/content/path search
+  - Tauri resolves definitions directly from matching indexed symbols, resolves references/callers by walking inbound CodeGraph edges, and resolves callees by walking outbound edges to target symbol definitions
+  - definition expansion prefers exact or normalized symbol-name matches before fuzzy matches
+  - caller/callee expansion now uses only edges indexed as calls, while reference expansion can include broader non-call usages
+  - added core regression coverage for relation follow-up reads and Tauri regression coverage for definition, reference, caller, and callee collection
+- Added first-pass relation-intent retrieval:
+  - user questions that explicitly ask for definitions, references/usages, callers, or callees now trigger typed relation search during the initial deterministic evidence acquisition pass
+  - relation hits are deduplicated with ordinary symbol hits and leased as normal symbol evidence, so extraction starts with caller/callee context when the request already names that need
+  - added regression coverage for common relation-intent phrases and initial relation evidence reads before extraction follow-up
+- Added project-research overview discovery:
+  - review, audit, architecture, research, overview, design, project, codebase, and repository-oriented requests now seed stack-neutral overview/doc queries inside the default search budget
+  - Tauri path scoring maps those generic overview/doc queries to README, docs, architecture, design, contributing, and developer-guide files without hard-coding this repository's paths
+  - added regression coverage for budgeted project-overview query insertion and overview/documentation path scoring
+- Added bounded symbol-context reads:
+  - Tauri symbol range reads now include a small surrounding line window so extraction sees nearby setup, comments, and adjacent control flow instead of an isolated bare symbol body
+  - explicit file-range reads remain exact, preserving precise user/model-requested range semantics and lease verification
+  - added regression coverage that only symbol reads expand while exact file-range reads do not
+- Added deterministic software-concept query expansion:
+  - Tauri search terms now conservatively bridge common project-research language such as loops, tools, context, prompts, discovery, APIs, persistence, validation, and UI to nearby software vocabulary used in paths and code
+  - the expansion lives in host-side lexical scoring/search, keeping prompts portable and avoiding any claim of true semantic/vector retrieval
+  - added regression coverage for concept-expanded terms and path scoring
+- Tightened `rg` candidate acceleration for recall:
+  - `rg` remains an optional prefilter for content search, but broad match sets now disable prefiltering instead of limiting in-process scanning to an arbitrary capped subset
+  - added regression coverage that over-broad `rg` matches fall back to the deterministic scanner path
+- Made evidence dedupe range-aware:
+  - content hits in the same file as a symbol read are now skipped only when their line windows overlap existing evidence, so project-research tasks can collect multiple focused sections from one file
+  - follow-up symbol and content reads also use overlap checks, avoiding duplicate reads when symbol leases include a wider context window than the original symbol hit
+  - added regression coverage for same-file disjoint symbol/content evidence and overlap detection
+- Added bounded direct-callee context expansion for explanation tasks:
+  - top seed symbols in ordinary `Explain` tasks now trigger a small host-driven callee lookup, so the evidence pass can include definitions of immediate helpers the seed symbol calls before asking the model to extract claims
+  - explicit caller/callee questions continue through the typed relation-intent path; the new expansion is for non-explicit "explain this" style code research
+  - added regression coverage that direct callee evidence is read before extraction without model-requested follow-up
+- Added bounded impact-context expansion for edit planning:
+  - top seed symbols in `Edit` tasks now trigger small host-driven caller and reference lookups, so plan mode can see likely impact sites before accepting or filtering affected files
+  - graph-impact context still uses host-selected relation search, normal evidence leases, overlap checks, and token budgets rather than model-selected tool calls
+  - added regression coverage that caller impact evidence is read before plan generation and can support evidence-backed planned files
+- Preserved user-request terms in host query normalization:
+  - intake normalization now inserts a compact target-focused query derived from the user's own request near the front of the search plan, so a narrow or weak model-generated query list cannot fully steer retrieval away from the original wording
+  - the preserved query coexists with validation and project-overview augmentations inside the default query budget
+  - added regression coverage for raw-request term preservation and existing budget-sensitive query augmentations
+- Surfaced repository instruction files for project research:
+  - project-research query augmentation now reserves default-budget space for repository instructions alongside overview and README discovery
+  - Tauri path scoring maps generic repository-instruction queries to guidance files such as `AGENTS.md`, `CLAUDE.md`, `.cursorrules`, `.github/instructions/*`, and `.cursor/rules/*`
+  - added regression coverage for budgeted instruction-query insertion and instruction-file path scoring
+- Surfaced startup and entrypoint files for project research:
+  - project-research query augmentation now reserves default-budget space for project entrypoints after overview, README, and repository instructions
+  - Tauri path scoring maps generic entrypoint/startup/bootstrap queries to common startup files such as `main.*`, `App.*`, `index.*`, `lib.rs`, app directories, and Tauri main files
+  - added regression coverage for budgeted entrypoint-query insertion and startup-file path scoring without bleeding into architecture docs
+- Added changed-file context for review and edit workflows:
+  - `CodeSearch` now exposes a host-owned `changed_files` hook, and the deterministic pipeline folds changed file hits into the same ranked path evidence flow for edit, review, diff, dirty, and current-worktree requests
+  - the Tauri adapter reads `git status --porcelain`, parses modified, untracked, and renamed paths, filters to searchable text files, and ranks them as high-value local context
+  - changed-file evidence now includes a bounded `git diff HEAD -- <path>` slice when available, using a dedicated `FileReader::read_diff` path and diff freshness checks rather than unverified notes
+  - added regression coverage that review requests read changed file diffs and current file contents as evidence, and that porcelain parsing keeps the current renamed path
+- Surfaced related test files for edit and review context:
+  - edit and validation-oriented requests now reserve default-budget space for a generic `related tests` query alongside manifest and command discovery
+  - Tauri path scoring maps related/coverage/spec test queries to conventional test files and test directories without treating plain `test script` manifest discovery as the same context
+  - added regression coverage for budgeted related-test query insertion and test/spec path scoring
+- Added deterministic adjacent-file discovery:
+  - `CodeSearch` now exposes a host-owned adjacent-file lookup that receives seed paths already found by file, symbol, content, and changed-file search
+  - project-research, review, and edit workflows can fold sibling modules, nearby tests, styles, and nested support files into the ordinary ranked path evidence flow before extraction
+  - Tauri adjacent-file scoring prefers same-directory or nested-neighbor files with the same logical basename, while rejecting same-name files in unrelated directories
+  - added regression coverage that adjacent files are read as leased evidence and that sibling scoring avoids cross-directory noise
+- Added deterministic imported-file discovery:
+  - `CodeSearch` now exposes a host-owned import-neighbor lookup that receives seed paths already found by earlier retrieval passes
+  - project-research, review, and edit workflows can fold locally imported modules into the ordinary ranked path evidence flow before extraction
+  - Tauri resolves relative JavaScript/TypeScript imports, re-exports, dynamic imports, `require(...)` calls, and simple Rust `mod name;` declarations against indexed workspace files
+  - added regression coverage that imported files are read as leased evidence and that resolver tests use real temporary files
+- Added deterministic importing-file discovery:
+  - `CodeSearch` now exposes a host-owned reverse import-neighbor lookup for files that import or declare seed paths
+  - project-research, review, and edit workflows can fold dependent files into the ordinary ranked path evidence flow before extraction, improving impact analysis without model-selected tools
+  - Tauri reuses the local import resolver to scan indexed files and find JavaScript/TypeScript/Rust files that resolve to the seed paths
+  - added regression coverage that importing files are read as leased evidence and that reverse resolver tests use real temporary files
+- Added deterministic scoped project-context discovery:
+  - `CodeSearch` now exposes a host-owned scope-file lookup for manifests, config files, README/developer docs, and repository instruction files near seed paths
+  - project-research, review, and edit workflows can fold nearest package/local context into the ordinary ranked path evidence flow before extraction, improving nested package and monorepo answers
+  - Tauri walks seed enclosing directories and scores nearer scope files above distant ancestors while rejecting sibling package manifests
+  - added regression coverage that scoped files are read as leased evidence and that nested package scoring avoids sibling noise
+- Preserved explicit path mentions in deterministic query planning:
+  - intake normalization now extracts path-like mentions such as `src/foo.rs` and `file.tsx:10-20` from the user's request before generic query augmentation
+  - validation and project-research augmentation preserve explicit paths inside the default query budget instead of pushing them behind overview/config discovery
+  - added regression coverage for path extraction, line-suffix stripping, URL/parent-path rejection, and budget preservation
+- Added direct evidence reads for explicit file ranges:
+  - deterministic evidence acquisition now extracts request mentions such as `src/foo.rs:10-20` and `src/foo.rs lines 10-20`
+  - explicit ranges are read with `FileReader::read_range`, recorded as leased notebook facts, traced as host tool calls, and token-budgeted before broader ranked path reads
+  - added regression coverage that explicit ranges are read before model-requested follow-up and that URL-like ranges are rejected
+- Added direct evidence reads for explicit file mentions:
+  - deterministic evidence acquisition now reads user-mentioned files such as `src/foo.rs` directly with `FileReader::read_file` before broader ranked path fallback
+  - exact file reads are recorded as leased notebook facts, traced as host tool calls, and skipped when an explicit range for the same file was already read
+  - added regression coverage that explicit files are read first and that range mentions do not duplicate whole-file reads
+- Added deterministic directory mention expansion:
+  - `CodeSearch` now exposes a host-owned directory-file lookup for extensionless path mentions such as `src/foo`
+  - deterministic retrieval expands requested directories into ranked indexed files before path evidence is read, while avoiding failed direct file reads for directories
+  - Tauri ranks direct children above nested files and boosts entrypoints, manifests, docs, instructions, and tests under the requested directory
+  - added regression coverage that directory mentions expand to leased file evidence and that directory files are ranked without leaking outside the requested directory
+- Added deterministic context-doc discovery:
+  - `CodeSearch` now exposes a host-owned context-doc lookup for project research, review, edit, and "how does this work" style requests
+  - deterministic retrieval uses already-found seed files plus intake queries to add nearby documentation before extraction, improving subsystem research without model-selected tools
+  - Tauri ranks domain-matching docs in the seed's local package/docs scope above distant ancestors while rejecting sibling package docs
+  - added regression coverage that nearby context docs are read as leased evidence and that package-local docs outrank global docs without sibling noise
 
 ## Verified
 
 - `cargo test --workspace`
-  - 24 tests passed.
+  - 56 tests passed.
 - `cargo test --manifest-path src-tauri/Cargo.toml`
-  - 14 Tauri-side tests passed.
+  - 40 Tauri-side tests passed.
 - `cargo test --manifest-path src-tauri/Cargo.toml indexer::tests::tree_sitter -- --nocapture`
   - 2 Tree-sitter indexer tests passed.
 - `cargo check --manifest-path src-tauri/Cargo.toml`
@@ -185,15 +329,15 @@ Rebuild the orchestrator and `agentv2` behavior so deterministic Rust code contr
 
 ## Intentional Temporary Limitations
 
-- `CodeGraphStore` now provides symbol ranges, lightweight mention/call edges, and bounded graph-distance lookup, but it does not yet provide robust LSP/type-aware cross-file call graphs or references.
-- Evidence leases can now cover symbol and content-search ranges when hits are available. Symbol parsing is conservative, so complex language constructs may still fall back to whole-file slices.
-- The Tauri adapter uses deterministic path, Tree-sitter-backed symbol, regex/phrase content search, `rg` candidate acceleration, lightweight symbol mention/call edges, graph-edge symbol boosts, graph-aware repo-map ordering, and bounded two-hop graph-distance retrieval. It does not yet provide semantic/vector search, LSP-backed references, or robust type-aware cross-file references.
+- `CodeGraphStore` now provides symbol ranges, lightweight mention/call edges, bounded graph-distance lookup, relation-specific definition/reference/caller/callee expansion, but it does not yet provide robust LSP/type-aware cross-file call graphs or references.
+- Evidence leases can now cover symbol and content-search ranges when hits are available, and symbol leases include a small context window. Symbol parsing is conservative, so complex language constructs may still fall back to whole-file slices.
+- The Tauri adapter uses deterministic path, scoped-context, context-doc, adjacent-file, imported-file, importing-file, Tree-sitter-backed symbol, regex/phrase content search, `rg` candidate acceleration, lightweight symbol mention/call edges, graph-edge symbol boosts, graph-aware repo-map ordering, bounded two-hop graph-distance retrieval, relation-specific symbol expansion, overview/documentation surfacing, and conservative lexical software-concept expansion for project-research requests. It does not yet provide semantic/vector search, LSP-backed references, or robust type-aware cross-file references.
 - The final answer is streamed to the UI as one chunk after synthesis rather than token-streamed.
 - Plan mode is non-writing only. It does not yet produce edit artifacts, preview diffs, accept approvals, apply changes, run validation commands, or repair failed validation.
 - Token counting is tokenizer-backed when llama-server exposes `/tokenize`, with an approximate fallback for compatibility.
 - `agent-cli replay` can now regenerate prompt bytes from recorded prompt parts. It still does not replay from notebook snapshots alone.
 - Eval now scores files and symbols and can include trace-derived citation validity, outcome correctness, stop reasons, calls, tokens, queue wait, and wall time when a task includes `trace_path`. It is still a baseline/evaluation harness, not a full task runner.
-- Lease verification is implemented against the current filesystem range hash. Whole-file fallback leases may be weaker for very large truncated files, so UI verification should focus first on symbol-range cases.
+- Lease verification is implemented against the current filesystem range hash. Whole-file fallback leases are line-bounded when truncated, but broad file slices are still less specific than symbol or content-match ranges.
 - Runtime metadata currently records the OpenAI-compatible local endpoint and best-effort model id. The sidecar server version remains `null` until we add a stable llama-server version source.
 
 ## Next Milestones

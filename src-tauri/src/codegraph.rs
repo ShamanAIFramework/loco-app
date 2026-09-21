@@ -79,7 +79,7 @@ impl CodeGraphStore {
             "PRAGMA foreign_keys = ON;
              PRAGMA journal_mode = WAL;
              PRAGMA busy_timeout = 5000;
-             PRAGMA synchronous = NORMAL;"
+             PRAGMA synchronous = NORMAL;",
         )?;
 
         conn.execute_batch(
@@ -119,7 +119,7 @@ impl CodeGraphStore {
              CREATE INDEX IF NOT EXISTS idx_symbols_file_id ON symbols(file_id);
              CREATE INDEX IF NOT EXISTS idx_symbol_edges_from ON symbol_edges(from_symbol_id);
              CREATE INDEX IF NOT EXISTS idx_symbol_edges_target ON symbol_edges(target_name);
-             CREATE INDEX IF NOT EXISTS idx_files_project_id ON files(project_id);"
+             CREATE INDEX IF NOT EXISTS idx_files_project_id ON files(project_id);",
         )?;
 
         migrate_schema(&conn)?;
@@ -132,12 +132,12 @@ impl CodeGraphStore {
     /// Registers a new project, asserting it exists, or returns the existing matching one.
     pub fn register_project(&self, name: &str, root_path: &Path) -> Result<Project> {
         let guard = self.conn.lock().map_err(|_| anyhow!("Mutex poisoned"))?;
-        
+
         let canonical_path = std::fs::canonicalize(root_path)
             .context("Failed to resolve absolute path for project root. Does it exist?")?;
-        
+
         let path_str = canonical_path.to_string_lossy().to_string();
-        
+
         // Check for existing
         if let Ok(existing) = guard.query_row(
             "SELECT id, name, created_at FROM projects WHERE root_path = ?1",
@@ -149,7 +149,7 @@ impl CodeGraphStore {
                     root_path: path_str.clone(),
                     created_at: parse_dt(&row.get::<_, String>(2)?).unwrap_or_default(),
                 })
-            }
+            },
         ) {
             return Ok(existing);
         }
@@ -178,13 +178,19 @@ impl CodeGraphStore {
     }
 
     /// Upserts a source file into the system, maintaining its stable ID.
-    pub fn upsert_file(&self, project_id: &str, path: &str, checksum: Option<&str>) -> Result<SourceFile> {
+    pub fn upsert_file(
+        &self,
+        project_id: &str,
+        path: &str,
+        checksum: Option<&str>,
+    ) -> Result<SourceFile> {
         let guard = self.conn.lock().map_err(|_| anyhow!("Mutex poisoned"))?;
         let generated_id = Uuid::new_v4().to_string();
         let now = now_str();
 
-        guard.query_row(
-            r#"INSERT INTO files (id, project_id, path, checksum, index_version, last_indexed)
+        guard
+            .query_row(
+                r#"INSERT INTO files (id, project_id, path, checksum, index_version, last_indexed)
                VALUES (?1, ?2, ?3, ?4, 1, ?5)
                ON CONFLICT(project_id, path) DO UPDATE SET
                    index_version = CASE
@@ -194,18 +200,19 @@ impl CodeGraphStore {
                    checksum = excluded.checksum,
                    last_indexed = excluded.last_indexed
                RETURNING id, project_id, path, checksum, index_version, last_indexed"#,
-            params![generated_id, project_id, path, checksum, now],
-            |row| {
-                Ok(SourceFile {
-                    id: row.get(0)?,
-                    project_id: row.get(1)?,
-                    path: row.get(2)?,
-                    checksum: row.get(3)?,
-                    index_version: row.get(4)?,
-                    last_indexed: parse_opt_dt(row.get(5)?),
-                })
-            },
-        ).context("Failed to upsert source file")
+                params![generated_id, project_id, path, checksum, now],
+                |row| {
+                    Ok(SourceFile {
+                        id: row.get(0)?,
+                        project_id: row.get(1)?,
+                        path: row.get(2)?,
+                        checksum: row.get(3)?,
+                        index_version: row.get(4)?,
+                        last_indexed: parse_opt_dt(row.get(5)?),
+                    })
+                },
+            )
+            .context("Failed to upsert source file")
     }
 
     /// Upserts a parsed symbol for a specific file.
@@ -382,17 +389,19 @@ impl CodeGraphStore {
     /// Lists all projects sorted alphabetically.
     pub fn list_projects(&self) -> Result<Vec<Project>> {
         let guard = self.conn.lock().map_err(|_| anyhow!("Mutex poisoned"))?;
-        let mut stmt = guard.prepare("SELECT id, name, root_path, created_at FROM projects ORDER BY name ASC")?;
-        
-        let res = stmt.query_map([], |row| {
-            Ok(Project {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                root_path: row.get(2)?,
-                created_at: parse_dt(&row.get::<_, String>(3)?).unwrap_or_default(),
-            })
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
+        let mut stmt = guard
+            .prepare("SELECT id, name, root_path, created_at FROM projects ORDER BY name ASC")?;
+
+        let res = stmt
+            .query_map([], |row| {
+                Ok(Project {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    root_path: row.get(2)?,
+                    created_at: parse_dt(&row.get::<_, String>(3)?).unwrap_or_default(),
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(res)
     }
 
@@ -400,18 +409,19 @@ impl CodeGraphStore {
     pub fn project_files(&self, project_id: &str) -> Result<Vec<SourceFile>> {
         let guard = self.conn.lock().map_err(|_| anyhow!("Mutex poisoned"))?;
         let mut stmt = guard.prepare("SELECT id, project_id, path, checksum, index_version, last_indexed FROM files WHERE project_id = ?1 ORDER BY path ASC")?;
-        
-        let res = stmt.query_map(params![project_id], |row| {
-            Ok(SourceFile {
-                id: row.get(0)?,
-                project_id: row.get(1)?,
-                path: row.get(2)?,
-                checksum: row.get(3)?,
-                index_version: row.get(4)?,
-                last_indexed: parse_opt_dt(row.get(5)?),
-            })
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
+
+        let res = stmt
+            .query_map(params![project_id], |row| {
+                Ok(SourceFile {
+                    id: row.get(0)?,
+                    project_id: row.get(1)?,
+                    path: row.get(2)?,
+                    checksum: row.get(3)?,
+                    index_version: row.get(4)?,
+                    last_indexed: parse_opt_dt(row.get(5)?),
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(res)
     }
 
@@ -419,20 +429,21 @@ impl CodeGraphStore {
     pub fn file_symbols(&self, file_id: &str) -> Result<Vec<Symbol>> {
         let guard = self.conn.lock().map_err(|_| anyhow!("Mutex poisoned"))?;
         let mut stmt = guard.prepare("SELECT id, file_id, name, kind, line, start_line, end_line, content_hash FROM symbols WHERE file_id = ?1 ORDER BY start_line ASC, name ASC")?;
-        
-        let res = stmt.query_map(params![file_id], |row| {
-            Ok(Symbol {
-                id: row.get(0)?,
-                file_id: row.get(1)?,
-                name: row.get(2)?,
-                kind: row.get(3)?,
-                line: row.get(4)?,
-                start_line: row.get(5)?,
-                end_line: row.get(6)?,
-                content_hash: row.get(7)?,
-            })
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
+
+        let res = stmt
+            .query_map(params![file_id], |row| {
+                Ok(Symbol {
+                    id: row.get(0)?,
+                    file_id: row.get(1)?,
+                    name: row.get(2)?,
+                    kind: row.get(3)?,
+                    line: row.get(4)?,
+                    start_line: row.get(5)?,
+                    end_line: row.get(6)?,
+                    content_hash: row.get(7)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(res)
     }
 
@@ -466,35 +477,46 @@ impl CodeGraphStore {
 
     /// Returns files matching the query snippet (path or filename).
     pub fn search_files(&self, project_id: &str, query: &str) -> Result<Vec<SourceFile>> {
-        let guard = self.conn.lock().map_err(|_| anyhow::anyhow!("Mutex poisoned"))?;
-        
+        let guard = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Mutex poisoned"))?;
+
         // Wrap the query in wildcards for substring matching
         let like_query = format!("%{}%", query);
         let mut stmt = guard.prepare(
             "SELECT id, project_id, path, checksum, index_version, last_indexed 
              FROM files 
              WHERE project_id = ?1 AND path LIKE ?2 
-             ORDER BY path ASC LIMIT 20"
+             ORDER BY path ASC LIMIT 20",
         )?;
-        
-        let res = stmt.query_map(rusqlite::params![project_id, like_query], |row| {
-            Ok(SourceFile {
-                id: row.get(0)?,
-                project_id: row.get(1)?,
-                path: row.get(2)?,
-                checksum: row.get(3)?,
-                index_version: row.get(4)?,
-                last_indexed: parse_opt_dt(row.get(5)?),
-            })
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-        
+
+        let res = stmt
+            .query_map(rusqlite::params![project_id, like_query], |row| {
+                Ok(SourceFile {
+                    id: row.get(0)?,
+                    project_id: row.get(1)?,
+                    path: row.get(2)?,
+                    checksum: row.get(3)?,
+                    index_version: row.get(4)?,
+                    last_indexed: parse_opt_dt(row.get(5)?),
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
         Ok(res)
     }
 
     /// Returns symbols matching a name or file-path query.
-    pub fn search_symbols(&self, project_id: &str, query: &str) -> Result<Vec<(SourceFile, Symbol)>> {
-        let guard = self.conn.lock().map_err(|_| anyhow::anyhow!("Mutex poisoned"))?;
+    pub fn search_symbols(
+        &self,
+        project_id: &str,
+        query: &str,
+    ) -> Result<Vec<(SourceFile, Symbol)>> {
+        let guard = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Mutex poisoned"))?;
         let like_query = format!("%{}%", query);
         let mut stmt = guard.prepare(
             "SELECT
@@ -554,7 +576,10 @@ impl CodeGraphStore {
 
     /// Removes a file from the index (e.g., when it is deleted on disk).
     pub fn remove_file(&self, project_id: &str, rel_path: &str) -> anyhow::Result<()> {
-        let guard = self.conn.lock().map_err(|_| anyhow::anyhow!("Mutex poisoned"))?;
+        let guard = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Mutex poisoned"))?;
         guard.execute(
             "DELETE FROM files WHERE project_id = ?1 AND path = ?2",
             rusqlite::params![project_id, rel_path],
@@ -582,10 +607,7 @@ fn migrate_schema(conn: &Connection) -> Result<()> {
         "UPDATE symbols SET start_line = line WHERE start_line = 0",
         [],
     )?;
-    conn.execute(
-        "UPDATE symbols SET end_line = line WHERE end_line = 0",
-        [],
-    )?;
+    conn.execute("UPDATE symbols SET end_line = line WHERE end_line = 0", [])?;
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_symbols_legacy_identity ON symbols(file_id, name, kind, line)",
         [],
@@ -612,7 +634,10 @@ fn ensure_column(conn: &Connection, table: &str, column: &str, declaration: &str
         .collect::<std::result::Result<Vec<_>, _>>()?;
     if !columns.iter().any(|existing| existing == column) {
         conn.execute(
-            &format!("ALTER TABLE {} ADD COLUMN {} {}", table, column, declaration),
+            &format!(
+                "ALTER TABLE {} ADD COLUMN {} {}",
+                table, column, declaration
+            ),
             [],
         )?;
     }
@@ -629,17 +654,21 @@ mod tests {
     fn test_codegraph_crud() {
         let db_path = env::temp_dir().join(format!("{}.db", Uuid::new_v4()));
         let store = CodeGraphStore::new(&db_path).unwrap();
-        
+
         // Setup valid test dir
         let test_dir = env::temp_dir().join("loco_test_proj");
         fs::create_dir_all(&test_dir).unwrap();
-        
+
         let proj = store.register_project("Test", &test_dir).unwrap();
         let proj_dup = store.register_project("Test", &test_dir).unwrap();
         assert_eq!(proj.id, proj_dup.id);
 
-        let file = store.upsert_file(&proj.id, "src/main.rs", Some("abc")).unwrap();
-        let file_dup = store.upsert_file(&proj.id, "src/main.rs", Some("def")).unwrap();
+        let file = store
+            .upsert_file(&proj.id, "src/main.rs", Some("abc"))
+            .unwrap();
+        let file_dup = store
+            .upsert_file(&proj.id, "src/main.rs", Some("def"))
+            .unwrap();
         assert_eq!(file.id, file_dup.id);
         assert_eq!(file_dup.checksum.as_deref(), Some("def"));
 
