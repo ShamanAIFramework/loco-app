@@ -7,6 +7,7 @@ use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::Mutex;
 use uuid::Uuid;
@@ -301,6 +302,83 @@ impl CodeGraphStore {
         Ok(res)
     }
 
+    pub fn symbol_graph_distance_to_query(
+        &self,
+        project_id: &str,
+        from_symbol_id: &str,
+        query: &str,
+        max_depth: usize,
+    ) -> Result<Option<usize>> {
+        let guard = self.conn.lock().map_err(|_| anyhow!("Mutex poisoned"))?;
+        let query_lower = query.to_lowercase();
+        let mut symbol_stmt = guard.prepare(
+            "SELECT s.id, s.name
+             FROM symbols s
+             JOIN files f ON f.id = s.file_id
+             WHERE f.project_id = ?1",
+        )?;
+        let project_symbols = symbol_stmt
+            .query_map(params![project_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        let symbol_names = project_symbols
+            .iter()
+            .cloned()
+            .collect::<HashMap<String, String>>();
+        let mut symbols_by_name = HashMap::<String, Vec<String>>::new();
+        for (id, name) in &project_symbols {
+            symbols_by_name
+                .entry(name.to_lowercase())
+                .or_default()
+                .push(id.clone());
+        }
+
+        let mut edge_stmt = guard.prepare(
+            "SELECT e.from_symbol_id, e.target_name
+             FROM symbol_edges e
+             JOIN symbols s ON s.id = e.from_symbol_id
+             JOIN files f ON f.id = s.file_id
+             WHERE f.project_id = ?1",
+        )?;
+        let edges = edge_stmt
+            .query_map(params![project_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        let mut edges_by_source = HashMap::<String, Vec<String>>::new();
+        for (from, target_name) in edges {
+            edges_by_source.entry(from).or_default().push(target_name);
+        }
+
+        let mut visited = HashSet::new();
+        let mut queue = VecDeque::from([(from_symbol_id.to_string(), 0usize)]);
+        while let Some((symbol_id, depth)) = queue.pop_front() {
+            if !visited.insert(symbol_id.clone()) || depth >= max_depth {
+                continue;
+            }
+            let Some(edges) = edges_by_source.get(&symbol_id) else {
+                continue;
+            };
+            for target_name in edges {
+                if target_name.to_lowercase().contains(&query_lower) {
+                    return Ok(Some(depth + 1));
+                }
+                if let Some(next_symbols) = symbols_by_name.get(&target_name.to_lowercase()) {
+                    for next_id in next_symbols {
+                        if symbol_names.contains_key(next_id) {
+                            queue.push_back((next_id.clone(), depth + 1));
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
     /// Lists all projects sorted alphabetically.
     pub fn list_projects(&self) -> Result<Vec<Project>> {
         let guard = self.conn.lock().map_err(|_| anyhow!("Mutex poisoned"))?;
@@ -358,6 +436,34 @@ impl CodeGraphStore {
         Ok(res)
     }
 
+    /// Retrieves parsed symbols for all files in a project.
+    pub fn project_symbols(&self, project_id: &str) -> Result<Vec<Symbol>> {
+        let guard = self.conn.lock().map_err(|_| anyhow!("Mutex poisoned"))?;
+        let mut stmt = guard.prepare(
+            "SELECT s.id, s.file_id, s.name, s.kind, s.line, s.start_line, s.end_line, s.content_hash
+             FROM symbols s
+             JOIN files f ON f.id = s.file_id
+             WHERE f.project_id = ?1
+             ORDER BY f.path ASC, s.start_line ASC, s.name ASC",
+        )?;
+
+        let res = stmt
+            .query_map(params![project_id], |row| {
+                Ok(Symbol {
+                    id: row.get(0)?,
+                    file_id: row.get(1)?,
+                    name: row.get(2)?,
+                    kind: row.get(3)?,
+                    line: row.get(4)?,
+                    start_line: row.get(5)?,
+                    end_line: row.get(6)?,
+                    content_hash: row.get(7)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(res)
+    }
+
     /// Returns files matching the query snippet (path or filename).
     pub fn search_files(&self, project_id: &str, query: &str) -> Result<Vec<SourceFile>> {
         let guard = self.conn.lock().map_err(|_| anyhow::anyhow!("Mutex poisoned"))?;
@@ -404,6 +510,14 @@ impl CodeGraphStore {
                        SELECT 1 FROM symbol_edges e
                        WHERE e.from_symbol_id = s.id
                          AND e.target_name LIKE ?2
+                   )
+                   OR EXISTS (
+                       SELECT 1 FROM symbol_edges e1
+                       JOIN symbols mid ON mid.name = e1.target_name
+                       JOIN files mf ON mf.id = mid.file_id AND mf.project_id = ?1
+                       JOIN symbol_edges e2 ON e2.from_symbol_id = mid.id
+                       WHERE e1.from_symbol_id = s.id
+                         AND e2.target_name LIKE ?2
                    )
                )
              ORDER BY f.path ASC, s.start_line ASC, s.name ASC
@@ -532,27 +646,41 @@ mod tests {
         assert_eq!(file.index_version, 1);
         assert_eq!(file_dup.index_version, 2);
 
-        let _sym = store
+        let _main = store
             .upsert_symbol(&file.id, "main", "fn", 1, 4, Some("hash"))
             .unwrap();
+        let _helper = store
+            .upsert_symbol(&file.id, "helper", "fn", 6, 8, Some("helper_hash"))
+            .unwrap();
         let syms = store.file_symbols(&file.id).unwrap();
-        assert_eq!(syms.len(), 1);
+        assert_eq!(syms.len(), 2);
         assert_eq!(syms[0].start_line, 1);
         assert_eq!(syms[0].end_line, 4);
         assert_eq!(syms[0].content_hash.as_deref(), Some("hash"));
+        assert_eq!(store.project_symbols(&proj.id).unwrap().len(), 2);
 
         let hits = store.search_symbols(&proj.id, "main").unwrap();
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].1.name, "main");
+        assert!(hits.iter().any(|(_, symbol)| symbol.name == "main"));
 
+        let main_symbol = syms.iter().find(|symbol| symbol.name == "main").unwrap();
+        let helper_symbol = syms.iter().find(|symbol| symbol.name == "helper").unwrap();
         let edge = store
-            .upsert_symbol_edge(&syms[0].id, "println", "call")
+            .upsert_symbol_edge(&main_symbol.id, "helper", "call")
             .unwrap();
-        assert_eq!(edge.target_name, "println");
-        assert_eq!(store.symbol_edges(&syms[0].id).unwrap().len(), 1);
+        assert_eq!(edge.target_name, "helper");
+        store
+            .upsert_symbol_edge(&helper_symbol.id, "println", "call")
+            .unwrap();
+        assert_eq!(store.symbol_edges(&main_symbol.id).unwrap().len(), 1);
+        assert_eq!(
+            store
+                .symbol_graph_distance_to_query(&proj.id, &main_symbol.id, "println", 2)
+                .unwrap(),
+            Some(2)
+        );
         let edge_hits = store.search_symbols(&proj.id, "println").unwrap();
-        assert_eq!(edge_hits.len(), 1);
-        assert_eq!(edge_hits[0].1.name, "main");
+        assert!(edge_hits.iter().any(|(_, symbol)| symbol.name == "main"));
+        assert!(edge_hits.iter().any(|(_, symbol)| symbol.name == "helper"));
 
         store.clear_file_symbols(&file.id).unwrap();
         assert!(store.file_symbols(&file.id).unwrap().is_empty());

@@ -1,5 +1,5 @@
 use crate::prompt::PromptParts;
-use crate::types::{EvidenceSlice, FileHit, LeaseStatus, Phase, SymbolHit};
+use crate::types::{ContentHit, EvidenceSlice, FileHit, LeaseStatus, Phase, SymbolHit};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -44,6 +44,7 @@ pub trait CodeSearch: Send + Sync {
     async fn repo_map(&self, max_entries: usize) -> Result<Vec<String>>;
     async fn search(&self, query: &str, limit: usize) -> Result<Vec<FileHit>>;
     async fn search_symbols(&self, query: &str, limit: usize) -> Result<Vec<SymbolHit>>;
+    async fn search_content(&self, query: &str, limit: usize) -> Result<Vec<ContentHit>>;
 }
 
 #[async_trait]

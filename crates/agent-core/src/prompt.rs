@@ -113,10 +113,22 @@ pub fn intake_instruction() -> String {
     [
         "QUESTION",
         "Classify the local coding request and propose deterministic code-search queries for the host to run.",
-        "Use `Locate` for where/which-file questions, `Explain` for how/what/why/update-analysis questions, and `Unclear` only when the request has no actionable code target.",
-        "Prefer to proceed on short local-code questions if they mention UI, git, components, files, functions, panels, workspace, Tauri, Rust, or TypeScript.",
+        "Use `Edit` for requests to add, update, fix, remove, refactor, style, or otherwise change code. Use `Locate` for where/which-file questions, `Explain` for how/what/why/update-analysis questions, and `Unclear` only when the request has no actionable code target.",
+        "Prefer to proceed on short local-code questions if they mention UI, git, components, files, functions, panels, workspace, Tauri, Rust, TypeScript, or concrete change intent.",
         "Produce 3-6 short search queries likely to match paths, symbols, UI labels, component names, or domain nouns. Include exact identifiers and useful variants; omit filler words.",
         "Do not answer the user here.",
+    ]
+    .join("\n")
+}
+
+pub fn plan_instruction() -> String {
+    [
+        "QUESTION",
+        "Draft a safe implementation plan for this local coding change. Do not propose an edit artifact yet and do not claim files were changed.",
+        "Use only active notebook entries and leased evidence. If evidence is incomplete, make the plan narrow and name the uncertainty in risks.",
+        "Affected files should include only files that current evidence supports as likely touch points.",
+        "Steps should be concrete implementation actions the host could later turn into edit artifacts.",
+        "Validation commands should be commands the user or host can run in this workspace after edits, such as package scripts, cargo checks, or focused tests inferred from evidence.",
     ]
     .join("\n")
 }
@@ -222,8 +234,8 @@ pub fn schema_intake() -> serde_json::Value {
         "properties": {
             "task_type": {
                 "type": "string",
-                "enum": ["Explain", "Locate", "Unclear"],
-                "description": "Locate for where/which-file questions, Explain for code behavior or change analysis, Unclear only when no actionable local-code target exists."
+                "enum": ["Explain", "Locate", "Edit", "Unclear"],
+                "description": "Edit for requested code changes, Locate for where/which-file questions, Explain for code behavior or change analysis, Unclear only when no actionable local-code target exists."
             },
             "target_hints": {
                 "type": "array",
@@ -242,6 +254,56 @@ pub fn schema_intake() -> serde_json::Value {
             }
         },
         "required": ["task_type", "target_hints", "constraints", "search_queries"],
+        "additionalProperties": false
+    })
+}
+
+pub fn schema_plan() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "objective": {
+                "type": "string",
+                "description": "One sentence describing the requested code change."
+            },
+            "affected_files": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "reason": { "type": "string" }
+                    },
+                    "required": ["path", "reason"],
+                    "additionalProperties": false
+                },
+                "description": "Files likely to need edits based on current evidence only."
+            },
+            "steps": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "title": { "type": "string" },
+                        "detail": { "type": "string" }
+                    },
+                    "required": ["title", "detail"],
+                    "additionalProperties": false
+                },
+                "description": "Concrete implementation steps for a later edit-artifact phase."
+            },
+            "risks": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Uncertainties, likely regression risks, or missing evidence."
+            },
+            "validation_commands": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Commands to run after edits are eventually applied."
+            }
+        },
+        "required": ["objective", "affected_files", "steps", "risks", "validation_commands"],
         "additionalProperties": false
     })
 }
@@ -382,13 +444,17 @@ mod tests {
     fn local_coding_instructions_are_explicit() {
         let global = global_prefix(&["src/GitPanel.tsx".to_string()]);
         let intake = intake_instruction();
+        let plan = plan_instruction();
         let extract = extract_instruction();
         let synthesize = synthesize_instruction();
 
         assert!(global.contains("never edit files"));
         assert!(global.contains("repo map as navigation only"));
         assert!(intake.contains("Prefer to proceed on short local-code questions"));
+        assert!(intake.contains("Use `Edit`"));
         assert!(intake.contains("UI"));
+        assert!(plan.contains("safe implementation plan"));
+        assert!(plan.contains("Do not propose an edit artifact yet"));
         assert!(extract.contains("exact JSX/render block"));
         assert!(extract.contains("Copy lease ids exactly"));
         assert!(synthesize.contains("Do not include a markdown Sources section"));
@@ -398,13 +464,18 @@ mod tests {
     #[test]
     fn schemas_describe_local_code_outputs() {
         let intake = schema_intake();
+        let plan = schema_plan();
         let extract = schema_extract();
         let synthesize = schema_synthesize();
 
         assert!(intake["properties"]["task_type"]["description"]
             .as_str()
             .unwrap()
-            .contains("which-file"));
+            .contains("requested code changes"));
+        assert!(plan["properties"]["affected_files"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("current evidence"));
         assert!(
             extract["properties"]["inferences"]["items"]["properties"]["statement"]["description"]
                 .as_str()

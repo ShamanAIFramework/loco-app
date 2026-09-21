@@ -131,13 +131,53 @@ Rebuild the orchestrator and `agentv2` behavior so deterministic Rust code contr
   - added `AGENTS.md` with project rules for separated phases, stable context, source UI, and future whole-file edit mode
   - added local Codex skill `local-agent-prompting` with a reference guide for local/open-weight coding-agent prompt design
   - prompt text now explicitly says each call is a separated harness phase, not a ReAct loop
+- Started plan-only edit loop:
+  - added `TaskType::Edit` and `Phase::Plan` in `agent-core`
+  - added structured `EditPlan`, `PlannedFile`, and `PlanStep` types
+  - intake can classify change requests as `Edit`, then the existing evidence loop feeds a plan-only JSON phase
+  - edit requests now return a markdown implementation plan and explicitly state that no files were changed
+  - added regression coverage that edit requests enter `Plan` and do not enter synthesis
+- Added local content-search retrieval:
+  - `CodeSearch` now includes `search_content` alongside path and symbol search
+  - Tauri content search scans indexed workspace files locally and returns ranked line-window matches
+  - content search supports case-insensitive regex/phrase matching and merges overlapping snippet windows
+  - the evidence loop reads content hits as leased ranges before falling back to whole-file reads
+  - progress now reports text-match search and matched line-window inspection
+  - added regression coverage that content-search hits become notebook evidence
+- Improved stable repo-map context:
+  - repo map entries now include compact symbol outlines and line ranges instead of only file paths
+  - symbol-bearing files are prioritized before plain file path entries inside the repo-map budget
+- Added Tree-sitter-backed structural indexing:
+  - Rust, TypeScript, JavaScript, JSX, and TSX files now use Tree-sitter parsing before the conservative line scanner fallback
+  - indexed symbols include functions, classes, methods, structs, enums, traits, impls, and function-valued callbacks
+  - repo maps, symbol search, and leased range evidence benefit from parser-derived definition ranges when the file parses cleanly
+  - added regression coverage for Rust impl/function extraction and TSX component/callback extraction
+- Improved lightweight reference discovery:
+  - the indexer now records deterministic symbol mention and call edges against all indexed project symbols, including cross-file references discovered from parsed symbol bodies
+  - symbol search can surface definitions and local callers/referencers for the queried symbol name
+  - added regression coverage for a cross-file TypeScript helper call
+- Improved local retrieval ranking and acceleration:
+  - symbol search now boosts symbols that call or reference the queried symbol through indexed graph edges
+  - repo-map context now prefers files with stronger graph connectivity before isolated symbol outlines
+  - content search can use `rg` to preselect candidate files when available, then falls back to the deterministic in-process scanner
+  - added regression coverage for graph-edge scoring and `rg` fallback behavior
+- Added bounded multi-hop graph-distance retrieval:
+  - symbol search now includes two-hop candidates, so callers of callers can surface for a queried target symbol
+  - symbol scoring applies a smaller boost to two-hop graph matches than direct graph matches
+  - added regression coverage for a `main -> helper -> println` symbol chain
+- Reduced graph-reference noise:
+  - symbol edge extraction now requires identifier-boundary matches instead of raw substring matches
+  - call edges are detected from boundary-matched symbol names followed by an opening parenthesis
+  - added regression coverage so `helperText` and `my_helper` do not create false `helper` references
 
 ## Verified
 
 - `cargo test --workspace`
-  - 22 tests passed.
+  - 24 tests passed.
 - `cargo test --manifest-path src-tauri/Cargo.toml`
-  - 6 Tauri-side tests passed.
+  - 14 Tauri-side tests passed.
+- `cargo test --manifest-path src-tauri/Cargo.toml indexer::tests::tree_sitter -- --nocapture`
+  - 2 Tree-sitter indexer tests passed.
 - `cargo check --manifest-path src-tauri/Cargo.toml`
   - completed successfully.
 - `npm run build`
@@ -145,10 +185,11 @@ Rebuild the orchestrator and `agentv2` behavior so deterministic Rust code contr
 
 ## Intentional Temporary Limitations
 
-- `CodeGraphStore` now provides symbol ranges and lightweight intra-file edges, but it does not yet provide robust cross-file call graphs, references, or graph-distance ranking.
-- Evidence leases can now cover symbol ranges when symbol hits are available. Symbol parsing is conservative and regex-free, so complex language constructs may still fall back to whole-file slices.
-- The Tauri adapter uses current file-path and symbol-name search, scored deterministically by simple matching.
+- `CodeGraphStore` now provides symbol ranges, lightweight mention/call edges, and bounded graph-distance lookup, but it does not yet provide robust LSP/type-aware cross-file call graphs or references.
+- Evidence leases can now cover symbol and content-search ranges when hits are available. Symbol parsing is conservative, so complex language constructs may still fall back to whole-file slices.
+- The Tauri adapter uses deterministic path, Tree-sitter-backed symbol, regex/phrase content search, `rg` candidate acceleration, lightweight symbol mention/call edges, graph-edge symbol boosts, graph-aware repo-map ordering, and bounded two-hop graph-distance retrieval. It does not yet provide semantic/vector search, LSP-backed references, or robust type-aware cross-file references.
 - The final answer is streamed to the UI as one chunk after synthesis rather than token-streamed.
+- Plan mode is non-writing only. It does not yet produce edit artifacts, preview diffs, accept approvals, apply changes, run validation commands, or repair failed validation.
 - Token counting is tokenizer-backed when llama-server exposes `/tokenize`, with an approximate fallback for compatibility.
 - `agent-cli replay` can now regenerate prompt bytes from recorded prompt parts. It still does not replay from notebook snapshots alone.
 - Eval now scores files and symbols and can include trace-derived citation validity, outcome correctness, stop reasons, calls, tokens, queue wait, and wall time when a task includes `trace_path`. It is still a baseline/evaluation harness, not a full task runner.
@@ -157,15 +198,24 @@ Rebuild the orchestrator and `agentv2` behavior so deterministic Rust code contr
 
 ## Next Milestones
 
-1. Capture a stable llama.cpp/server version if the sidecar exposes one.
-2. Improve parsers and graph extraction beyond the conservative line scanner.
-3. Add UI smoke verification against a small workspace:
+1. Add draft edit artifacts without writes:
+   - whole-file or block-level replacements
+   - prior hash/range validation
+   - host-computed diff preview
+2. Add plan approval/refinement UI controls before artifact generation.
+3. Capture a stable llama.cpp/server version if the sidecar exposes one.
+4. Improve graph extraction beyond local symbol definitions:
+   - LSP references/definitions where available
+   - Tree-sitter reference extraction beyond local definitions
+   - richer graph-distance ranking using typed references when available
+5. Add semantic/vector retrieval as a supplement to lexical and structural search.
+6. Add UI smoke verification against a small workspace:
    - ask for a known symbol
    - edit that symbol while the app is open
    - ask again
    - confirm stale evidence is rejected
    - run `agent-cli replay` on the trace
-4. Consider removing or renaming the now-empty `src-tauri/src/agentv2.rs` compatibility module once all references have settled.
+7. Consider removing or renaming the now-empty `src-tauri/src/agentv2.rs` compatibility module once all references have settled.
 
 ## Resume Notes
 

@@ -48,6 +48,7 @@ fn default_max_evidence_tokens() -> usize {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Phase {
     Intake,
+    Plan,
     Extract,
     Synthesize,
 }
@@ -56,6 +57,7 @@ pub enum Phase {
 pub enum TaskType {
     Explain,
     Locate,
+    Edit,
     Unclear,
 }
 
@@ -84,6 +86,27 @@ pub struct IntakeOutput {
     pub target_hints: Vec<String>,
     pub constraints: Vec<String>,
     pub search_queries: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EditPlan {
+    pub objective: String,
+    pub affected_files: Vec<PlannedFile>,
+    pub steps: Vec<PlanStep>,
+    pub risks: Vec<String>,
+    pub validation_commands: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PlannedFile {
+    pub path: String,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PlanStep {
+    pub title: String,
+    pub detail: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -137,6 +160,15 @@ pub struct SymbolHit {
     pub kind: String,
     pub start_line: u32,
     pub end_line: u32,
+    pub score: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ContentHit {
+    pub path: String,
+    pub start_line: u32,
+    pub end_line: u32,
+    pub preview: String,
     pub score: i64,
 }
 

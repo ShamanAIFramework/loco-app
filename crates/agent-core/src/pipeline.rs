@@ -1,16 +1,16 @@
 use crate::notebook::{EntryId, EvidenceLease, LineRange, Notebook, Provenance};
 use crate::prompt::{
     evidence_block, extract_instruction, global_prefix, intake_instruction, notebook_block,
-    phase_prefix, schema_extract, schema_intake, schema_synthesize, synthesize_instruction,
-    task_block, PromptParts,
+    phase_prefix, plan_instruction, schema_extract, schema_intake, schema_plan, schema_synthesize,
+    synthesize_instruction, task_block, PromptParts,
 };
 use crate::trace::{Trace, TraceEvent};
 use crate::traits::{
     AgentProgress, CodeSearch, FileReader, LlmClient, LlmRequest, ProgressSink, TokenCounter,
 };
 use crate::types::{
-    AgentAnswer, EvidenceSlice, ExtractOutput, IntakeOutput, LeaseStatus, MissingEvidenceKind,
-    Phase, StopReason, SymbolHit, SynthesizeOutput, TaskRequest, TaskType,
+    AgentAnswer, EditPlan, EvidenceSlice, ExtractOutput, IntakeOutput, LeaseStatus,
+    MissingEvidenceKind, Phase, StopReason, SynthesizeOutput, TaskRequest, TaskType,
 };
 use anyhow::{anyhow, Context, Result};
 use serde::de::DeserializeOwned;
@@ -136,7 +136,8 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
         .await;
 
     let mut file_paths = BTreeMap::<String, i64>::new();
-    let mut symbol_hits = BTreeMap::<(String, String, u32, u32), SymbolHit>::new();
+    let mut symbol_hits = BTreeMap::<(String, String, u32, u32), crate::types::SymbolHit>::new();
+    let mut content_hits = BTreeMap::<(String, u32, u32), crate::types::ContentHit>::new();
     for query in intake
         .search_queries
         .iter()
@@ -209,6 +210,39 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
                     hit.start_line,
                     hit.end_line,
                 ))
+                .and_modify(|existing| existing.score += hit.score)
+                .or_insert(hit);
+        }
+
+        runtime
+            .progress
+            .emit(AgentProgress::Status(format!(
+                "Finding text matches for {}",
+                plain_query(query)
+            )))
+            .await;
+        let text_hits = runtime
+            .code_search
+            .search_content(query, task.budgets.max_files_to_read * 3)
+            .await
+            .unwrap_or_default();
+        trace.push(TraceEvent::ToolCall {
+            name: "code_search_content".to_string(),
+            args: serde_json::json!({ "query": query }),
+            result_count: text_hits.len(),
+        });
+        runtime
+            .progress
+            .emit(AgentProgress::Status(format!(
+                "Found {} text match{} for {}",
+                text_hits.len(),
+                plural(text_hits.len()),
+                plain_query(query)
+            )))
+            .await;
+        for hit in text_hits {
+            content_hits
+                .entry((hit.path.clone(), hit.start_line, hit.end_line))
                 .and_modify(|existing| existing.score += hit.score)
                 .or_insert(hit);
         }
@@ -331,6 +365,119 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
                     },
                     Phase::Extract,
                     vec![hit.path, hit.symbol],
+                );
+            }
+        }
+    }
+
+    let mut sorted_content_hits = content_hits.into_values().collect::<Vec<_>>();
+    sorted_content_hits.sort_by(|a, b| {
+        b.score
+            .cmp(&a.score)
+            .then_with(|| a.path.cmp(&b.path))
+            .then_with(|| a.start_line.cmp(&b.start_line))
+    });
+    for hit in sorted_content_hits
+        .into_iter()
+        .take(task.budgets.max_files_to_read)
+    {
+        if read_paths.contains(&hit.path) && !evidence.is_empty() {
+            continue;
+        }
+        runtime
+            .progress
+            .emit(AgentProgress::Status(format!(
+                "Inspecting text match in `{}` lines {}-{}",
+                hit.path, hit.start_line, hit.end_line
+            )))
+            .await;
+        match runtime
+            .file_reader
+            .read_range(
+                &hit.path,
+                None,
+                hit.start_line,
+                hit.end_line,
+                per_slice_budget(&task),
+            )
+            .await
+        {
+            Ok(slice) => {
+                let token_count = runtime.token_counter.count_tokens(&slice.content).await;
+                if !should_accept_evidence(&evidence, evidence_tokens, token_count, &task) {
+                    runtime
+                        .progress
+                        .emit(AgentProgress::Status(format!(
+                            "Skipping `{}` lines {}-{} because the evidence budget is full",
+                            slice.lease.path, slice.lease.range.start, slice.lease.range.end
+                        )))
+                        .await;
+                    notebook.append_tool_fact(
+                        format!(
+                            "Skipped text match in {} lines {}-{} because it would exceed the evidence token budget",
+                            slice.lease.path, slice.lease.range.start, slice.lease.range.end
+                        ),
+                        Provenance::Tool {
+                            name: "token_budget".to_string(),
+                            call_id: call_id("token_budget"),
+                        },
+                        Phase::Extract,
+                        vec![slice.lease.path.clone()],
+                    );
+                    continue;
+                }
+                let fact_id = notebook.append_tool_fact(
+                    format!(
+                        "Read text match in {} lines {}-{} under lease {}",
+                        slice.lease.path,
+                        slice.lease.range.start,
+                        slice.lease.range.end,
+                        slice.lease.id.0
+                    ),
+                    Provenance::File {
+                        path: slice.lease.path.clone(),
+                        symbol: None,
+                        range: slice.lease.range,
+                        lease_id: slice.lease.id.clone(),
+                    },
+                    Phase::Extract,
+                    vec![slice.lease.path.clone()],
+                );
+                lease_fact_entries.insert(slice.lease.id.clone(), fact_id);
+                read_paths.insert(slice.lease.path.clone());
+                evidence_tokens += token_count;
+                evidence.push(slice);
+                runtime
+                    .progress
+                    .emit(AgentProgress::Status(format!(
+                        "Using `{}` lines {}-{} as evidence",
+                        evidence
+                            .last()
+                            .map(|slice| slice.lease.path.as_str())
+                            .unwrap_or("unknown"),
+                        evidence
+                            .last()
+                            .map(|slice| slice.lease.range.start)
+                            .unwrap_or_default(),
+                        evidence
+                            .last()
+                            .map(|slice| slice.lease.range.end)
+                            .unwrap_or_default()
+                    )))
+                    .await;
+            }
+            Err(err) => {
+                notebook.append_tool_fact(
+                    format!(
+                        "Could not read text match in {} lines {}-{}: {}",
+                        hit.path, hit.start_line, hit.end_line, err
+                    ),
+                    Provenance::Tool {
+                        name: "read_range".to_string(),
+                        call_id: call_id("read_range"),
+                    },
+                    Phase::Extract,
+                    vec![hit.path],
                 );
             }
         }
@@ -625,6 +772,74 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
         .emit(AgentProgress::Status("Preparing the answer".to_string()))
         .await;
 
+    if intake.task_type == TaskType::Edit {
+        if llm_calls >= task.budgets.max_llm_calls {
+            let content = fallback_plan_answer(&task, &notebook, &inference_entry_ids);
+            let answer = AgentAnswer {
+                content,
+                stop_reason: StopReason::BudgetExhausted,
+                cited_entries: active_entries(&notebook, inference_entry_ids),
+                notebook,
+            };
+            trace.push(TraceEvent::NotebookSnapshot {
+                phase: Phase::Plan,
+                notebook: answer.notebook.deterministic_checkpoint(),
+            });
+            trace.push(TraceEvent::RunFinished {
+                stop_reason: StopReason::BudgetExhausted,
+            });
+            return Ok(AgentRunResult { answer, trace });
+        }
+
+        trace.push(TraceEvent::PhaseStarted { phase: Phase::Plan });
+        runtime
+            .progress
+            .emit(AgentProgress::Status(
+                "Drafting an implementation plan".to_string(),
+            ))
+            .await;
+        let plan_parts = PromptParts {
+            global_prefix: global,
+            phase_prefix: phase_prefix(Phase::Plan, "EditPlan"),
+            task: task_block(&task),
+            notebook: notebook_block(&notebook, &target_tags, 64),
+            evidence: "EPHEMERAL EVIDENCE\nUse notebook entries as the source of truth for this plan. Do not draft replacement code or claim edits were applied.".to_string(),
+            question: plan_instruction(),
+        };
+        let plan_prompt = plan_parts.render();
+        let plan_req = LlmRequest {
+            call_id: call_id("plan"),
+            phase: Phase::Plan,
+            schema_name: "EditPlan".to_string(),
+            schema: schema_plan(),
+            prompt_parts: Some(plan_parts),
+            prompt: plan_prompt,
+            temperature: 0.0,
+        };
+        trace.push(TraceEvent::NotebookSnapshot {
+            phase: Phase::Plan,
+            notebook: notebook.deterministic_checkpoint(),
+        });
+        let plan_resp = runtime.llm.complete_json(plan_req.clone()).await?;
+        trace.push(TraceEvent::LlmCall {
+            request: plan_req,
+            response: plan_resp.clone(),
+        });
+        let plan: EditPlan = parse_json(&plan_resp.raw_json)
+            .unwrap_or_else(|_| fallback_edit_plan(&task, &notebook, &inference_entry_ids));
+        let cited_entries = active_entries(&notebook, inference_entry_ids);
+        let answer = AgentAnswer {
+            content: render_edit_plan(&plan),
+            stop_reason: StopReason::Done,
+            cited_entries,
+            notebook,
+        };
+        trace.push(TraceEvent::RunFinished {
+            stop_reason: StopReason::Done,
+        });
+        return Ok(AgentRunResult { answer, trace });
+    }
+
     if llm_calls >= task.budgets.max_llm_calls {
         let content = fallback_answer(
             &task,
@@ -760,7 +975,11 @@ fn fallback_intake(question: &str) -> IntakeOutput {
         terms.push(question.to_string());
     }
     IntakeOutput {
-        task_type: TaskType::Explain,
+        task_type: if looks_like_edit_request(question) {
+            TaskType::Edit
+        } else {
+            TaskType::Explain
+        },
         target_hints: terms.clone(),
         constraints: Vec::new(),
         search_queries: terms,
@@ -783,6 +1002,28 @@ fn normalize_intake(intake: &mut IntakeOutput, task: &TaskRequest) {
     }
     dedup(&mut intake.search_queries);
     dedup(&mut intake.target_hints);
+}
+
+fn looks_like_edit_request(question: &str) -> bool {
+    let lower = question.to_lowercase();
+    [
+        "update",
+        "change",
+        "fix",
+        "add",
+        "remove",
+        "make",
+        "wrap",
+        "display",
+        "show",
+        "refactor",
+        "rename",
+        "style",
+        "implement",
+        "create",
+    ]
+    .iter()
+    .any(|word| lower.contains(word))
 }
 
 fn looks_actionable_code_request(question: &str) -> bool {
@@ -858,6 +1099,120 @@ fn fallback_answer(
     if stop_reason == StopReason::BudgetExhausted {
         lines.push("The run stopped because the LLM call budget was exhausted.".to_string());
     }
+    lines.join("\n")
+}
+
+fn fallback_edit_plan(
+    task: &TaskRequest,
+    notebook: &Notebook,
+    inference_entry_ids: &[EntryId],
+) -> EditPlan {
+    let affected_files = active_entries(notebook, inference_entry_ids.to_vec())
+        .into_iter()
+        .filter_map(|id| {
+            let entry = notebook.get(&id)?;
+            match &entry.provenance {
+                Provenance::File { path, .. } => Some(crate::types::PlannedFile {
+                    path: path.clone(),
+                    reason: entry.statement.clone(),
+                }),
+                _ => None,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    EditPlan {
+        objective: task.question.clone(),
+        affected_files,
+        steps: vec![
+            crate::types::PlanStep {
+                title: "Confirm the target code".to_string(),
+                detail:
+                    "Use the cited evidence to confirm the exact component, function, or file range to change."
+                        .to_string(),
+            },
+            crate::types::PlanStep {
+                title: "Draft a host-validated edit artifact".to_string(),
+                detail:
+                    "Generate a whole-file or block-level replacement in the next edit phase, then preview the resulting diff before writing."
+                        .to_string(),
+            },
+        ],
+        risks: vec![
+            "This is a planning-only response; no file changes have been written.".to_string(),
+        ],
+        validation_commands: vec![
+            "cargo test --workspace".to_string(),
+            "cargo test --manifest-path src-tauri/Cargo.toml".to_string(),
+            "npm run build".to_string(),
+        ],
+    }
+}
+
+fn fallback_plan_answer(
+    task: &TaskRequest,
+    notebook: &Notebook,
+    inference_entry_ids: &[EntryId],
+) -> String {
+    let mut plan = fallback_edit_plan(task, notebook, inference_entry_ids);
+    plan.risks
+        .push("The run stopped before a model-authored plan could be generated.".to_string());
+    render_edit_plan(&plan)
+}
+
+fn render_edit_plan(plan: &EditPlan) -> String {
+    let mut lines = vec![
+        "## Implementation Plan".to_string(),
+        String::new(),
+        format!("**Objective:** {}", plan.objective),
+        String::new(),
+        "**Likely files:**".to_string(),
+    ];
+
+    if plan.affected_files.is_empty() {
+        lines.push("- No specific files were confirmed yet.".to_string());
+    } else {
+        for file in &plan.affected_files {
+            lines.push(format!("- `{}`: {}", file.path, file.reason));
+        }
+    }
+
+    lines.push(String::new());
+    lines.push("**Steps:**".to_string());
+    if plan.steps.is_empty() {
+        lines.push("- No implementation steps were produced.".to_string());
+    } else {
+        for (idx, step) in plan.steps.iter().enumerate() {
+            lines.push(format!("{}. **{}**: {}", idx + 1, step.title, step.detail));
+        }
+    }
+
+    lines.push(String::new());
+    lines.push("**Risks:**".to_string());
+    if plan.risks.is_empty() {
+        lines.push("- No specific risks identified.".to_string());
+    } else {
+        for risk in &plan.risks {
+            lines.push(format!("- {}", risk));
+        }
+    }
+
+    lines.push(String::new());
+    lines.push("**Validation:**".to_string());
+    if plan.validation_commands.is_empty() {
+        lines.push("- No validation commands identified yet.".to_string());
+    } else {
+        for command in &plan.validation_commands {
+            lines.push(format!("- `{}`", command));
+        }
+    }
+
+    lines.push(String::new());
+    lines.push(
+        "No files were changed. This is the plan-only phase before edit artifacts and diff preview."
+            .to_string(),
+    );
+
     lines.join("\n")
 }
 
@@ -1101,7 +1456,7 @@ mod tests {
     use super::*;
     use crate::notebook::EvidenceLease;
     use crate::traits::{ApproxTokenCounter, LlmResponse, LlmUsage, NoopProgressSink};
-    use crate::types::{Budgets, FileHit};
+    use crate::types::{Budgets, ContentHit, FileHit, SymbolHit};
     use async_trait::async_trait;
     use std::sync::{Arc, Mutex};
 
@@ -1139,6 +1494,37 @@ mod tests {
 
         async fn search_symbols(&self, _query: &str, _limit: usize) -> Result<Vec<SymbolHit>> {
             Ok(Vec::new())
+        }
+
+        async fn search_content(&self, _query: &str, _limit: usize) -> Result<Vec<ContentHit>> {
+            Ok(Vec::new())
+        }
+    }
+
+    struct ContentOnlySearch;
+
+    #[async_trait]
+    impl CodeSearch for ContentOnlySearch {
+        async fn repo_map(&self, _max_entries: usize) -> Result<Vec<String>> {
+            Ok(vec!["src/styles.css".to_string()])
+        }
+
+        async fn search(&self, _query: &str, _limit: usize) -> Result<Vec<FileHit>> {
+            Ok(Vec::new())
+        }
+
+        async fn search_symbols(&self, _query: &str, _limit: usize) -> Result<Vec<SymbolHit>> {
+            Ok(Vec::new())
+        }
+
+        async fn search_content(&self, _query: &str, _limit: usize) -> Result<Vec<ContentHit>> {
+            Ok(vec![ContentHit {
+                path: "src/styles.css".to_string(),
+                start_line: 10,
+                end_line: 14,
+                preview: ".status-pill { display: flex; }".to_string(),
+                score: 90,
+            }])
         }
     }
 
@@ -1323,6 +1709,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn edit_request_returns_plan_without_synthesis() {
+        let llm = MockLlm {
+            responses: Mutex::new(vec![
+                r#"{"task_type":"Edit","target_hints":["main"],"constraints":[],"search_queries":["main"]}"#.to_string(),
+                r#"{"inferences":[],"sufficient":true,"missing":[]}"#.to_string(),
+                r#"{"objective":"Update the main entry point.","affected_files":[{"path":"src/main.rs","reason":"It contains the entry point."}],"steps":[{"title":"Adjust main","detail":"Update the relevant entry point behavior after confirming the intended change."}],"risks":["The exact desired runtime behavior needs confirmation."],"validation_commands":["cargo test --workspace"]}"#.to_string(),
+            ]),
+        };
+        let task = TaskRequest {
+            run_id: "run".to_string(),
+            session_id: "session".to_string(),
+            workspace_path: None,
+            question: "update main".to_string(),
+            conversation: Vec::new(),
+            budgets: Budgets::default(),
+        };
+
+        let result = run_agent(
+            task,
+            AgentRuntime {
+                llm: &llm,
+                code_search: &MockSearch,
+                file_reader: &MockReader,
+                token_counter: &ApproxTokenCounter,
+                progress: &NoopProgressSink,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.answer.stop_reason, StopReason::Done);
+        assert!(result.answer.content.contains("## Implementation Plan"));
+        assert!(result.answer.content.contains("No files were changed"));
+        assert!(result
+            .trace
+            .events
+            .iter()
+            .any(|event| matches!(event, TraceEvent::PhaseStarted { phase: Phase::Plan })));
+        assert!(!result.trace.events.iter().any(|event| matches!(
+            event,
+            TraceEvent::PhaseStarted {
+                phase: Phase::Synthesize
+            }
+        )));
+    }
+
+    #[tokio::test]
+    async fn content_search_hits_are_read_as_evidence() {
+        let llm = MockLlm {
+            responses: Mutex::new(vec![
+                r#"{"task_type":"Locate","target_hints":["status pill"],"constraints":[],"search_queries":["status pill"]}"#.to_string(),
+                r#"{"inferences":[],"sufficient":true,"missing":[]}"#.to_string(),
+                r#"{"answer":"The status pill styling is in src/styles.css.","cited_entries":[],"stop_reason":"Done"}"#.to_string(),
+            ]),
+        };
+        let task = TaskRequest {
+            run_id: "run".to_string(),
+            session_id: "session".to_string(),
+            workspace_path: None,
+            question: "where are status pill styles?".to_string(),
+            conversation: Vec::new(),
+            budgets: Budgets::default(),
+        };
+
+        let result = run_agent(
+            task,
+            AgentRuntime {
+                llm: &llm,
+                code_search: &ContentOnlySearch,
+                file_reader: &MockReader,
+                token_counter: &ApproxTokenCounter,
+                progress: &NoopProgressSink,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(result.trace.events.iter().any(|event| {
+            matches!(
+                event,
+                TraceEvent::ToolCall {
+                    name,
+                    result_count: 1,
+                    ..
+                } if name == "code_search_content"
+            )
+        }));
+        assert!(result
+            .answer
+            .notebook
+            .iter_in_append_order()
+            .any(|entry| entry
+                .statement
+                .contains("Read text match in src/styles.css lines 10-14")));
+    }
+
+    #[tokio::test]
     async fn expired_lease_invalidates_notebook_and_rejects_inference() {
         let llm = MockLlm {
             responses: Mutex::new(vec![
@@ -1365,7 +1848,7 @@ mod tests {
     }
 
     #[test]
-    fn actionable_ui_prompt_overrides_unclear_intake() {
+    fn actionable_ui_prompt_overrides_unclear_intake_as_edit_when_change_requested() {
         let task = TaskRequest {
             run_id: "run".to_string(),
             session_id: "session".to_string(),
@@ -1383,7 +1866,7 @@ mod tests {
 
         normalize_intake(&mut intake, &task);
 
-        assert_eq!(intake.task_type, TaskType::Explain);
+        assert_eq!(intake.task_type, TaskType::Edit);
         assert!(!intake.search_queries.is_empty());
     }
 

@@ -6,15 +6,18 @@ use crate::conversation_store::Role;
 use crate::engine::EngineState;
 use crate::{AppError, AppState};
 use agent_core::{
-    AgentProgress, AgentRuntime, Budgets, CodeSearch, ConversationTurn, EvidenceLease,
+    AgentProgress, AgentRuntime, Budgets, CodeSearch, ContentHit, ConversationTurn, EvidenceLease,
     EvidenceSlice, FileHit, FileReader, LeaseStatus, LineRange, LlmClient, LlmRequest, LlmResponse,
     LlmUsage, ProgressSink, RuntimeMetadata, SymbolHit, TaskRequest, TokenCounter, TraceEvent,
 };
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
+use regex::RegexBuilder;
 use serde::Deserialize;
 use serde_json::json;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 use tauri::ipc::Channel;
 use tauri::Manager;
@@ -296,15 +299,49 @@ impl CodeSearch for TauriCodeSearch {
         let app = self.app.clone();
         tauri::async_runtime::spawn_blocking(move || {
             let state = app.state::<AppState>();
-            let mut files = state
-                .codegraph
-                .project_files(&project_id)?
+            let mut entries = Vec::<(String, usize, usize)>::new();
+            for file in state.codegraph.project_files(&project_id)? {
+                let file_symbols = state.codegraph.file_symbols(&file.id)?;
+                let edge_count = file_symbols
+                    .iter()
+                    .map(|symbol| {
+                        state
+                            .codegraph
+                            .symbol_edges(&symbol.id)
+                            .map(|edges| edges.len())
+                            .unwrap_or_default()
+                    })
+                    .sum::<usize>();
+                let symbols = file_symbols
+                    .iter()
+                    .take(6)
+                    .map(|symbol| {
+                        format!(
+                            "{} {} lines {}-{}",
+                            symbol.kind, symbol.name, symbol.start_line, symbol.end_line
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                if symbols.is_empty() {
+                    entries.push((file.path, 0, 0));
+                } else {
+                    let mut outline = format!("{} :: {}", file.path, symbols.join("; "));
+                    if edge_count > 0 {
+                        outline.push_str(&format!("; refs {}", edge_count));
+                    }
+                    entries.push((outline, file_symbols.len(), edge_count));
+                }
+            }
+            entries.sort_by(|a, b| {
+                b.2.cmp(&a.2)
+                    .then_with(|| b.1.cmp(&a.1))
+                    .then_with(|| a.0.cmp(&b.0))
+            });
+            entries.truncate(max_entries);
+            Ok(entries
                 .into_iter()
-                .map(|file| file.path)
-                .collect::<Vec<_>>();
-            files.sort();
-            files.truncate(max_entries);
-            Ok(files)
+                .map(|(entry, _, _)| entry)
+                .collect::<Vec<_>>())
         })
         .await
         .context("Failed to join repo map task")?
@@ -351,7 +388,12 @@ impl CodeSearch for TauriCodeSearch {
                 .search_symbols(&project_id, &query)?
                 .into_iter()
                 .map(|(file, symbol)| {
-                    let score = score_symbol_hit(&file.path, &symbol.name, &query);
+                    let edge_boost = state
+                        .codegraph
+                        .symbol_graph_distance_to_query(&project_id, &symbol.id, &query, 2)
+                        .map(|distance| symbol_graph_distance_boost(distance))
+                        .unwrap_or_default();
+                    let score = score_symbol_hit(&file.path, &symbol.name, &query) + edge_boost;
                     SymbolHit {
                         path: file.path,
                         symbol: symbol.name,
@@ -374,6 +416,66 @@ impl CodeSearch for TauriCodeSearch {
         })
         .await
         .context("Failed to join symbol search task")?
+    }
+
+    async fn search_content(&self, query: &str, limit: usize) -> Result<Vec<ContentHit>> {
+        let Some(project_id) = self.project_id.clone() else {
+            return Ok(Vec::new());
+        };
+        let app = self.app.clone();
+        let query = query.to_string();
+        tauri::async_runtime::spawn_blocking(move || {
+            let state = app.state::<AppState>();
+            let project = state
+                .codegraph
+                .list_projects()?
+                .into_iter()
+                .find(|project| project.id == project_id)
+                .ok_or_else(|| anyhow!("Project not found for content search"))?;
+            let root = PathBuf::from(project.root_path);
+            let terms = search_terms(&query);
+            let regex = search_regex(&query);
+            if terms.is_empty() && regex.is_none() {
+                return Ok(Vec::new());
+            }
+            let rg_candidates = rg_candidate_paths(&root, &terms);
+
+            let mut hits = Vec::new();
+            for file in state.codegraph.project_files(&project_id)? {
+                if !looks_searchable_text_file(&file.path) {
+                    continue;
+                }
+                if let Some(candidates) = rg_candidates.as_ref() {
+                    if !candidates.is_empty() && !candidates.contains(&file.path) {
+                        continue;
+                    }
+                }
+                let rel_path = sanitize_relative_path(&file.path)?;
+                let full_path = root.join(&rel_path);
+                let Ok(content) = std::fs::read_to_string(&full_path) else {
+                    continue;
+                };
+                collect_content_hits(
+                    &file.path,
+                    &content,
+                    &terms,
+                    regex.as_ref(),
+                    &query,
+                    &mut hits,
+                );
+            }
+
+            hits.sort_by(|a, b| {
+                b.score
+                    .cmp(&a.score)
+                    .then_with(|| a.path.cmp(&b.path))
+                    .then_with(|| a.start_line.cmp(&b.start_line))
+            });
+            hits.truncate(limit);
+            Ok(hits)
+        })
+        .await
+        .context("Failed to join content search task")?
     }
 }
 
@@ -659,6 +761,213 @@ fn score_symbol_hit(path: &str, symbol: &str, query: &str) -> i64 {
     }
 }
 
+fn symbol_graph_distance_boost(distance: Option<usize>) -> i64 {
+    match distance {
+        Some(1) => 80,
+        Some(2) => 45,
+        _ => 0,
+    }
+}
+
+fn looks_searchable_text_file(path: &str) -> bool {
+    let lower = path.to_lowercase();
+    if lower.starts_with("node_modules/")
+        || lower.contains("/node_modules/")
+        || lower.starts_with("target/")
+        || lower.contains("/target/")
+        || lower.starts_with("dist/")
+        || lower.contains("/dist/")
+        || lower.starts_with(".git/")
+        || lower.contains("/.git/")
+        || lower.ends_with(".lock")
+    {
+        return false;
+    }
+    matches!(
+        lower.rsplit('.').next(),
+        Some(
+            "rs" | "ts"
+                | "tsx"
+                | "js"
+                | "jsx"
+                | "css"
+                | "scss"
+                | "html"
+                | "md"
+                | "json"
+                | "toml"
+                | "yaml"
+                | "yml"
+                | "sql"
+                | "py"
+                | "go"
+                | "java"
+                | "kt"
+                | "swift"
+                | "c"
+                | "cc"
+                | "cpp"
+                | "h"
+                | "hpp"
+        )
+    )
+}
+
+fn rg_candidate_paths(root: &Path, terms: &[String]) -> Option<HashSet<String>> {
+    if terms.is_empty() {
+        return None;
+    }
+
+    let mut candidates = HashSet::new();
+    for term in terms.iter().take(8) {
+        let output = Command::new("rg")
+            .current_dir(root)
+            .args([
+                "--files-with-matches",
+                "--ignore-case",
+                "--fixed-strings",
+                "--glob",
+                "!node_modules/**",
+                "--glob",
+                "!target/**",
+                "--glob",
+                "!dist/**",
+                "--glob",
+                "!build/**",
+                "--",
+                term,
+            ])
+            .output()
+            .ok()?;
+
+        if !output.status.success() && output.status.code() != Some(1) {
+            return None;
+        }
+
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let normalized = line.trim().replace('\\', "/");
+            if !normalized.is_empty() && looks_searchable_text_file(&normalized) {
+                candidates.insert(normalized);
+            }
+            if candidates.len() >= 512 {
+                return Some(candidates);
+            }
+        }
+    }
+
+    Some(candidates)
+}
+
+fn search_terms(query: &str) -> Vec<String> {
+    let mut terms = query
+        .split(|ch: char| !ch.is_alphanumeric() && ch != '_' && ch != '-')
+        .map(|term| term.trim().to_lowercase())
+        .filter(|term| term.len() > 2)
+        .filter(|term| {
+            !matches!(
+                term.as_str(),
+                "the" | "and" | "for" | "with" | "where" | "what" | "how" | "our" | "code"
+            )
+        })
+        .collect::<Vec<_>>();
+    terms.sort();
+    terms.dedup();
+    terms
+}
+
+fn search_regex(query: &str) -> Option<regex::Regex> {
+    let trimmed = query.trim();
+    if trimmed.len() < 3 || trimmed.len() > 200 {
+        return None;
+    }
+    RegexBuilder::new(trimmed)
+        .case_insensitive(true)
+        .build()
+        .ok()
+}
+
+fn collect_content_hits(
+    path: &str,
+    content: &str,
+    terms: &[String],
+    regex: Option<&regex::Regex>,
+    query: &str,
+    hits: &mut Vec<ContentHit>,
+) {
+    let lines = content.lines().collect::<Vec<_>>();
+    if lines.is_empty() {
+        return;
+    }
+    let query_lower = query.to_lowercase();
+    let path_lower = path.to_lowercase();
+    for (idx, line) in lines.iter().enumerate() {
+        let line_lower = line.to_lowercase();
+        let mut score = 0i64;
+        if !query_lower.is_empty() && line_lower.contains(&query_lower) {
+            score += 80;
+        }
+        if regex
+            .map(|regex| regex.is_match(line))
+            .unwrap_or(false)
+        {
+            score += 90;
+        }
+        let term_matches = terms
+            .iter()
+            .filter(|term| line_lower.contains(term.as_str()))
+            .count();
+        if term_matches == 0 && score == 0 {
+            continue;
+        }
+        score += (term_matches as i64) * 12;
+        if !terms.is_empty() && term_matches == terms.len() {
+            score += 40;
+        }
+        for term in terms {
+            if path_lower.contains(term) {
+                score += 4;
+            }
+        }
+        if line_lower.contains("class")
+            || line_lower.contains("function")
+            || line_lower.contains("const")
+            || line_lower.contains("fn ")
+        {
+            score += 3;
+        }
+
+        let start_idx = idx.saturating_sub(4);
+        let end_idx = (idx + 4).min(lines.len().saturating_sub(1));
+        push_or_merge_content_hit(
+            ContentHit {
+                path: path.to_string(),
+                start_line: (start_idx + 1) as u32,
+                end_line: (end_idx + 1) as u32,
+                preview: line.trim().chars().take(200).collect(),
+                score,
+            },
+            hits,
+        );
+    }
+}
+
+fn push_or_merge_content_hit(hit: ContentHit, hits: &mut Vec<ContentHit>) {
+    if let Some(existing) = hits.iter_mut().find(|existing| {
+        existing.path == hit.path
+            && existing.start_line <= hit.end_line
+            && hit.start_line <= existing.end_line
+    }) {
+        existing.start_line = existing.start_line.min(hit.start_line);
+        existing.end_line = existing.end_line.max(hit.end_line);
+        existing.score += hit.score;
+        if existing.preview.len() < hit.preview.len() {
+            existing.preview = hit.preview;
+        }
+    } else {
+        hits.push(hit);
+    }
+}
+
 fn sanitize_relative_path(path: &str) -> Result<PathBuf> {
     let trimmed = path.trim_start_matches(['/', '\\']);
     let rel = PathBuf::from(trimmed);
@@ -708,4 +1017,60 @@ async fn load_budgets() -> Result<Budgets> {
     })
     .await
     .context("Failed to join budget config read task")?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn content_search_supports_regex_and_merges_overlapping_windows() {
+        let content = [
+            "const idle = true;",
+            "const statusPill = createMemo(() => activeStatus());",
+            "const elapsed = formatElapsed(statusElapsedMs());",
+            "return <div class=\"status-pill\">{statusPill()}</div>;",
+            "export default statusPill;",
+        ]
+        .join("\n");
+        let regex = search_regex("status.*pill");
+        let mut hits = Vec::new();
+
+        collect_content_hits(
+            "src/AiChat.tsx",
+            &content,
+            &search_terms("status pill"),
+            regex.as_ref(),
+            "status.*pill",
+            &mut hits,
+        );
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, "src/AiChat.tsx");
+        assert_eq!(hits[0].start_line, 1);
+        assert_eq!(hits[0].end_line, 5);
+        assert!(hits[0].score >= 180);
+    }
+
+    #[test]
+    fn repo_text_search_skips_generated_and_binary_like_paths() {
+        assert!(!looks_searchable_text_file("node_modules/pkg/index.ts"));
+        assert!(!looks_searchable_text_file("target/debug/main.rs"));
+        assert!(!looks_searchable_text_file("Cargo.lock"));
+        assert!(looks_searchable_text_file("src/App.tsx"));
+        assert!(looks_searchable_text_file("src-tauri/src/orchestrator.rs"));
+    }
+
+    #[test]
+    fn rg_candidate_paths_skips_when_no_terms_are_available() {
+        assert!(rg_candidate_paths(Path::new("."), &[]).is_none());
+    }
+
+    #[test]
+    fn symbol_graph_distance_boost_prioritizes_nearer_edges() {
+        assert_eq!(symbol_graph_distance_boost(Some(1)), 80);
+        assert_eq!(symbol_graph_distance_boost(Some(2)), 45);
+        assert_eq!(symbol_graph_distance_boost(Some(3)), 0);
+        assert_eq!(symbol_graph_distance_boost(None), 0);
+    }
 }
