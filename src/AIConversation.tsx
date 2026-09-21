@@ -12,6 +12,15 @@ marked.setOptions({
 export interface Message {
   role: "user" | "assistant" | "system";
   content: string;
+  sources?: SourceRef[];
+}
+
+export interface SourceRef {
+  path: string;
+  start_line: number;
+  end_line: number;
+  symbol?: string | null;
+  label: string;
 }
 
 interface AIConversationProps {
@@ -28,7 +37,7 @@ export default function AIConversation(props: AIConversationProps) {
         {(msg) => (
           <Show
             when={msg.role === "user"}
-            fallback={<AssistantBubble content={msg.content} />}
+            fallback={<AssistantBubble content={msg.content} sources={msg.sources} />}
           >
             <UserBubble content={msg.content} />
           </Show>
@@ -71,7 +80,7 @@ function UserBubble(props: { content: string }) {
   );
 }
 
-function AssistantBubble(props: { content: string }) {
+function AssistantBubble(props: { content: string; sources?: SourceRef[] }) {
   let contentRef: HTMLDivElement | undefined;
 
   // Re-run markdown parsing, highlighting, and button injection when content streams
@@ -161,7 +170,52 @@ function AssistantBubble(props: { content: string }) {
           ref={contentRef}
           class="flex-1 min-w-0 prose prose-invert prose-sm md:prose-base prose-pre:bg-[#0d1117] prose-pre:border prose-pre:border-gray-800 prose-pre:rounded-xl text-gray-300 max-w-none"
         ></div>
+        <Show when={props.sources && props.sources.length > 0}>
+          <div class="mt-4 flex flex-wrap gap-2">
+            <For each={props.sources}>
+              {(source) => <SourceChip source={source} />}
+            </For>
+          </div>
+        </Show>
       </div>
     </div>
+  );
+}
+
+function SourceChip(props: { source: SourceRef }) {
+  const lineLabel = () =>
+    props.source.start_line === props.source.end_line
+      ? `L${props.source.start_line}`
+      : `L${props.source.start_line}-L${props.source.end_line}`;
+
+  const fileName = () =>
+    props.source.path.split("/").pop() || props.source.path;
+
+  return (
+    <button
+      type="button"
+      title={`${props.source.path}:${props.source.start_line}-${props.source.end_line}`}
+      onClick={() =>
+        navigator.clipboard?.writeText(
+          `${props.source.path}:${props.source.start_line}-${props.source.end_line}`,
+        )
+      }
+      class="group max-w-full rounded-lg border border-gray-700 bg-gray-900/70 px-3 py-2 text-left text-xs text-gray-300 transition-colors hover:border-gray-600 hover:bg-gray-800/80"
+    >
+      <div class="flex max-w-full items-center gap-2">
+        <span class="shrink-0 rounded bg-blue-500/10 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-blue-300">
+          {lineLabel()}
+        </span>
+        <span class="min-w-0 truncate font-mono text-gray-200">
+          {props.source.path}
+        </span>
+      </div>
+      <div class="mt-1 flex items-center gap-2 text-[11px] text-gray-500">
+        <span class="truncate">{props.source.label || fileName()}</span>
+        <span class="opacity-0 transition-opacity group-hover:opacity-100">
+          Click to copy
+        </span>
+      </div>
+    </button>
   );
 }

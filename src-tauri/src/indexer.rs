@@ -208,10 +208,45 @@ fn extract_symbols(content: &str) -> Vec<ParsedSymbol> {
             .get(idx + 1)
             .map(|symbol| symbol.start_line.saturating_sub(1))
             .unwrap_or(lines.len() as u32);
-        starts[idx].end_line = next_start.max(starts[idx].start_line);
+        let brace_end = block_end_line(&lines, starts[idx].start_line as usize);
+        starts[idx].end_line = brace_end.unwrap_or(next_start).max(starts[idx].start_line);
     }
 
     starts
+}
+
+fn block_end_line(lines: &[&str], start_line: usize) -> Option<u32> {
+    let start_idx = start_line.saturating_sub(1);
+    let mut depth = 0i32;
+    let mut saw_open = false;
+
+    for (idx, line) in lines.iter().enumerate().skip(start_idx) {
+        let scan = if idx == start_idx {
+            match line.rfind('{') {
+                Some(pos) => &line[pos..],
+                None => line,
+            }
+        } else {
+            line
+        };
+        for ch in scan.chars() {
+            match ch {
+                '{' => {
+                    depth += 1;
+                    saw_open = true;
+                }
+                '}' if saw_open => {
+                    depth -= 1;
+                    if depth <= 0 {
+                        return Some((idx + 1) as u32);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    None
 }
 
 fn parse_symbol_start(line: &str) -> Option<(String, String)> {
@@ -232,6 +267,7 @@ fn parse_symbol_start(line: &str) -> Option<(String, String)> {
         .or_else(|| parse_after_keyword(trimmed, "trait", "trait"))
         .or_else(|| parse_after_keyword(trimmed, "pub impl", "impl"))
         .or_else(|| parse_after_keyword(trimmed, "impl", "impl"))
+        .or_else(|| parse_after_keyword(trimmed, "export default function", "function"))
         .or_else(|| parse_after_keyword(trimmed, "export function", "function"))
         .or_else(|| parse_after_keyword(trimmed, "function", "function"))
         .or_else(|| parse_after_keyword(trimmed, "export class", "class"))
@@ -340,7 +376,7 @@ impl AppState {
         assert_eq!(symbols[0].name, "AppState");
         assert_eq!(symbols[0].kind, "struct");
         assert_eq!(symbols[0].start_line, 2);
-        assert_eq!(symbols[0].end_line, 4);
+        assert_eq!(symbols[0].end_line, 3);
         assert_eq!(symbols[1].name, "run_app");
     }
 
@@ -357,6 +393,49 @@ export class Widget {}
             symbols.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
             vec!["useThing", "helper", "Widget"]
         );
+        let use_thing = symbols.iter().find(|s| s.name == "useThing").unwrap();
+        assert_eq!(use_thing.start_line, 2);
+        assert_eq!(use_thing.end_line, 3);
+    }
+
+    #[test]
+    fn tsx_component_range_can_cover_nested_helpers_and_render_block() {
+        let source = r#"
+export default function GitPanel(props: { workspacePath: string }) {
+  const [files, setFiles] = createSignal([]);
+
+  const fetchStatus = async () => {
+    setFiles([]);
+  };
+
+  const loadDiff = async (path: string) => {
+    console.log(path);
+  };
+
+  return (
+    <div>
+      {/* Changed Files List (Top Half) */}
+      <div>
+        <For each={files()}>
+          {(file) => (
+            <button>
+              <span>{file.path}</span>
+              <span>{file.status}</span>
+            </button>
+          )}
+        </For>
+      </div>
+    </div>
+  );
+}
+"#;
+        let symbols = extract_symbols(source);
+        let component = symbols.iter().find(|s| s.name == "GitPanel").unwrap();
+
+        assert_eq!(component.start_line, 2);
+        assert_eq!(component.end_line, 28);
+        assert!(symbols.iter().any(|s| s.name == "fetchStatus"));
+        assert!(symbols.iter().any(|s| s.name == "loadDiff"));
     }
 
     #[test]

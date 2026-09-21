@@ -60,8 +60,9 @@ pub trait FileReader: Send + Sync {
     async fn verify_lease(&self, lease: &crate::notebook::EvidenceLease) -> Result<LeaseStatus>;
 }
 
+#[async_trait]
 pub trait TokenCounter: Send + Sync {
-    fn count_tokens(&self, text: &str) -> usize;
+    async fn count_tokens(&self, text: &str) -> usize;
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -77,10 +78,15 @@ pub trait ProgressSink: Send + Sync {
 
 pub struct ApproxTokenCounter;
 
+#[async_trait]
 impl TokenCounter for ApproxTokenCounter {
-    fn count_tokens(&self, text: &str) -> usize {
-        text.split_whitespace().count()
+    async fn count_tokens(&self, text: &str) -> usize {
+        approx_token_count(text)
     }
+}
+
+pub fn approx_token_count(text: &str) -> usize {
+    text.split_whitespace().count()
 }
 
 pub struct NoopProgressSink;

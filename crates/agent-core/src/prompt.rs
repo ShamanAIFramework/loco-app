@@ -34,27 +34,116 @@ pub fn global_prefix(repo_map: &[String]) -> String {
         repo_map.join("\n")
     };
     format!(
-        "SYSTEM\nYou are Loco's bounded reasoning coprocessor. Deterministic Rust code controls workflow, tools, budgets, and stopping. You return only JSON matching the requested schema. The codebase is the source of truth.\n\nREPO MAP SNAPSHOT\n{}",
+        "SYSTEM\nYou are Loco's local coding reasoning coprocessor. Deterministic Rust host code controls workflow, tools, search, file reads, budgets, leases, source display, and stopping. You are in a separated harness phase, not a ReAct loop. You never edit files, never call tools, never claim to have run tools, and never invent code facts. Treat the repo map as navigation only; leased evidence and active notebook entries are the source of truth. Return only JSON matching the requested schema.\n\nREPO MAP SNAPSHOT\n{}",
         repo
     )
 }
 
 pub fn phase_prefix(phase: Phase, schema_name: &str) -> String {
     format!(
-        "PHASE {:?}\nReturn JSON for schema `{}` only. Do not call tools. Do not include markdown.",
+        "PHASE {:?}\nComplete only this phase. Return one JSON object for schema `{}` only. Do not call tools, plan future tool calls, edit files, or include markdown, prose, comments, or code fences. Use exact enum strings from the schema.",
         phase, schema_name
     )
 }
 
 pub fn task_block(task: &TaskRequest) -> String {
+    let conversation = recent_conversation_block(task);
     format!(
-        "TASK\nWorkspace: {}\nUser request: {}",
+        "TASK\nWorkspace: {}\n{}\nCurrent user request: {}",
         task.workspace_path
             .as_ref()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "unknown".to_string()),
+        conversation,
         task.question
     )
+}
+
+fn recent_conversation_block(task: &TaskRequest) -> String {
+    let mut turns = task
+        .conversation
+        .iter()
+        .filter(|turn| turn.role != "system")
+        .collect::<Vec<_>>();
+
+    if matches!(turns.last(), Some(last) if last.role == "user" && last.content.trim() == task.question.trim())
+    {
+        turns.pop();
+    }
+
+    let mut rendered = Vec::new();
+    let mut used_chars = 0usize;
+    for turn in turns
+        .into_iter()
+        .rev()
+        .take(6)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+    {
+        let content = compact_text(&turn.content, 320);
+        let line = format!("{}: {}", turn.role, content);
+        used_chars += line.len();
+        if used_chars > 1_500 {
+            break;
+        }
+        rendered.push(line);
+    }
+
+    if rendered.is_empty() {
+        "Recent conversation: none".to_string()
+    } else {
+        format!("Recent conversation:\n{}", rendered.join("\n"))
+    }
+}
+
+fn compact_text(value: &str, max_chars: usize) -> String {
+    let compacted = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compacted.chars().count() <= max_chars {
+        compacted
+    } else {
+        format!(
+            "{}...[truncated]",
+            compacted.chars().take(max_chars).collect::<String>()
+        )
+    }
+}
+
+pub fn intake_instruction() -> String {
+    [
+        "QUESTION",
+        "Classify the local coding request and propose deterministic code-search queries for the host to run.",
+        "Use `Locate` for where/which-file questions, `Explain` for how/what/why/update-analysis questions, and `Unclear` only when the request has no actionable code target.",
+        "Prefer to proceed on short local-code questions if they mention UI, git, components, files, functions, panels, workspace, Tauri, Rust, or TypeScript.",
+        "Produce 3-6 short search queries likely to match paths, symbols, UI labels, component names, or domain nouns. Include exact identifiers and useful variants; omit filler words.",
+        "Do not answer the user here.",
+    ]
+    .join("\n")
+}
+
+pub fn extract_instruction() -> String {
+    [
+        "QUESTION",
+        "Extract only atomic claims supported by leased evidence. Do not propose edits.",
+        "Every inference must cite exactly one provided lease_id. Copy lease ids exactly.",
+        "Each statement should preserve the most specific file path, line range, symbol/block name, and user-facing UI/code purpose available.",
+        "For UI location questions, identify the exact JSX/render block, list/map/conditional, or component section when present.",
+        "For implementation questions, distinguish definitions, callers, state, IPC commands, and rendering code.",
+        "Set sufficient=true when the evidence directly answers the request. Use missing only for concrete additional evidence the host should search for; do not ask the user for missing code evidence.",
+    ]
+    .join("\n")
+}
+
+pub fn synthesize_instruction() -> String {
+    [
+        "QUESTION",
+        "Write a concise final answer for a local coding assistant.",
+        "For location questions, lead with the exact file and line range, then explain what that block does.",
+        "Do not include a markdown Sources section, notebook ids, lease ids, hashes, or internal tracing details; the UI renders structured sources separately.",
+        "Cite only active notebook entry ids that directly support claims in the answer. Prefer the narrowest relevant file range and avoid background citations.",
+        "If evidence is weak or incomplete, say exactly what is uncertain and why.",
+    ]
+    .join("\n")
 }
 
 pub fn notebook_block(notebook: &Notebook, target_tags: &[String], limit: usize) -> String {
@@ -131,10 +220,26 @@ pub fn schema_intake() -> serde_json::Value {
     json!({
         "type": "object",
         "properties": {
-            "task_type": { "type": "string", "enum": ["Explain", "Locate", "Unclear"] },
-            "target_hints": { "type": "array", "items": { "type": "string" } },
-            "constraints": { "type": "array", "items": { "type": "string" } },
-            "search_queries": { "type": "array", "items": { "type": "string" } }
+            "task_type": {
+                "type": "string",
+                "enum": ["Explain", "Locate", "Unclear"],
+                "description": "Locate for where/which-file questions, Explain for code behavior or change analysis, Unclear only when no actionable local-code target exists."
+            },
+            "target_hints": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Short identifiers, UI labels, filenames, symbols, and domain nouns relevant to the request."
+            },
+            "constraints": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "User constraints such as no edits, UI-only, backend-only, or exact behavior to inspect."
+            },
+            "search_queries": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Three to six concise queries likely to match indexed paths or symbols."
+            }
         },
         "required": ["task_type", "target_hints", "constraints", "search_queries"],
         "additionalProperties": false
@@ -150,15 +255,28 @@ pub fn schema_extract() -> serde_json::Value {
                 "items": {
                     "type": "object",
                     "properties": {
-                        "statement": { "type": "string" },
-                        "lease_id": { "type": "string" },
-                        "tags": { "type": "array", "items": { "type": "string" } }
+                        "statement": {
+                            "type": "string",
+                            "description": "One evidence-backed claim with exact file path, line range, symbol/block, and coding/UI purpose when available."
+                        },
+                        "lease_id": {
+                            "type": "string",
+                            "description": "The exact lease id from the evidence that supports this inference."
+                        },
+                        "tags": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Relevant paths, symbols, and user-facing concepts for notebook retrieval."
+                        }
                     },
                     "required": ["statement", "lease_id", "tags"],
                     "additionalProperties": false
                 }
             },
-            "sufficient": { "type": "boolean" },
+            "sufficient": {
+                "type": "boolean",
+                "description": "True when current evidence directly answers the user request."
+            },
             "missing": {
                 "type": "array",
                 "items": {
@@ -182,8 +300,15 @@ pub fn schema_synthesize() -> serde_json::Value {
     json!({
         "type": "object",
         "properties": {
-            "answer": { "type": "string" },
-            "cited_entries": { "type": "array", "items": { "type": "string" } },
+            "answer": {
+                "type": "string",
+                "description": "Concise user-facing answer. Do not include Sources, notebook ids, lease ids, or hashes."
+            },
+            "cited_entries": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Only notebook entry ids directly used by the answer; prefer narrow source ranges."
+            },
             "stop_reason": { "type": "string", "enum": ["Done", "NotFound", "NeedsUser", "NoProgress", "BudgetExhausted", "Cancelled", "Error"] }
         },
         "required": ["answer", "cited_entries", "stop_reason"],
@@ -251,6 +376,101 @@ mod tests {
         assert!(first.starts_with(&stable));
         assert!(second.starts_with(&stable));
         assert!(common_prefix_len(&first, &second) >= stable.len());
+    }
+
+    #[test]
+    fn local_coding_instructions_are_explicit() {
+        let global = global_prefix(&["src/GitPanel.tsx".to_string()]);
+        let intake = intake_instruction();
+        let extract = extract_instruction();
+        let synthesize = synthesize_instruction();
+
+        assert!(global.contains("never edit files"));
+        assert!(global.contains("repo map as navigation only"));
+        assert!(intake.contains("Prefer to proceed on short local-code questions"));
+        assert!(intake.contains("UI"));
+        assert!(extract.contains("exact JSX/render block"));
+        assert!(extract.contains("Copy lease ids exactly"));
+        assert!(synthesize.contains("Do not include a markdown Sources section"));
+        assert!(synthesize.contains("structured sources separately"));
+    }
+
+    #[test]
+    fn schemas_describe_local_code_outputs() {
+        let intake = schema_intake();
+        let extract = schema_extract();
+        let synthesize = schema_synthesize();
+
+        assert!(intake["properties"]["task_type"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("which-file"));
+        assert!(
+            extract["properties"]["inferences"]["items"]["properties"]["statement"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("line range")
+        );
+        assert!(synthesize["properties"]["answer"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("Do not include Sources"));
+    }
+
+    #[test]
+    fn task_block_includes_recent_conversation_without_repeating_current_request() {
+        let task = TaskRequest {
+            run_id: "run".to_string(),
+            session_id: "session".to_string(),
+            workspace_path: None,
+            question: "Where is the git panel rendered?".to_string(),
+            conversation: vec![
+                crate::types::ConversationTurn {
+                    role: "user".to_string(),
+                    content: "We were looking at source control UI.".to_string(),
+                },
+                crate::types::ConversationTurn {
+                    role: "assistant".to_string(),
+                    content: "The source control UI is mounted in App.tsx.".to_string(),
+                },
+                crate::types::ConversationTurn {
+                    role: "user".to_string(),
+                    content: "Where is the git panel rendered?".to_string(),
+                },
+            ],
+            budgets: crate::types::Budgets::default(),
+        };
+
+        let rendered = task_block(&task);
+
+        assert!(rendered.contains("Recent conversation:"));
+        assert!(rendered.contains("source control UI"));
+        assert_eq!(
+            rendered.matches("Where is the git panel rendered?").count(),
+            1
+        );
+        assert!(rendered.contains("Current user request: Where is the git panel rendered?"));
+    }
+
+    #[test]
+    fn recent_conversation_is_compacted_for_local_context() {
+        let long = "word ".repeat(500);
+        let task = TaskRequest {
+            run_id: "run".to_string(),
+            session_id: "session".to_string(),
+            workspace_path: None,
+            question: "Summarize the prior topic.".to_string(),
+            conversation: vec![crate::types::ConversationTurn {
+                role: "assistant".to_string(),
+                content: long,
+            }],
+            budgets: crate::types::Budgets::default(),
+        };
+
+        let rendered = task_block(&task);
+
+        assert!(rendered.contains("[truncated]"));
+        assert!(rendered.len() < 2_000);
     }
 
     #[test]

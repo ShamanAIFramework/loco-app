@@ -1,10 +1,13 @@
 use crate::notebook::{EntryId, EvidenceLease, LineRange, Notebook, Provenance};
 use crate::prompt::{
-    evidence_block, global_prefix, notebook_block, phase_prefix, schema_extract, schema_intake,
-    schema_synthesize, task_block, PromptParts,
+    evidence_block, extract_instruction, global_prefix, intake_instruction, notebook_block,
+    phase_prefix, schema_extract, schema_intake, schema_synthesize, synthesize_instruction,
+    task_block, PromptParts,
 };
 use crate::trace::{Trace, TraceEvent};
-use crate::traits::{AgentProgress, CodeSearch, FileReader, LlmClient, LlmRequest, ProgressSink};
+use crate::traits::{
+    AgentProgress, CodeSearch, FileReader, LlmClient, LlmRequest, ProgressSink, TokenCounter,
+};
 use crate::types::{
     AgentAnswer, EvidenceSlice, ExtractOutput, IntakeOutput, LeaseStatus, MissingEvidenceKind,
     Phase, StopReason, SymbolHit, SynthesizeOutput, TaskRequest, TaskType,
@@ -18,6 +21,7 @@ pub struct AgentRuntime<'a> {
     pub llm: &'a dyn LlmClient,
     pub code_search: &'a dyn CodeSearch,
     pub file_reader: &'a dyn FileReader,
+    pub token_counter: &'a dyn TokenCounter,
     pub progress: &'a dyn ProgressSink,
 }
 
@@ -41,7 +45,7 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
     runtime
         .progress
         .emit(AgentProgress::Status(
-            "Figuring out what kind of code question this is...".to_string(),
+            "Classifying the user's request".to_string(),
         ))
         .await;
     trace.push(TraceEvent::PhaseStarted {
@@ -54,7 +58,7 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
         task: task_block(&task),
         notebook: notebook_block(&notebook, &[], 16),
         evidence: evidence_block(&[]),
-        question: "QUESTION\nClassify the request and propose deterministic code search queries. Keep queries short and likely to match paths or symbols.".to_string(),
+        question: intake_instruction(),
     };
     let intake_prompt = intake_parts.render();
 
@@ -74,7 +78,7 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
     runtime
         .progress
         .emit(AgentProgress::Status(
-            "Asking the local model to choose a search strategy...".to_string(),
+            "Planning workspace search".to_string(),
         ))
         .await;
     let intake_resp = runtime.llm.complete_json(intake_req.clone()).await?;
@@ -115,7 +119,15 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
     runtime
         .progress
         .emit(AgentProgress::Status(format!(
-            "Looking through the workspace with {} focused queries...",
+            "Searching for {}",
+            format_list(&intake.search_queries, task.budgets.max_search_queries)
+        )))
+        .await;
+
+    runtime
+        .progress
+        .emit(AgentProgress::Status(format!(
+            "Checking {} focused workspace queries",
             intake
                 .search_queries
                 .len()
@@ -133,8 +145,8 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
         runtime
             .progress
             .emit(AgentProgress::Status(format!(
-                "Checking indexed files for `{}`...",
-                query
+                "Finding files related to {}",
+                plain_query(query)
             )))
             .await;
         let hits = runtime
@@ -147,6 +159,15 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
             args: serde_json::json!({ "query": query }),
             result_count: hits.len(),
         });
+        runtime
+            .progress
+            .emit(AgentProgress::Status(format!(
+                "Found {} file path{} for {}",
+                hits.len(),
+                plural(hits.len()),
+                plain_query(query)
+            )))
+            .await;
         for hit in hits {
             file_paths
                 .entry(hit.path)
@@ -157,8 +178,8 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
         runtime
             .progress
             .emit(AgentProgress::Status(format!(
-                "Checking symbols and definitions for `{}`...",
-                query
+                "Finding symbols related to {}",
+                plain_query(query)
             )))
             .await;
         let symbols = runtime
@@ -171,6 +192,15 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
             args: serde_json::json!({ "query": query }),
             result_count: symbols.len(),
         });
+        runtime
+            .progress
+            .emit(AgentProgress::Status(format!(
+                "Found {} symbol{} for {}",
+                symbols.len(),
+                plural(symbols.len()),
+                plain_query(query)
+            )))
+            .await;
         for hit in symbols {
             symbol_hits
                 .entry((
@@ -188,6 +218,7 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
     sorted_paths.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
     let mut evidence = Vec::new();
+    let mut evidence_tokens = 0usize;
     let mut lease_fact_entries = BTreeMap::new();
     let mut read_paths = BTreeSet::<String>::new();
     let mut sorted_symbols = symbol_hits.into_values().collect::<Vec<_>>();
@@ -205,7 +236,7 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
         runtime
             .progress
             .emit(AgentProgress::Status(format!(
-                "Reading the `{}` definition in `{}` lines {}-{}...",
+                "Inspecting `{}` in `{}` lines {}-{}",
                 hit.symbol, hit.path, hit.start_line, hit.end_line
             )))
             .await;
@@ -221,6 +252,32 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
             .await
         {
             Ok(slice) => {
+                let token_count = runtime.token_counter.count_tokens(&slice.content).await;
+                if !should_accept_evidence(&evidence, evidence_tokens, token_count, &task) {
+                    runtime
+                        .progress
+                        .emit(AgentProgress::Status(format!(
+                            "Skipping `{}` lines {}-{} because the evidence budget is full",
+                            slice.lease.path, slice.lease.range.start, slice.lease.range.end
+                        )))
+                        .await;
+                    notebook.append_tool_fact(
+                        format!(
+                            "Skipped symbol {} in {} lines {}-{} because it would exceed the evidence token budget",
+                            hit.symbol,
+                            slice.lease.path,
+                            slice.lease.range.start,
+                            slice.lease.range.end
+                        ),
+                        Provenance::Tool {
+                            name: "token_budget".to_string(),
+                            call_id: call_id("token_budget"),
+                        },
+                        Phase::Extract,
+                        vec![slice.lease.path.clone(), hit.symbol],
+                    );
+                    continue;
+                }
                 let fact_id = notebook.append_tool_fact(
                     format!(
                         "Read symbol {} in {} lines {}-{} under lease {}",
@@ -241,7 +298,26 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
                 );
                 lease_fact_entries.insert(slice.lease.id.clone(), fact_id);
                 read_paths.insert(slice.lease.path.clone());
+                evidence_tokens += token_count;
                 evidence.push(slice);
+                runtime
+                    .progress
+                    .emit(AgentProgress::Status(format!(
+                        "Using `{}` lines {}-{} as evidence",
+                        evidence
+                            .last()
+                            .map(|slice| slice.lease.path.as_str())
+                            .unwrap_or("unknown"),
+                        evidence
+                            .last()
+                            .map(|slice| slice.lease.range.start)
+                            .unwrap_or_default(),
+                        evidence
+                            .last()
+                            .map(|slice| slice.lease.range.end)
+                            .unwrap_or_default()
+                    )))
+                    .await;
             }
             Err(err) => {
                 notebook.append_tool_fact(
@@ -269,10 +345,7 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
         }
         runtime
             .progress
-            .emit(AgentProgress::Status(format!(
-                "Opening `{}` to inspect the relevant code...",
-                path
-            )))
+            .emit(AgentProgress::Status(format!("Inspecting `{}`", path)))
             .await;
         match runtime
             .file_reader
@@ -283,11 +356,34 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
                 runtime
                     .progress
                     .emit(AgentProgress::Status(format!(
-                        "Narrowing `{}` to the most relevant section...",
+                        "Finding the relevant section in `{}`",
                         slice.lease.path
                     )))
                     .await;
                 let slice = focus_location_slice(slice, &task.question, &intake.search_queries);
+                let token_count = runtime.token_counter.count_tokens(&slice.content).await;
+                if !should_accept_evidence(&evidence, evidence_tokens, token_count, &task) {
+                    runtime
+                        .progress
+                        .emit(AgentProgress::Status(format!(
+                            "Skipping `{}` lines {}-{} because the evidence budget is full",
+                            slice.lease.path, slice.lease.range.start, slice.lease.range.end
+                        )))
+                        .await;
+                    notebook.append_tool_fact(
+                        format!(
+                            "Skipped {} lines {}-{} because it would exceed the evidence token budget",
+                            slice.lease.path, slice.lease.range.start, slice.lease.range.end
+                        ),
+                        Provenance::Tool {
+                            name: "token_budget".to_string(),
+                            call_id: call_id("token_budget"),
+                        },
+                        Phase::Extract,
+                        vec![slice.lease.path.clone()],
+                    );
+                    continue;
+                }
                 let fact_id = notebook.append_tool_fact(
                     format!(
                         "Read {} lines {}-{} under lease {}",
@@ -306,7 +402,26 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
                     vec![slice.lease.path.clone()],
                 );
                 lease_fact_entries.insert(slice.lease.id.clone(), fact_id);
+                evidence_tokens += token_count;
                 evidence.push(slice);
+                runtime
+                    .progress
+                    .emit(AgentProgress::Status(format!(
+                        "Using `{}` lines {}-{} as evidence",
+                        evidence
+                            .last()
+                            .map(|slice| slice.lease.path.as_str())
+                            .unwrap_or("unknown"),
+                        evidence
+                            .last()
+                            .map(|slice| slice.lease.range.start)
+                            .unwrap_or_default(),
+                        evidence
+                            .last()
+                            .map(|slice| slice.lease.range.end)
+                            .unwrap_or_default()
+                    )))
+                    .await;
             }
             Err(err) => {
                 notebook.append_tool_fact(
@@ -350,7 +465,7 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
         runtime
             .progress
             .emit(AgentProgress::Status(format!(
-                "Pulling out cited findings, pass {}...",
+                "Extracting supported findings, pass {}",
                 round + 1
             )))
             .await;
@@ -364,7 +479,7 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
             task: task_block(&task),
             notebook: notebook_block(&notebook, &target_tags, 32),
             evidence: evidence_block(&evidence),
-            question: "QUESTION\nExtract only claims supported by the leased evidence. Each inference must cite one provided lease_id and preserve the most specific file path, line range, and UI/code block purpose in the statement. For UI location questions, identify the exact JSX/render block when present. Say what is missing without retrieving it.".to_string(),
+            question: extract_instruction(),
         };
         let extract_prompt = extract_parts.render();
 
@@ -384,7 +499,7 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
         runtime
             .progress
             .emit(AgentProgress::Status(format!(
-                "Asking the local model to turn evidence into cited findings, pass {}...",
+                "Summarizing evidence into findings, pass {}",
                 round + 1
             )))
             .await;
@@ -408,7 +523,7 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
                 runtime
                     .progress
                     .emit(AgentProgress::Status(format!(
-                        "Checking that `{}` lines {}-{} are still current...",
+                        "Checking freshness for `{}` lines {}-{}",
                         lease.path, lease.range.start, lease.range.end
                     )))
                     .await;
@@ -444,6 +559,16 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
                 inference_entry_ids.push(entry_id);
             }
         }
+        let added_count = inference_entry_ids.len().saturating_sub(before_count);
+        runtime
+            .progress
+            .emit(AgentProgress::Status(format!(
+                "Accepted {} supported finding{} from pass {}",
+                added_count,
+                plural(added_count),
+                round + 1
+            )))
+            .await;
 
         if extract.sufficient {
             break;
@@ -467,6 +592,13 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
             .into_iter()
             .take(task.budgets.max_search_queries.saturating_sub(1))
         {
+            runtime
+                .progress
+                .emit(AgentProgress::Status(format!(
+                    "Finding additional evidence for {}",
+                    plain_query(&query)
+                )))
+                .await;
             let hits = runtime
                 .code_search
                 .search(&query, task.budgets.max_files_to_read)
@@ -477,6 +609,11 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
                     continue;
                 }
                 if let Ok(slice) = runtime.file_reader.read_file(&hit.path, 4_000).await {
+                    let token_count = runtime.token_counter.count_tokens(&slice.content).await;
+                    if !should_accept_evidence(&evidence, evidence_tokens, token_count, &task) {
+                        continue;
+                    }
+                    evidence_tokens += token_count;
                     evidence.push(slice);
                 }
             }
@@ -485,9 +622,7 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
 
     runtime
         .progress
-        .emit(AgentProgress::Status(
-            "Putting the cited findings together...".to_string(),
-        ))
+        .emit(AgentProgress::Status("Preparing the answer".to_string()))
         .await;
 
     if llm_calls >= task.budgets.max_llm_calls {
@@ -519,7 +654,7 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
     runtime
         .progress
         .emit(AgentProgress::Status(
-            "Choosing the strongest notebook entries to cite...".to_string(),
+            "Selecting supporting sources".to_string(),
         ))
         .await;
     let synth_parts = PromptParts {
@@ -528,7 +663,7 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
         task: task_block(&task),
         notebook: notebook_block(&notebook, &target_tags, 64),
         evidence: "EPHEMERAL EVIDENCE\nUse notebook entries as the citation surface. Do not cite leases directly in the final answer.".to_string(),
-        question: "QUESTION\nWrite a concise final answer. For location questions, name the exact file and line range, then explain what that block does. Prefer the most specific active notebook entry for citations, especially entries with the narrowest file range. If evidence is weak, say what is uncertain.".to_string(),
+        question: synthesize_instruction(),
     };
     let synth_prompt = synth_parts.render();
 
@@ -548,7 +683,7 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
     runtime
         .progress
         .emit(AgentProgress::Status(
-            "Asking the local model to write the final answer...".to_string(),
+            "Constructing the final response".to_string(),
         ))
         .await;
     let synth_resp = runtime.llm.complete_json(synth_req.clone()).await?;
@@ -582,6 +717,36 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
     trace.push(TraceEvent::RunFinished { stop_reason });
 
     Ok(AgentRunResult { answer, trace })
+}
+
+fn plural(count: usize) -> &'static str {
+    if count == 1 {
+        ""
+    } else {
+        "s"
+    }
+}
+
+fn plain_query(value: &str) -> String {
+    value
+        .trim()
+        .trim_matches('`')
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn format_list(values: &[String], limit: usize) -> String {
+    let visible = values
+        .iter()
+        .take(limit)
+        .map(|value| plain_query(value))
+        .collect::<Vec<_>>();
+    match visible.as_slice() {
+        [] => "no queries".to_string(),
+        [only] => only.clone(),
+        _ => visible.join(", "),
+    }
 }
 
 fn fallback_intake(question: &str) -> IntakeOutput {
@@ -729,6 +894,16 @@ fn sort_citations_by_specificity(notebook: &Notebook, mut ids: Vec<EntryId>) -> 
 fn per_slice_budget(task: &TaskRequest) -> usize {
     let fair_share = task.budgets.max_evidence_chars / task.budgets.max_files_to_read.max(1);
     fair_share.max(8_000).min(task.budgets.max_evidence_chars)
+}
+
+fn should_accept_evidence(
+    evidence: &[EvidenceSlice],
+    current_tokens: usize,
+    next_tokens: usize,
+    task: &TaskRequest,
+) -> bool {
+    evidence.is_empty()
+        || current_tokens.saturating_add(next_tokens) <= task.budgets.max_evidence_tokens
 }
 
 fn focus_location_slice(
@@ -925,10 +1100,10 @@ fn lease_for_text(path: String, text: &str) -> EvidenceSlice {
 mod tests {
     use super::*;
     use crate::notebook::EvidenceLease;
-    use crate::traits::{LlmResponse, LlmUsage, NoopProgressSink};
+    use crate::traits::{ApproxTokenCounter, LlmResponse, LlmUsage, NoopProgressSink};
     use crate::types::{Budgets, FileHit};
     use async_trait::async_trait;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     struct MockLlm {
         responses: Mutex<Vec<String>>,
@@ -1057,6 +1232,19 @@ mod tests {
         }
     }
 
+    struct CollectProgress {
+        messages: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl ProgressSink for CollectProgress {
+        async fn emit(&self, progress: AgentProgress) {
+            if let AgentProgress::Status(message) = progress {
+                self.messages.lock().unwrap().push(message);
+            }
+        }
+    }
+
     #[tokio::test]
     async fn deterministic_loop_returns_answer() {
         let llm = MockLlm {
@@ -1080,6 +1268,7 @@ mod tests {
                 llm: &llm,
                 code_search: &MockSearch,
                 file_reader: &MockReader,
+                token_counter: &ApproxTokenCounter,
                 progress: &NoopProgressSink,
             },
         )
@@ -1088,6 +1277,49 @@ mod tests {
 
         assert_eq!(result.answer.stop_reason, StopReason::Done);
         assert!(result.answer.content.contains("entry point"));
+    }
+
+    #[tokio::test]
+    async fn progress_reports_concrete_agent_steps() {
+        let llm = MockLlm {
+            responses: Mutex::new(vec![
+                r#"{"task_type":"Locate","target_hints":["main"],"constraints":[],"search_queries":["main"]}"#.to_string(),
+                r#"{"inferences":[],"sufficient":true,"missing":[]}"#.to_string(),
+                r#"{"answer":"The app entry point is in src/main.rs.","cited_entries":[],"stop_reason":"Done"}"#.to_string(),
+            ]),
+        };
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        let progress = CollectProgress {
+            messages: messages.clone(),
+        };
+        let task = TaskRequest {
+            run_id: "run".to_string(),
+            session_id: "session".to_string(),
+            workspace_path: None,
+            question: "where is main?".to_string(),
+            conversation: Vec::new(),
+            budgets: Budgets::default(),
+        };
+
+        run_agent(
+            task,
+            AgentRuntime {
+                llm: &llm,
+                code_search: &MockSearch,
+                file_reader: &MockReader,
+                token_counter: &ApproxTokenCounter,
+                progress: &progress,
+            },
+        )
+        .await
+        .unwrap();
+
+        let joined = messages.lock().unwrap().join("\n");
+        assert!(joined.contains("Classifying the user's request"));
+        assert!(joined.contains("Searching for main"));
+        assert!(joined.contains("Found 1 file path for main"));
+        assert!(joined.contains("Using `src/main.rs` lines 1-1 as evidence"));
+        assert!(joined.contains("Accepted 0 supported findings from pass 1"));
     }
 
     #[tokio::test]
@@ -1113,6 +1345,7 @@ mod tests {
                 llm: &llm,
                 code_search: &MockSearch,
                 file_reader: &ExpiredReader,
+                token_counter: &ApproxTokenCounter,
                 progress: &NoopProgressSink,
             },
         )
@@ -1212,6 +1445,23 @@ mod tests {
         };
 
         assert!(per_slice_budget(&task) >= 8_000);
+    }
+
+    #[test]
+    fn evidence_token_budget_allows_first_slice_then_caps_more() {
+        let mut task = TaskRequest {
+            run_id: "run".to_string(),
+            session_id: "session".to_string(),
+            workspace_path: None,
+            question: "explain main".to_string(),
+            conversation: Vec::new(),
+            budgets: Budgets::default(),
+        };
+        task.budgets.max_evidence_tokens = 2;
+        let first = lease_for_text("src/main.rs".to_string(), "one two three");
+
+        assert!(should_accept_evidence(&[], 0, 3, &task));
+        assert!(!should_accept_evidence(&[first], 3, 1, &task));
     }
 
     #[test]

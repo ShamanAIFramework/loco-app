@@ -24,6 +24,8 @@ pub struct Budgets {
     pub max_search_queries: usize,
     pub max_files_to_read: usize,
     pub max_evidence_chars: usize,
+    #[serde(default = "default_max_evidence_tokens")]
+    pub max_evidence_tokens: usize,
 }
 
 impl Default for Budgets {
@@ -34,8 +36,13 @@ impl Default for Budgets {
             max_search_queries: 5,
             max_files_to_read: 6,
             max_evidence_chars: 18_000,
+            max_evidence_tokens: default_max_evidence_tokens(),
         }
     }
+}
+
+fn default_max_evidence_tokens() -> usize {
+    4_500
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -146,3 +153,23 @@ pub enum LeaseStatus {
 }
 
 pub use crate::notebook::{EntryId, EvidenceLease, LeaseId, Notebook};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn budgets_default_missing_token_limit() {
+        let raw = r#"{
+            "max_llm_calls": 4,
+            "max_extract_rounds": 2,
+            "max_search_queries": 5,
+            "max_files_to_read": 6,
+            "max_evidence_chars": 18000
+        }"#;
+
+        let budgets: Budgets = serde_json::from_str(raw).unwrap();
+
+        assert_eq!(budgets.max_evidence_tokens, 4_500);
+    }
+}

@@ -1,14 +1,14 @@
 // src-tauri/src/orchestrator.rs
 //! Tauri host adapter for the deterministic agent-core runtime.
 
-use crate::agent::AgentEvent;
+use crate::agent::{AgentEvent, SourceRef};
 use crate::conversation_store::Role;
 use crate::engine::EngineState;
 use crate::{AppError, AppState};
 use agent_core::{
     AgentProgress, AgentRuntime, Budgets, CodeSearch, ConversationTurn, EvidenceLease,
     EvidenceSlice, FileHit, FileReader, LeaseStatus, LineRange, LlmClient, LlmRequest, LlmResponse,
-    LlmUsage, ProgressSink, RuntimeMetadata, SymbolHit, TaskRequest, TraceEvent,
+    LlmUsage, ProgressSink, RuntimeMetadata, SymbolHit, TaskRequest, TokenCounter, TraceEvent,
 };
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -109,6 +109,7 @@ pub async fn prompt_agent_v2(
             llm: &llm,
             code_search: &search,
             file_reader: &reader,
+            token_counter: &llm,
             progress: &progress,
         },
     )
@@ -120,8 +121,12 @@ pub async fn prompt_agent_v2(
         .insert(1, TraceEvent::RuntimeMetadata { metadata });
     write_trace(&run_id, &result.trace).await?;
 
-    let final_response = render_answer_with_citations(&result.answer);
+    let final_response = result.answer.content.clone();
+    let sources = collect_answer_sources(&result.answer);
     let _ = on_chunk.send(AgentEvent::Chunk(final_response.clone()));
+    if !sources.is_empty() {
+        let _ = on_chunk.send(AgentEvent::Sources(sources));
+    }
 
     tauri::async_runtime::spawn_blocking(move || -> Result<_> {
         let state = app.state::<AppState>();
@@ -246,6 +251,34 @@ impl LlmClient for LlamaServerClient {
                 wall_ms: Some(started.elapsed().as_millis() as u64),
             },
         })
+    }
+}
+
+#[async_trait]
+impl TokenCounter for LlamaServerClient {
+    async fn count_tokens(&self, text: &str) -> usize {
+        let value = self
+            .client
+            .post(format!("http://127.0.0.1:{}/tokenize", self.port))
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .json(&json!({ "content": text }))
+            .send()
+            .await
+            .ok()
+            .and_then(|response| response.error_for_status().ok());
+
+        let Some(response) = value else {
+            return agent_core::approx_token_count(text);
+        };
+        let Ok(value) = response.json::<serde_json::Value>().await else {
+            return agent_core::approx_token_count(text);
+        };
+
+        value
+            .get("tokens")
+            .and_then(|tokens| tokens.as_array())
+            .map(|tokens| tokens.len())
+            .unwrap_or_else(|| agent_core::approx_token_count(text))
     }
 }
 
@@ -510,46 +543,87 @@ impl ProgressSink for TauriProgressSink {
     }
 }
 
-fn render_answer_with_citations(answer: &agent_core::AgentAnswer) -> String {
-    if answer.cited_entries.is_empty() {
-        return answer.content.clone();
+fn collect_answer_sources(answer: &agent_core::AgentAnswer) -> Vec<SourceRef> {
+    let answer_lower = answer.content.to_lowercase();
+    let mut sources = answer
+        .cited_entries
+        .iter()
+        .filter_map(|entry_id| answer.notebook.get(entry_id))
+        .filter_map(|entry| source_from_entry(entry))
+        .collect::<Vec<_>>();
+
+    sources.sort_by_key(|source| {
+        let file_name = source
+            .path
+            .rsplit('/')
+            .next()
+            .unwrap_or(source.path.as_str())
+            .to_lowercase();
+        let mentioned = answer_lower.contains(&source.path.to_lowercase())
+            || answer_lower.contains(&file_name);
+        (
+            !mentioned,
+            source.end_line.saturating_sub(source.start_line),
+            source.path.clone(),
+            source.start_line,
+        )
+    });
+
+    let mut seen = std::collections::BTreeSet::new();
+    sources.retain(|source| {
+        let key = (source.path.clone(), source.start_line, source.end_line);
+        seen.insert(key)
+    });
+
+    if sources.iter().any(|source| {
+        let file_name = source.path.rsplit('/').next().unwrap_or(source.path.as_str());
+        answer_lower.contains(&source.path.to_lowercase())
+            || answer_lower.contains(&file_name.to_lowercase())
+    }) {
+        sources.retain(|source| {
+            let file_name = source.path.rsplit('/').next().unwrap_or(source.path.as_str());
+            answer_lower.contains(&source.path.to_lowercase())
+                || answer_lower.contains(&file_name.to_lowercase())
+        });
     }
 
-    let mut rendered = answer.content.clone();
-    rendered.push_str("\n\nSources:\n");
-    for entry_id in &answer.cited_entries {
-        if let Some(entry) = answer.notebook.get(entry_id) {
-            rendered.push_str(&format!(
-                "- `{}` {} — {}\n",
-                entry.id.0,
-                render_provenance(&entry.provenance),
-                entry.statement
-            ));
-        }
-    }
-    rendered
+    sources.truncate(3);
+    sources
 }
 
-fn render_provenance(provenance: &agent_core::Provenance) -> String {
-    match provenance {
+fn source_from_entry(entry: &agent_core::NotebookEntry) -> Option<SourceRef> {
+    match &entry.provenance {
         agent_core::Provenance::File {
             path,
             symbol,
             range,
             ..
-        } => {
-            let symbol = symbol
-                .as_ref()
-                .map(|value| format!(" `{}`", value))
-                .unwrap_or_default();
-            format!("`{}:{}-{}`{}", path, range.start, range.end, symbol)
-        }
-        agent_core::Provenance::CodeGraph { query, .. } => {
-            format!("codegraph query `{}`", query)
-        }
-        agent_core::Provenance::Model { call_id } => format!("model call `{}`", call_id),
-        agent_core::Provenance::Tool { name, .. } => format!("tool `{}`", name),
+        } => Some(SourceRef {
+            path: path.clone(),
+            start_line: range.start,
+            end_line: range.end,
+            symbol: symbol.clone(),
+            label: source_label(path, symbol.as_deref(), &entry.statement),
+        }),
+        _ => None,
     }
+}
+
+fn source_label(path: &str, symbol: Option<&str>, statement: &str) -> String {
+    if let Some(symbol) = symbol {
+        return symbol.to_string();
+    }
+    let lower = statement.to_lowercase();
+    if lower.contains("changed files") || lower.contains("file list") {
+        return "Changed files list".to_string();
+    }
+    path.rsplit('/')
+        .next()
+        .unwrap_or(path)
+        .trim_end_matches(".tsx")
+        .trim_end_matches(".ts")
+        .trim_end_matches(".rs")
+        .to_string()
 }
 
 fn score_file_hit(path: &str, query: &str) -> i64 {

@@ -1,6 +1,6 @@
 import { createSignal, createEffect, onCleanup, Show } from "solid-js";
 import { invoke, Channel } from "@tauri-apps/api/core";
-import AIConversation, { Message } from "./AIConversation";
+import AIConversation, { Message, SourceRef } from "./AIConversation";
 import { SessionDetails } from "./App";
 
 interface AiChatProps {
@@ -9,8 +9,8 @@ interface AiChatProps {
 
 // Define the structured event we expect from Rust
 interface AgentEvent {
-  type: "Status" | "Chunk";
-  data: string;
+  type: "Status" | "Chunk" | "Sources";
+  data: string | SourceRef[];
 }
 
 export default function AiChat(props: AiChatProps) {
@@ -85,7 +85,7 @@ export default function AiChat(props: AiChatProps) {
     setMessages((prev) => [...prev, { role: "user", content: currentInput }]);
     setInput("");
     setIsGenerating(true);
-    updateStatus("Getting the request ready..."); // Initial status before stream begins
+    updateStatus("Preparing the request"); // Initial status before stream begins
 
     // 2. Create empty assistant bubble
     setMessages((prev) => [...prev, { role: "assistant", content: "" }]);
@@ -97,7 +97,7 @@ export default function AiChat(props: AiChatProps) {
       onChunk.onmessage = (event: AgentEvent) => {
         if (event.type === "Status") {
           // Update the status pill for tool execution
-          updateStatus(event.data);
+          updateStatus(event.data as string);
         } else if (event.type === "Chunk") {
           // As soon as real text arrives, clear the status pill
           if (activeStatus()) updateStatus(null);
@@ -108,7 +108,19 @@ export default function AiChat(props: AiChatProps) {
             if (lastIndex >= 0 && updated[lastIndex].role === "assistant") {
               updated[lastIndex] = {
                 ...updated[lastIndex],
-                content: updated[lastIndex].content + event.data,
+                content: updated[lastIndex].content + (event.data as string),
+              };
+            }
+            return updated;
+          });
+        } else if (event.type === "Sources") {
+          setMessages((prev) => {
+            const updated = [...prev];
+            const lastIndex = updated.length - 1;
+            if (lastIndex >= 0 && updated[lastIndex].role === "assistant") {
+              updated[lastIndex] = {
+                ...updated[lastIndex],
+                sources: event.data as SourceRef[],
               };
             }
             return updated;
@@ -156,12 +168,16 @@ export default function AiChat(props: AiChatProps) {
           <div class="flex justify-start px-4">
             <div class="flex max-w-[min(48rem,100%)] items-start gap-2 rounded-2xl border border-gray-700 bg-gray-800/80 px-3 py-2 text-xs leading-relaxed text-gray-400">
               <span class="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-blue-400 animate-ping"></span>
-              <span class="min-w-0 whitespace-normal break-words">
-                {activeStatus()}
-              </span>
-              <span class="ml-1 shrink-0 tabular-nums text-gray-500">
-                {formatElapsed(statusElapsedMs())}
-              </span>
+              <div class="min-w-0 flex-1">
+                <div class="flex items-start gap-2">
+                  <span class="min-w-0 whitespace-normal break-words text-gray-300">
+                    {activeStatus()}
+                  </span>
+                  <span class="ml-auto shrink-0 tabular-nums text-gray-500">
+                    {formatElapsed(statusElapsedMs())}
+                  </span>
+                </div>
+              </div>
             </div>
           </div>
         </Show>

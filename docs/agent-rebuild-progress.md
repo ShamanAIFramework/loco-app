@@ -101,16 +101,47 @@ Rebuild the orchestrator and `agentv2` behavior so deterministic Rust code contr
 - Added regression coverage for line-numbered evidence, wider UI-location slice budgets, deterministic GitPanel-style JSX section focusing, non-location whole-file preservation, and citation specificity ordering.
 - Improved chat progress visibility:
   - agent-core emits more fine-grained status updates for model calls, searches, reads, focusing, lease checks, and synthesis
+  - progress now reports task classification, search intent, path/symbol hit counts, accepted/skipped evidence ranges, extraction pass counts, and missing-evidence follow-up queries
+  - status labels avoid implementation details such as local-model calls and omit decorative ellipses
   - chat UI shows an elapsed timer for the current progress step
+  - chat UI shows only the active step, not a completed-subtask trail
+- Improved TypeScript/TSX symbol ranges:
+  - `export default function` declarations are now indexed as function symbols
+  - symbol end ranges are brace-aware when possible, so component symbols can include nested helpers and JSX render blocks
+  - added TSX component regression coverage for a GitPanel-style render section
+- Added token-aware evidence budgeting:
+  - `AgentRuntime` now receives a `TokenCounter`
+  - Tauri asks llama-server `/tokenize` for evidence token counts when available
+  - token counting falls back to the existing approximate counter if the tokenizer endpoint is unavailable
+  - evidence accumulation now respects `max_evidence_tokens`, while always allowing the first evidence slice
+  - older budget configs without `max_evidence_tokens` still deserialize with a default
+- Improved source display:
+  - Tauri now sends structured `Sources` events instead of appending raw source markdown with notebook and lease ids
+  - source filtering prefers file ranges mentioned by the final answer and deduplicates file/range pairs
+  - chat messages can render compact source chips with path, line range, label, and click-to-copy behavior
+- Audited and tightened prompts for local coding:
+  - global prompt now emphasizes local code truth, no file edits, no tool claims, and repo-map-as-navigation-only
+  - task context now includes a compact recent-conversation block, skips the duplicated current request, and caps prior turns for local-model context windows
+  - intake prompt biases toward proceeding on actionable local-code questions and generating path/symbol/UI-label queries
+  - extraction prompt requires exact lease ids, file/range/block purpose, and UI render block identification
+  - synthesis prompt forbids markdown source sections and internal ids because sources are rendered structurally by the UI
+  - schemas now include local-code-oriented field descriptions
+  - added prompt contract tests for these rules
+- Applied local-model harness guidance:
+  - added `AGENTS.md` with project rules for separated phases, stable context, source UI, and future whole-file edit mode
+  - added local Codex skill `local-agent-prompting` with a reference guide for local/open-weight coding-agent prompt design
+  - prompt text now explicitly says each call is a separated harness phase, not a ReAct loop
 
 ## Verified
 
 - `cargo test --workspace`
-  - 15 tests passed.
+  - 22 tests passed.
 - `cargo test --manifest-path src-tauri/Cargo.toml`
-  - 5 Tauri-side tests passed.
+  - 6 Tauri-side tests passed.
 - `cargo check --manifest-path src-tauri/Cargo.toml`
   - completed successfully.
+- `npm run build`
+  - completed successfully with Vite's existing large-chunk warning.
 
 ## Intentional Temporary Limitations
 
@@ -118,7 +149,7 @@ Rebuild the orchestrator and `agentv2` behavior so deterministic Rust code contr
 - Evidence leases can now cover symbol ranges when symbol hits are available. Symbol parsing is conservative and regex-free, so complex language constructs may still fall back to whole-file slices.
 - The Tauri adapter uses current file-path and symbol-name search, scored deterministically by simple matching.
 - The final answer is streamed to the UI as one chunk after synthesis rather than token-streamed.
-- Token counting is still approximate in `agent-core`; the host does not yet query llama-server tokenizer.
+- Token counting is tokenizer-backed when llama-server exposes `/tokenize`, with an approximate fallback for compatibility.
 - `agent-cli replay` can now regenerate prompt bytes from recorded prompt parts. It still does not replay from notebook snapshots alone.
 - Eval now scores files and symbols and can include trace-derived citation validity, outcome correctness, stop reasons, calls, tokens, queue wait, and wall time when a task includes `trace_path`. It is still a baseline/evaluation harness, not a full task runner.
 - Lease verification is implemented against the current filesystem range hash. Whole-file fallback leases may be weaker for very large truncated files, so UI verification should focus first on symbol-range cases.
@@ -126,16 +157,15 @@ Rebuild the orchestrator and `agentv2` behavior so deterministic Rust code contr
 
 ## Next Milestones
 
-1. Add tokenizer-backed token counting instead of approximate counting.
-2. Capture a stable llama.cpp/server version if the sidecar exposes one.
-3. Improve parsers and graph extraction beyond the conservative line scanner.
-4. Add UI smoke verification against a small workspace:
+1. Capture a stable llama.cpp/server version if the sidecar exposes one.
+2. Improve parsers and graph extraction beyond the conservative line scanner.
+3. Add UI smoke verification against a small workspace:
    - ask for a known symbol
    - edit that symbol while the app is open
    - ask again
    - confirm stale evidence is rejected
    - run `agent-cli replay` on the trace
-5. Consider removing or renaming the now-empty `src-tauri/src/agentv2.rs` compatibility module once all references have settled.
+4. Consider removing or renaming the now-empty `src-tauri/src/agentv2.rs` compatibility module once all references have settled.
 
 ## Resume Notes
 
