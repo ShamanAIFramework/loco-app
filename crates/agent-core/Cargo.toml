@@ -12,6 +12,7 @@ serde_json = "1"
 sha2 = "0.10"
 tokio = { version = "1", features = ["sync"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+log = "0.4"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }

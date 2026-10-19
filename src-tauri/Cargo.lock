@@ -15,6 +15,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
+ "log",
  "serde",
  "serde_json",
  "sha2",

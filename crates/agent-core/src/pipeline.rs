@@ -33,7 +33,16 @@ pub struct AgentRunResult {
 
 pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<AgentRunResult> {
     let mut trace = Trace::default();
-    trace.push(TraceEvent::RunStarted {
+    macro_rules! record_trace {
+        ($event:expr) => {{
+            let ev = $event;
+            if let Ok(json) = serde_json::to_string(&ev) {
+                runtime.progress.emit(AgentProgress::Trace(json)).await;
+            }
+            trace.push(ev);
+        }};
+    }
+    record_trace!(TraceEvent::RunStarted {
         run_id: task.run_id.clone(),
         question: task.question.clone(),
     });
@@ -49,7 +58,7 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
             "Classifying the user's request".to_string(),
         ))
         .await;
-    trace.push(TraceEvent::PhaseStarted {
+    record_trace!(TraceEvent::PhaseStarted {
         phase: Phase::Intake,
     });
 
@@ -72,7 +81,7 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
         prompt: intake_prompt,
         temperature: 0.0,
     };
-    trace.push(TraceEvent::NotebookSnapshot {
+    record_trace!(TraceEvent::NotebookSnapshot {
         phase: Phase::Intake,
         notebook: notebook.deterministic_checkpoint(),
     });
@@ -84,7 +93,7 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
         .await;
     let intake_resp = runtime.llm.complete_json(intake_req.clone()).await?;
     llm_calls += 1;
-    trace.push(TraceEvent::LlmCall {
+    record_trace!(TraceEvent::LlmCall {
         request: intake_req,
         response: intake_resp.clone(),
     });
@@ -111,7 +120,7 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
             cited_entries: Vec::new(),
             notebook,
         };
-        trace.push(TraceEvent::RunFinished {
+        record_trace!(TraceEvent::RunFinished {
             stop_reason: StopReason::NeedsUser,
         });
         return Ok(AgentRunResult { answer, trace });
@@ -158,7 +167,7 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
             .search(query, task.budgets.max_files_to_read)
             .await
             .unwrap_or_default();
-        trace.push(TraceEvent::ToolCall {
+        record_trace!(TraceEvent::ToolCall {
             name: "code_search".to_string(),
             args: serde_json::json!({ "query": query }),
             result_count: hits.len(),
@@ -191,7 +200,7 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
             .search_symbols(query, task.budgets.max_files_to_read)
             .await
             .unwrap_or_default();
-        trace.push(TraceEvent::ToolCall {
+        record_trace!(TraceEvent::ToolCall {
             name: "code_search_symbols".to_string(),
             args: serde_json::json!({ "query": query }),
             result_count: symbols.len(),
@@ -231,7 +240,7 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
                 .search_related_symbols(*relation, query, task.budgets.max_files_to_read)
                 .await
                 .unwrap_or_default();
-            trace.push(TraceEvent::ToolCall {
+            record_trace!(TraceEvent::ToolCall {
                 name: "code_search_related_symbols".to_string(),
                 args: serde_json::json!({
                     "query": query,
@@ -265,7 +274,7 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
             .search_content(query, task.budgets.max_files_to_read * 3)
             .await
             .unwrap_or_default();
-        trace.push(TraceEvent::ToolCall {
+        record_trace!(TraceEvent::ToolCall {
             name: "code_search_content".to_string(),
             args: serde_json::json!({ "query": query }),
             result_count: text_hits.len(),
@@ -299,7 +308,7 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
             .changed_files(task.budgets.max_files_to_read)
             .await
             .unwrap_or_default();
-        trace.push(TraceEvent::ToolCall {
+        record_trace!(TraceEvent::ToolCall {
             name: "changed_files".to_string(),
             args: serde_json::json!({ "limit": task.budgets.max_files_to_read }),
             result_count: changed.len(),
@@ -334,7 +343,7 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
                 .search_adjacent_files(&seed_paths, task.budgets.max_files_to_read)
                 .await
                 .unwrap_or_default();
-            trace.push(TraceEvent::ToolCall {
+            record_trace!(TraceEvent::ToolCall {
                 name: "code_search_adjacent_files".to_string(),
                 args: serde_json::json!({ "seed_paths": seed_paths }),
                 result_count: adjacent.len(),
@@ -369,7 +378,7 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
                 .search_imported_files(&seed_paths, task.budgets.max_files_to_read)
                 .await
                 .unwrap_or_default();
-            trace.push(TraceEvent::ToolCall {
+            record_trace!(TraceEvent::ToolCall {
                 name: "code_search_imported_files".to_string(),
                 args: serde_json::json!({ "seed_paths": seed_paths }),
                 result_count: imported.len(),
@@ -404,7 +413,7 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
                 .search_importing_files(&seed_paths, task.budgets.max_files_to_read)
                 .await
                 .unwrap_or_default();
-            trace.push(TraceEvent::ToolCall {
+            record_trace!(TraceEvent::ToolCall {
                 name: "code_search_importing_files".to_string(),
                 args: serde_json::json!({ "seed_paths": seed_paths }),
                 result_count: importing.len(),
@@ -439,7 +448,7 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
                 .search_scope_files(&seed_paths, task.budgets.max_files_to_read)
                 .await
                 .unwrap_or_default();
-            trace.push(TraceEvent::ToolCall {
+            record_trace!(TraceEvent::ToolCall {
                 name: "code_search_scope_files".to_string(),
                 args: serde_json::json!({ "seed_paths": seed_paths }),
                 result_count: scope_files.len(),
@@ -481,7 +490,7 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
                     .search_context_docs(&queries, &seed_paths, task.budgets.max_files_to_read)
                     .await
                     .unwrap_or_default();
-                trace.push(TraceEvent::ToolCall {
+                record_trace!(TraceEvent::ToolCall {
                     name: "code_search_context_docs".to_string(),
                     args: serde_json::json!({ "queries": queries, "seed_paths": seed_paths }),
                     result_count: context_docs.len(),
@@ -510,7 +519,7 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
             .search_directory_files(&explicit_directories, task.budgets.max_files_to_read)
             .await
             .unwrap_or_default();
-        trace.push(TraceEvent::ToolCall {
+        record_trace!(TraceEvent::ToolCall {
             name: "code_search_directory_files".to_string(),
             args: serde_json::json!({ "directories": explicit_directories }),
             result_count: directory_files.len(),
@@ -550,7 +559,7 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
             .file_reader
             .read_range(&path, None, start_line, end_line, per_slice_budget(&task))
             .await;
-        trace.push(TraceEvent::ToolCall {
+        record_trace!(TraceEvent::ToolCall {
             name: "read_explicit_file_range".to_string(),
             args: serde_json::json!({
                 "path": path,
@@ -627,7 +636,7 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
             .file_reader
             .read_file(&path, per_slice_budget(&task))
             .await;
-        trace.push(TraceEvent::ToolCall {
+        record_trace!(TraceEvent::ToolCall {
             name: "read_explicit_file".to_string(),
             args: serde_json::json!({ "path": path }),
             result_count: usize::from(slice_result.is_ok()),
@@ -699,7 +708,7 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
                         .await;
                     continue;
                 }
-                trace.push(TraceEvent::ToolCall {
+                record_trace!(TraceEvent::ToolCall {
                     name: "read_changed_diff".to_string(),
                     args: serde_json::json!({ "path": path }),
                     result_count: 1,
@@ -726,7 +735,7 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
                 evidence.push(slice);
             }
             Err(_) => {
-                trace.push(TraceEvent::ToolCall {
+                record_trace!(TraceEvent::ToolCall {
                     name: "read_changed_diff".to_string(),
                     args: serde_json::json!({ "path": path }),
                     result_count: 0,
@@ -864,7 +873,7 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
                 .search_related_symbols(expansion.relation, &seed.symbol, expansion.limit)
                 .await
                 .unwrap_or_default();
-            trace.push(TraceEvent::ToolCall {
+            record_trace!(TraceEvent::ToolCall {
                 name: "code_search_related_symbols".to_string(),
                 args: serde_json::json!({
                     "query": seed.symbol,
@@ -1151,7 +1160,7 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
             cited_entries: Vec::new(),
             notebook,
         };
-        trace.push(TraceEvent::RunFinished {
+        record_trace!(TraceEvent::RunFinished {
             stop_reason: StopReason::NotFound,
         });
         return Ok(AgentRunResult { answer, trace });
@@ -1176,7 +1185,7 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
                 round + 1
             )))
             .await;
-        trace.push(TraceEvent::PhaseStarted {
+        record_trace!(TraceEvent::PhaseStarted {
             phase: Phase::Extract,
         });
 
@@ -1199,7 +1208,7 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
             prompt: extract_prompt,
             temperature: 0.0,
         };
-        trace.push(TraceEvent::NotebookSnapshot {
+        record_trace!(TraceEvent::NotebookSnapshot {
             phase: Phase::Extract,
             notebook: notebook.deterministic_checkpoint(),
         });
@@ -1212,7 +1221,7 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
             .await;
         let extract_resp = runtime.llm.complete_json(extract_req.clone()).await?;
         llm_calls += 1;
-        trace.push(TraceEvent::LlmCall {
+        record_trace!(TraceEvent::LlmCall {
             request: extract_req,
             response: extract_resp.clone(),
         });
@@ -1236,7 +1245,7 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
                     .await;
                 if runtime.file_reader.verify_lease(lease).await? == LeaseStatus::Expired {
                     notebook.mark_stale_by_lease(&lease.id);
-                    trace.push(TraceEvent::LeaseInvalidated {
+                    record_trace!(TraceEvent::LeaseInvalidated {
                         lease_id: lease.id.clone(),
                     });
                     continue;
@@ -1329,7 +1338,7 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
                         .file_reader
                         .read_range(&path, None, start_line, end_line, per_slice_budget(&task))
                         .await;
-                    trace.push(TraceEvent::ToolCall {
+                    record_trace!(TraceEvent::ToolCall {
                         name: "read_file_range".to_string(),
                         args: serde_json::json!({
                             "target": query,
@@ -1380,7 +1389,7 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
                     .search_related_symbols(relation, &query, task.budgets.max_files_to_read)
                     .await
                     .unwrap_or_default();
-                trace.push(TraceEvent::ToolCall {
+                record_trace!(TraceEvent::ToolCall {
                     name: "code_search_related_symbols".to_string(),
                     args: serde_json::json!({
                         "query": query,
@@ -1443,7 +1452,7 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
                 .search_symbols(&query, task.budgets.max_files_to_read)
                 .await
                 .unwrap_or_default();
-            trace.push(TraceEvent::ToolCall {
+            record_trace!(TraceEvent::ToolCall {
                 name: "code_search_symbols".to_string(),
                 args: serde_json::json!({ "query": query, "follow_up": true }),
                 result_count: symbols.len(),
@@ -1500,7 +1509,7 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
                 .search_content(&query, task.budgets.max_files_to_read * 3)
                 .await
                 .unwrap_or_default();
-            trace.push(TraceEvent::ToolCall {
+            record_trace!(TraceEvent::ToolCall {
                 name: "code_search_content".to_string(),
                 args: serde_json::json!({ "query": query, "follow_up": true }),
                 result_count: text_hits.len(),
@@ -1556,7 +1565,7 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
                 .search(&query, task.budgets.max_files_to_read)
                 .await
                 .unwrap_or_default();
-            trace.push(TraceEvent::ToolCall {
+            record_trace!(TraceEvent::ToolCall {
                 name: "code_search".to_string(),
                 args: serde_json::json!({ "query": query, "follow_up": true }),
                 result_count: hits.len(),
@@ -1619,17 +1628,17 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
                 cited_entries: active_entries(&notebook, inference_entry_ids),
                 notebook,
             };
-            trace.push(TraceEvent::NotebookSnapshot {
+            record_trace!(TraceEvent::NotebookSnapshot {
                 phase: Phase::Plan,
                 notebook: answer.notebook.deterministic_checkpoint(),
             });
-            trace.push(TraceEvent::RunFinished {
+            record_trace!(TraceEvent::RunFinished {
                 stop_reason: StopReason::BudgetExhausted,
             });
             return Ok(AgentRunResult { answer, trace });
         }
 
-        trace.push(TraceEvent::PhaseStarted { phase: Phase::Plan });
+        record_trace!(TraceEvent::PhaseStarted { phase: Phase::Plan });
         runtime
             .progress
             .emit(AgentProgress::Status(
@@ -1654,12 +1663,12 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
             prompt: plan_prompt,
             temperature: 0.0,
         };
-        trace.push(TraceEvent::NotebookSnapshot {
+        record_trace!(TraceEvent::NotebookSnapshot {
             phase: Phase::Plan,
             notebook: notebook.deterministic_checkpoint(),
         });
         let plan_resp = runtime.llm.complete_json(plan_req.clone()).await?;
-        trace.push(TraceEvent::LlmCall {
+        record_trace!(TraceEvent::LlmCall {
             request: plan_req,
             response: plan_resp.clone(),
         });
@@ -1673,7 +1682,7 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
             cited_entries,
             notebook,
         };
-        trace.push(TraceEvent::RunFinished {
+        record_trace!(TraceEvent::RunFinished {
             stop_reason: StopReason::Done,
         });
         return Ok(AgentRunResult { answer, trace });
@@ -1692,17 +1701,17 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
             cited_entries: active_entries(&notebook, inference_entry_ids),
             notebook,
         };
-        trace.push(TraceEvent::NotebookSnapshot {
+        record_trace!(TraceEvent::NotebookSnapshot {
             phase: Phase::Synthesize,
             notebook: answer.notebook.deterministic_checkpoint(),
         });
-        trace.push(TraceEvent::RunFinished {
+        record_trace!(TraceEvent::RunFinished {
             stop_reason: StopReason::BudgetExhausted,
         });
         return Ok(AgentRunResult { answer, trace });
     }
 
-    trace.push(TraceEvent::PhaseStarted {
+    record_trace!(TraceEvent::PhaseStarted {
         phase: Phase::Synthesize,
     });
     runtime
@@ -1730,7 +1739,7 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
         prompt: synth_prompt,
         temperature: 0.0,
     };
-    trace.push(TraceEvent::NotebookSnapshot {
+    record_trace!(TraceEvent::NotebookSnapshot {
         phase: Phase::Synthesize,
         notebook: notebook.deterministic_checkpoint(),
     });
@@ -1741,7 +1750,7 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
         ))
         .await;
     let synth_resp = runtime.llm.complete_json(synth_req.clone()).await?;
-    trace.push(TraceEvent::LlmCall {
+    record_trace!(TraceEvent::LlmCall {
         request: synth_req,
         response: synth_resp.clone(),
     });
@@ -1771,7 +1780,7 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
         cited_entries,
         notebook,
     };
-    trace.push(TraceEvent::RunFinished { stop_reason });
+    record_trace!(TraceEvent::RunFinished { stop_reason });
 
     Ok(AgentRunResult { answer, trace })
 }

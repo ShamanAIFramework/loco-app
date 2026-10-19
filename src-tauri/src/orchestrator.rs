@@ -97,6 +97,17 @@ pub async fn prompt_agent_v2(
         slot: app.state::<AppState>().llm_slot.clone(),
     };
     let metadata = llm.runtime_metadata().await;
+    let trace_logger = Arc::new(
+        crate::trace_writer::TraceLogger::new(run_id.clone(), Some(question.clone()))
+            .context("Failed to initialize trace logger")?,
+    );
+    if let Some(model_id) = &metadata.model_id {
+        trace_logger.set_model_id(model_id.clone());
+    }
+    trace_logger.record_event(&TraceEvent::RuntimeMetadata {
+        metadata: metadata.clone(),
+    });
+
     let search = TauriCodeSearch {
         app: app.clone(),
         project_id,
@@ -106,9 +117,10 @@ pub async fn prompt_agent_v2(
     };
     let progress = TauriProgressSink {
         channel: on_chunk.clone(),
+        trace_logger: trace_logger.clone(),
     };
 
-    let mut result = agent_core::run_agent(
+    let mut result = match agent_core::run_agent(
         task,
         AgentRuntime {
             llm: &llm,
@@ -118,7 +130,14 @@ pub async fn prompt_agent_v2(
             progress: &progress,
         },
     )
-    .await?;
+    .await
+    {
+        Ok(res) => res,
+        Err(err) => {
+            trace_logger.record_error(&err);
+            return Err(err.into());
+        }
+    };
 
     result
         .trace
@@ -218,6 +237,14 @@ impl LlmClient for LlamaServerClient {
             "response_format": response_format
         });
 
+        log::info!(
+            "[llama-server] [{:?}] Starting call_id={} (schema={}, prompt_chars={})",
+            request.phase,
+            request.call_id,
+            request.schema_name,
+            request.prompt.len()
+        );
+
         let started = std::time::Instant::now();
         let res = self
             .client
@@ -237,6 +264,13 @@ impl LlmClient for LlamaServerClient {
             .await
             .context("Failed to parse llama-server response JSON")?;
         if !status.is_success() {
+            log::error!(
+                "[llama-server] [{:?}] Call {} failed with {}: {}",
+                request.phase,
+                request.call_id,
+                status,
+                value
+            );
             return Err(anyhow!(
                 "llama-server request failed with {}: {}",
                 status,
@@ -249,6 +283,18 @@ impl LlmClient for LlamaServerClient {
             .unwrap_or("{}")
             .to_string();
         let usage = &value["usage"];
+        let wall_ms = started.elapsed().as_millis() as u64;
+
+        log::info!(
+            "[llama-server] [{:?}] Finished call_id={} in {}ms (queue_wait={}ms, prompt_tokens={:?}, decode_tokens={:?})",
+            request.phase,
+            request.call_id,
+            wall_ms,
+            queue_wait_ms,
+            usage["prompt_tokens"].as_u64(),
+            usage["completion_tokens"].as_u64()
+        );
+
         Ok(LlmResponse {
             call_id: request.call_id,
             raw_json,
@@ -260,7 +306,7 @@ impl LlmClient for LlamaServerClient {
                 decode_tokens: usage["completion_tokens"].as_u64(),
                 prefill_ms: usage["prompt_ms"].as_u64(),
                 decode_ms: usage["predicted_ms"].as_u64(),
-                wall_ms: Some(started.elapsed().as_millis() as u64),
+                wall_ms: Some(wall_ms),
             },
         })
     }
@@ -991,6 +1037,7 @@ impl FileReader for WorkspaceFileReader {
 
 struct TauriProgressSink {
     channel: Channel<AgentEvent>,
+    trace_logger: Arc<crate::trace_writer::TraceLogger>,
 }
 
 #[async_trait]
@@ -1000,7 +1047,11 @@ impl ProgressSink for TauriProgressSink {
             AgentProgress::Status(status) => {
                 let _ = self.channel.send(AgentEvent::Status(status));
             }
-            AgentProgress::Trace(_) => {}
+            AgentProgress::Trace(json_str) => {
+                if let Ok(event) = serde_json::from_str::<TraceEvent>(&json_str) {
+                    self.trace_logger.record_event(&event);
+                }
+            }
         }
     }
 }
@@ -2470,10 +2521,12 @@ async fn write_trace(run_id: &str, trace: &agent_core::Trace) -> Result<()> {
     let home = dirs::home_dir().ok_or_else(|| anyhow!("Could not determine home directory"))?;
     let dir = home.join(".loco").join("traces");
     let path = dir.join(format!("{}.jsonl", run_id));
+    let latest_path = dir.join("latest.jsonl");
     let jsonl = trace.to_jsonl();
     tauri::async_runtime::spawn_blocking(move || {
         std::fs::create_dir_all(&dir)?;
-        std::fs::write(&path, jsonl)?;
+        std::fs::write(&path, &jsonl)?;
+        std::fs::write(&latest_path, &jsonl)?;
         log::info!("Wrote agent trace to {}", path.display());
         Ok::<_, anyhow::Error>(())
     })
