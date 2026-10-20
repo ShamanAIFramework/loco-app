@@ -514,20 +514,13 @@ pub fn prompt_candidate_gate(
     prompt_candidate_gate_optimist(task_question, intent_summary, candidates)
 }
 
-pub fn prompt_candidate_gate_optimist(
+pub fn prompt_candidate_gate_prefix(
     task_question: &str,
     intent_summary: &str,
     candidates: &[CandidateGateItem],
 ) -> String {
     let mut out = String::new();
-    out.push_str("CANDIDATE GATE OPTIMIST (ARCHITECTURAL SCOUT)\n");
-    out.push_str("Role: You are an inclusion-focused architectural scout maximizing retrieval recall.\n");
-    out.push_str("Mission: Identify every code candidate that provides valuable direct implementation, structural context, or architectural clarity for the user request.\n");
-    out.push_str("Inclusion Guidelines:\n");
-    out.push_str("1. Entrypoint & Root Mount Context: Keep application entrypoints and mount files that bootstrap the primary UI hierarchy. Even if an entrypoint only renders a root component or sets up top-level providers, it provides vital evidence regarding framework selection, top-level providers, and top-level architecture.\n");
-    out.push_str("2. Root Shells & View Switching: Keep main application shells and screen components. Modern UI applications frequently implement navigation and routing via conditional view switching, screen state signals, or panel containers rather than dedicated routing packages. These view-switching components are primary routing configurations.\n");
-    out.push_str("3. Structural Context: Keep candidates that define state signals, lifecycle hooks, or data contracts that govern the requested feature.\n");
-    out.push_str("If there is a valid architectural justification to keep a candidate for downstream synthesis, advocate for it with keep: true.\n\n");
+    out.push_str("CANDIDATE CODE EVALUATION\n");
     out.push_str(&format!("User Request: {}\n", task_question.trim()));
     out.push_str(&format!("Target Intent: {}\n\n", intent_summary.trim()));
     out.push_str("Candidates to evaluate:\n");
@@ -544,7 +537,23 @@ pub fn prompt_candidate_gate_optimist(
             c.snippet.trim()
         ));
     }
+    out
+}
 
+pub fn prompt_candidate_gate_optimist(
+    task_question: &str,
+    intent_summary: &str,
+    candidates: &[CandidateGateItem],
+) -> String {
+    let mut out = prompt_candidate_gate_prefix(task_question, intent_summary, candidates);
+    out.push_str("EVALUATION PERSPECTIVE: OPTIMIST (ARCHITECTURAL SCOUT)\n");
+    out.push_str("Role: You are an inclusion-focused architectural scout maximizing retrieval recall.\n");
+    out.push_str("Mission: Identify every code candidate that provides valuable direct implementation, structural context, or architectural clarity for the user request.\n");
+    out.push_str("Inclusion Guidelines:\n");
+    out.push_str("1. Entrypoint & Root Mount Context: Keep application entrypoints and mount files that bootstrap the primary UI hierarchy. Even if an entrypoint only renders a root component or sets up top-level providers, it provides vital evidence regarding framework selection, top-level providers, and top-level architecture.\n");
+    out.push_str("2. Root Shells & View Switching: Keep main application shells and screen components. Modern UI applications frequently implement navigation and routing via conditional view switching, screen state signals, or panel containers rather than dedicated routing packages. These view-switching components are primary routing configurations.\n");
+    out.push_str("3. Structural Context: Keep candidates that define state signals, lifecycle hooks, or data contracts that govern the requested feature.\n");
+    out.push_str("If there is a valid architectural justification to keep a candidate for downstream synthesis, advocate for it with keep: true.\n\n");
     out.push_str("Return a JSON object matching schema `CandidateGateOutput` with an evaluation for each candidate.\n");
     out
 }
@@ -554,8 +563,8 @@ pub fn prompt_candidate_gate_skeptic(
     intent_summary: &str,
     candidates: &[CandidateGateItem],
 ) -> String {
-    let mut out = String::new();
-    out.push_str("CANDIDATE GATE SKEPTIC (PRECISION CRITIC)\n");
+    let mut out = prompt_candidate_gate_prefix(task_question, intent_summary, candidates);
+    out.push_str("EVALUATION PERSPECTIVE: SKEPTIC (PRECISION CRITIC)\n");
     out.push_str("Role: You are a precision-focused code critic eliminating false positives and noise.\n");
     out.push_str("Mission: Scrutinize every code candidate. Challenge whether each slice directly answers the target intent or is merely an unneeded distraction.\n");
     out.push_str("Pruning Guidelines:\n");
@@ -563,23 +572,6 @@ pub fn prompt_candidate_gate_skeptic(
     out.push_str("2. Generic Utilities: Drop isolated utility helpers (e.g. DOM manipulation, syntax highlighting, text formatting, or generic handlers) that do not configure core views or logic.\n");
     out.push_str("3. Stylesheets & Pure Presentation: Drop CSS/styling files unless the user explicitly requested styling rules.\n");
     out.push_str("4. False Positives: If a candidate does not directly implement or define the target feature, reject it with keep: false.\n\n");
-    out.push_str(&format!("User Request: {}\n", task_question.trim()));
-    out.push_str(&format!("Target Intent: {}\n\n", intent_summary.trim()));
-    out.push_str("Candidates to evaluate:\n");
-
-    for (i, c) in candidates.iter().enumerate() {
-        out.push_str(&format!(
-            "--- Candidate {} ---\nPath: {}\nLines: {}-{}\nSymbol: {}\nSource: {}\n```\n{}\n```\n\n",
-            i + 1,
-            c.path,
-            c.start_line,
-            c.end_line,
-            c.symbol.as_deref().unwrap_or("none"),
-            c.source,
-            c.snippet.trim()
-        ));
-    }
-
     out.push_str("Return a JSON object matching schema `CandidateGateOutput` with an evaluation for each candidate.\n");
     out
 }
@@ -715,6 +707,26 @@ mod tests {
         assert!(first.starts_with(&stable));
         assert!(second.starts_with(&stable));
         assert!(common_prefix_len(&first, &second) >= stable.len());
+    }
+
+    #[test]
+    fn stereoscopic_prompts_share_stable_candidate_prefix() {
+        let items = vec![CandidateGateItem {
+            path: "src/App.tsx".to_string(),
+            symbol: Some("App".to_string()),
+            start_line: 1,
+            end_line: 50,
+            source: "CodeGraph".to_string(),
+            snippet: "export default function App() {}".to_string(),
+        }];
+        let opt = prompt_candidate_gate_optimist("Where is routing", "Locate routing", &items);
+        let skep = prompt_candidate_gate_skeptic("Where is routing", "Locate routing", &items);
+        let common = prompt_candidate_gate_prefix("Where is routing", "Locate routing", &items);
+
+        assert!(opt.starts_with(&common));
+        assert!(skep.starts_with(&common));
+        assert!(common.contains("src/App.tsx"));
+        assert!(common_prefix_len(&opt, &skep) >= common.len());
     }
 
     #[test]

@@ -591,7 +591,7 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
                     .read_range(&cand.path, cand.symbol.as_deref(), cand.start_line, cand.end_line, 2500)
                     .await
                 {
-                    Ok(slice) => slice.content,
+                    Ok(slice) => compact_candidate_snippet(&slice.content),
                     Err(_) => "Preview unavailable".to_string(),
                 };
                 gate_items.push(CandidateGateItem {
@@ -620,7 +620,7 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
                 schema: schema_candidate_gate(),
                 prompt_parts: None,
                 prompt: opt_prompt,
-                temperature: 0.1,
+                temperature: 0.0,
             };
 
             record_trace!(TraceEvent::PhaseStarted {
@@ -647,7 +647,7 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
                 schema: schema_candidate_gate(),
                 prompt_parts: None,
                 prompt: skep_prompt,
-                temperature: 0.1,
+                temperature: 0.0,
             };
 
             record_trace!(TraceEvent::PhaseStarted {
@@ -1171,6 +1171,25 @@ fn extract_terms_for_search(question: &str) -> Vec<String> {
     terms.dedup();
     terms.truncate(5);
     terms
+}
+
+fn compact_candidate_snippet(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut consecutive_empty = 0;
+    for line in raw.lines() {
+        let trimmed = line.trim_end();
+        if trimmed.trim().is_empty() {
+            consecutive_empty += 1;
+            if consecutive_empty <= 1 {
+                out.push('\n');
+            }
+        } else {
+            consecutive_empty = 0;
+            out.push_str(trimmed);
+            out.push('\n');
+        }
+    }
+    out
 }
 
 fn candidate_exclusion_reason(path: &str, question: &str) -> Option<&'static str> {
