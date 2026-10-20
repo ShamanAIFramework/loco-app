@@ -163,6 +163,30 @@ pub fn extract_chunks_from_project(
                         text: slice_text,
                     });
                     covered_ranges.insert((start, end));
+                } else if end - start > 200 {
+                    // For large symbols (> 200 lines), break into 60-line sub-chunks with 20-line overlap,
+                    // retaining the symbol name so vector hits know which symbol they belong to
+                    let sub_window = 60;
+                    let sub_step = 40;
+                    let mut s = start;
+                    while s <= end {
+                        let e = (s + sub_window - 1).min(end);
+                        let slice_text = lines[(s as usize - 1)..(e as usize)].join("\n");
+                        if !slice_text.trim().is_empty() {
+                            chunks.push(CodeChunk {
+                                path: file.path.clone(),
+                                symbol: Some(format!("{} (lines {}-{})", sym.name, s, e)),
+                                start_line: s,
+                                end_line: e,
+                                text: slice_text,
+                            });
+                        }
+                        if e == end {
+                            break;
+                        }
+                        s += sub_step;
+                    }
+                    covered_ranges.insert((start, end));
                 }
             }
         }
@@ -177,9 +201,12 @@ pub fn extract_chunks_from_project(
             if !already_covered && end >= curr {
                 let slice_text = lines[(curr as usize - 1)..(end as usize)].join("\n");
                 if !slice_text.trim().is_empty() {
+                    let enclosing_symbol = symbols_by_file.get(&file.id).and_then(|syms| {
+                        syms.iter().find(|s| curr >= s.start_line && end <= s.end_line).map(|s| s.name.clone())
+                    });
                     chunks.push(CodeChunk {
                         path: file.path.clone(),
-                        symbol: None,
+                        symbol: enclosing_symbol,
                         start_line: curr,
                         end_line: end,
                         text: slice_text,
@@ -290,5 +317,55 @@ mod tests {
 
         let sim = cosine_similarity(&q_vec, q_norm, &d_vec, d_norm);
         assert!(sim > 0.7);
+    }
+
+    #[test]
+    fn test_large_symbol_sub_chunking() {
+        let temp_dir = std::env::temp_dir().join(format!("loco_test_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let file_path = temp_dir.join("LargeComponent.tsx");
+
+        // Create a 350-line file
+        let mut file_lines = Vec::new();
+        for i in 1..=350 {
+            file_lines.push(format!("const line{} = {};", i, i));
+        }
+        std::fs::write(&file_path, file_lines.join("\n")).unwrap();
+
+        let source_file = SourceFile {
+            id: "file-1".to_string(),
+            project_id: "proj-1".to_string(),
+            path: "LargeComponent.tsx".to_string(),
+            checksum: None,
+            index_version: 1,
+            last_indexed: None,
+        };
+
+        let large_sym = Symbol {
+            id: "sym-1".to_string(),
+            file_id: "file-1".to_string(),
+            name: "LargeComponent".to_string(),
+            kind: "Component".to_string(),
+            line: 1,
+            start_line: 1,
+            end_line: 350,
+            content_hash: None,
+        };
+
+        let chunks = extract_chunks_from_project(
+            &temp_dir,
+            &[source_file],
+            &[large_sym],
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        // Should have extracted multiple sub-chunks covering the 350 lines
+        assert!(chunks.len() >= 5);
+        for chunk in &chunks {
+            assert!(chunk.symbol.is_some());
+            assert!(chunk.symbol.as_ref().unwrap().contains("LargeComponent"));
+            assert!(chunk.end_line - chunk.start_line <= 60);
+        }
     }
 }

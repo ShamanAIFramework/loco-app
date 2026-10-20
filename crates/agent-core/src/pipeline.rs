@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use crate::notebook::{Notebook, Provenance};
 use crate::prompt::{
     global_prefix, intake_critic_instruction, intake_instruction, phase_prefix,
@@ -404,13 +405,19 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
                 continue;
             }
             if !candidate_targets.iter().any(|t| t.path == ph.path) {
+                // If there is a matching vector hit for this path, use its focal range!
+                let (start_line, end_line, symbol, source) = if let Some(vh) = all_vector_hits.iter().find(|v| v.path == ph.path) {
+                    (vh.start_line, vh.end_line, vh.symbol.clone(), format!("Path match + Vector focal chunk ({})", vh.symbol.as_deref().unwrap_or("block")))
+                } else {
+                    (1, 60, None, "Path match".to_string())
+                };
                 candidate_targets.push(SliceTarget {
                     path: ph.path.clone(),
-                    symbol: None,
-                    start_line: 1,
-                    end_line: 60,
+                    symbol,
+                    start_line,
+                    end_line,
                     score: ph.score,
-                    source: "Path match".to_string(),
+                    source,
                 });
             }
         }
@@ -539,9 +546,16 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
                             syms.into_iter().max_by_key(|s| s.end_line.saturating_sub(s.start_line))
                         });
 
+                    let matching_vector_hit = all_vector_hits.iter().find(|vh| vh.path == imp.path);
+
                     if let Some(sym) = matched_sym {
-                        // For large components (> 200 lines), target the render / return block at the end
-                        let (s_line, e_line) = if sym.end_line > sym.start_line + 200 {
+                        // For files under 250 lines, start from line 1 to include imports and full component structure
+                        let (s_line, e_line) = if sym.end_line <= 250 {
+                            (1, sym.end_line)
+                        } else if let Some(vh) = matching_vector_hit {
+                            // If file > 250 lines and vector search found a semantic hit, target the focal chunk!
+                            (vh.start_line, vh.end_line)
+                        } else if sym.end_line > sym.start_line + 200 {
                             (sym.end_line.saturating_sub(120).max(sym.start_line), sym.end_line)
                         } else {
                             (sym.start_line, sym.end_line)
@@ -553,6 +567,15 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
                             end_line: e_line,
                             score: imp.score + 100, // Strong boost for topology-discovered root component
                             source: format!("CodeGraph topology (imported component `{}`)", sym.symbol),
+                        });
+                    } else if let Some(vh) = matching_vector_hit {
+                        candidate_targets.push(SliceTarget {
+                            path: imp.path.clone(),
+                            symbol: vh.symbol.clone(),
+                            start_line: vh.start_line,
+                            end_line: vh.end_line,
+                            score: imp.score + 85,
+                            source: "CodeGraph topology + Vector focal chunk".to_string(),
                         });
                     } else {
                         candidate_targets.push(SliceTarget {
@@ -586,13 +609,46 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
 
             let mut gate_items = Vec::new();
             for cand in &candidate_pool {
-                let preview = match runtime
-                    .file_reader
-                    .read_range(&cand.path, cand.symbol.as_deref(), cand.start_line, cand.end_line, 2500)
-                    .await
-                {
-                    Ok(slice) => compact_candidate_snippet(&slice.content),
-                    Err(_) => "Preview unavailable".to_string(),
+                let preview = if cand.start_line > 35 {
+                    // "Header + Focal Window" Slicing:
+                    // For chunks located deep in a file (> line 35), include the top 25 lines (imports, declarations)
+                    // so the Optimist & Skeptic model lenses have full lexical and architectural scope.
+                    let header_res = runtime
+                        .file_reader
+                        .read_range(&cand.path, None, 1, 25, 2000)
+                        .await;
+                    let focal_res = runtime
+                        .file_reader
+                        .read_range(&cand.path, cand.symbol.as_deref(), cand.start_line, cand.end_line, 6000)
+                        .await;
+
+                    match (header_res, focal_res) {
+                        (Ok(header_slice), Ok(focal_slice)) => {
+                            let clean_header = compact_candidate_snippet(&header_slice.content);
+                            let clean_focal = compact_candidate_snippet(&focal_slice.content);
+                            if !clean_header.is_empty() && clean_header != clean_focal {
+                                format!(
+                                    "{}\n// ... [omitted lines 26 to {}] ...\n{}",
+                                    clean_header,
+                                    cand.start_line.saturating_sub(1),
+                                    clean_focal
+                                )
+                            } else {
+                                clean_focal
+                            }
+                        }
+                        (_, Ok(focal_slice)) => compact_candidate_snippet(&focal_slice.content),
+                        _ => "Preview unavailable".to_string(),
+                    }
+                } else {
+                    match runtime
+                        .file_reader
+                        .read_range(&cand.path, cand.symbol.as_deref(), cand.start_line, cand.end_line, 8000)
+                        .await
+                    {
+                        Ok(slice) => compact_candidate_snippet(&slice.content),
+                        Err(_) => "Preview unavailable".to_string(),
+                    }
                 };
                 gate_items.push(CandidateGateItem {
                     path: cand.path.clone(),
@@ -704,15 +760,22 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
                         // Unanimous Keep
                         final_targets.push(cand.clone());
                     } else if !opt_keep && !skep_keep {
-                        // Unanimous Drop
-                        let reason = skep_eval
-                            .map(|e| e.reason.as_str())
-                            .or_else(|| opt_eval.map(|e| e.reason.as_str()))
-                            .unwrap_or("Stereoscopic Consensus: Pruned by both Optimist and Skeptic");
-                        pruned_candidates.push(PrunedCandidateDetail {
-                            path: cand.path.clone(),
-                            reason: format!("Stereoscopic consensus rejected: {}", reason),
-                        });
+                        // Unanimous Drop - with Architectural Anchor Protection:
+                        // If a candidate is a domain-aligned root component or shell directly connected by CodeGraph topology,
+                        // retain it as an architectural anchor even if both models claim lack of a dedicated feature table.
+                        let is_architectural_anchor = has_topology_backing && is_entrypoint_or_shell && is_domain_aligned;
+                        if is_architectural_anchor {
+                            final_targets.push(cand.clone());
+                        } else {
+                            let reason = skep_eval
+                                .map(|e| e.reason.as_str())
+                                .or_else(|| opt_eval.map(|e| e.reason.as_str()))
+                                .unwrap_or("Stereoscopic Consensus: Pruned by both Optimist and Skeptic");
+                            pruned_candidates.push(PrunedCandidateDetail {
+                                path: cand.path.clone(),
+                                reason: format!("Stereoscopic consensus rejected: {}", reason),
+                            });
+                        }
                     } else if opt_keep && !skep_keep {
                         // Split Decision: Optimist wanted to keep, Skeptic wanted to drop
                         // Deterministic Host Arbiter tie-breaker:
@@ -752,8 +815,49 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
             }
         }
 
+        let mut leased_header_paths: HashSet<String> = HashSet::new();
+
         // Acquire leases for final verified targets
         for target in final_targets.into_iter().take(max_files) {
+            // Header context lease: If target is deep inside a large file (> line 35),
+            // lease the file header (lines 1..25) first so imports and types are available in the notebook.
+            if target.start_line > 35 && !leased_header_paths.contains(&target.path) {
+                if let Ok(header_slice) = runtime
+                    .file_reader
+                    .read_range(&target.path, Some("header/imports"), 1, 25, 2000)
+                    .await
+                {
+                    leased_header_paths.insert(target.path.clone());
+                    record_trace!(TraceEvent::ToolCall {
+                        name: "read_range".to_string(),
+                        args: json!({
+                            "path": target.path,
+                            "symbol": "header/imports",
+                            "start_line": 1,
+                            "end_line": 25,
+                        }),
+                        result_count: 1,
+                    });
+
+                    notebook.append_tool_fact(
+                        format!(
+                            "Leased {} lines 1-25 (header/imports context)",
+                            header_slice.lease.path
+                        ),
+                        Provenance::File {
+                            path: header_slice.lease.path.clone(),
+                            symbol: header_slice.lease.symbol.clone(),
+                            range: header_slice.lease.range,
+                            lease_id: header_slice.lease.id.clone(),
+                        },
+                        Phase::Extract,
+                        vec![header_slice.lease.path.clone()],
+                    );
+
+                    leased_slices.push(header_slice);
+                }
+            }
+
             runtime
                 .progress
                 .emit(AgentProgress::Status(format!("Reading evidence: {}:{}-{}", target.path, target.start_line, target.end_line)))
@@ -2780,5 +2884,184 @@ mod tests {
         assert!(result.answer.content.contains("macOS-schema.json"));
         assert!(result.answer.content.contains("build.rs"));
         assert!(result.answer.content.contains("AIConversation.tsx"));
+    }
+
+    #[tokio::test]
+    async fn test_header_and_focal_window_slicing_for_large_files() {
+        struct LargeFileMockLlm;
+
+        #[async_trait]
+        impl LlmClient for LargeFileMockLlm {
+            async fn complete_json(&self, request: LlmRequest) -> Result<LlmResponse> {
+                let raw_json = match request.phase {
+                    Phase::Intake => r#"{
+                        "reasoning": "User looking for deep routing logic in large file.",
+                        "needs_workspace_search": true,
+                        "intents": [
+                            {
+                                "intent": "WorkspaceSearch",
+                                "summary": "Find deep routing in monolithic file",
+                                "needs_workspace_search": true,
+                                "direct_response": null,
+                                "search_queries": ["DeepProfileRoute", "route"]
+                            }
+                        ],
+                        "target_hints": ["MonolithicRoutes"],
+                        "constraints": []
+                    }"#.to_string(),
+                    Phase::IntakeCritic => r#"{
+                        "approved": true,
+                        "critique": "Draft is well structured.",
+                        "has_dropped_clauses": false,
+                        "has_contaminated_queries": false,
+                        "corrected_intents": []
+                    }"#.to_string(),
+                    Phase::CandidateGateOptimist | Phase::CandidateGateSkeptic => r#"{
+                        "evaluations": [
+                            {
+                                "path": "src/MonolithicRoutes.tsx",
+                                "keep": true,
+                                "confidence": 0.95,
+                                "reason": "Direct implementation of deep routing logic with framework imports"
+                            }
+                        ]
+                    }"#.to_string(),
+                    _ => "{}".to_string(),
+                };
+
+                Ok(LlmResponse {
+                    call_id: request.call_id,
+                    raw_json,
+                    usage: crate::traits::LlmUsage::default(),
+                })
+            }
+        }
+
+        #[async_trait]
+        impl TokenCounter for LargeFileMockLlm {
+            async fn count_tokens(&self, text: &str) -> usize {
+                text.len() / 4
+            }
+        }
+
+        struct LargeFileMockSearch;
+
+        #[async_trait]
+        impl CodeSearch for LargeFileMockSearch {
+            async fn repo_map(&self, _max_entries: usize) -> Result<Vec<String>> {
+                Ok(vec!["src/MonolithicRoutes.tsx".to_string()])
+            }
+            async fn search(&self, _query: &str, _limit: usize) -> Result<Vec<FileHit>> {
+                Ok(vec![FileHit {
+                    path: "src/MonolithicRoutes.tsx".to_string(),
+                    score: 80,
+                }])
+            }
+            async fn search_symbols(&self, _query: &str, _limit: usize) -> Result<Vec<SymbolHit>> {
+                Ok(Vec::new())
+            }
+            async fn search_vector(&self, _query: &str, _limit: usize) -> Result<Vec<VectorHit>> {
+                Ok(vec![VectorHit {
+                    path: "src/MonolithicRoutes.tsx".to_string(),
+                    start_line: 450,
+                    end_line: 510,
+                    symbol: Some("DeepProfileRoute".to_string()),
+                    snippet: "export function DeepProfileRoute() { ... }".to_string(),
+                    score: 0.85,
+                }])
+            }
+            async fn search_related_symbols(
+                &self,
+                _relation: crate::types::SymbolRelation,
+                _query: &str,
+                _limit: usize,
+            ) -> Result<Vec<SymbolHit>> {
+                Ok(Vec::new())
+            }
+            async fn search_content(&self, _query: &str, _limit: usize) -> Result<Vec<ContentHit>> {
+                Ok(Vec::new())
+            }
+        }
+
+        struct LargeFileMockReader;
+
+        #[async_trait]
+        impl FileReader for LargeFileMockReader {
+            async fn read_file(&self, _path: &str, _max_chars: usize) -> Result<EvidenceSlice> {
+                Err(anyhow::anyhow!("not implemented for mock"))
+            }
+            async fn read_range(
+                &self,
+                path: &str,
+                symbol: Option<&str>,
+                start_line: u32,
+                end_line: u32,
+                _max_chars: usize,
+            ) -> Result<EvidenceSlice> {
+                let text = if start_line == 1 && end_line == 25 {
+                    "import { Router, Route } from '@solidjs/router';\nimport { createSignal } from 'solid-js';"
+                } else {
+                    "export function DeepProfileRoute() {\n  return <Route path='/profile' />;\n}"
+                };
+
+                Ok(EvidenceSlice {
+                    lease: crate::notebook::EvidenceLease::new(
+                        path.to_string(),
+                        symbol.map(ToString::to_string),
+                        crate::notebook::LineRange {
+                            start: start_line as usize,
+                            end: end_line as usize,
+                        },
+                        text,
+                    ),
+                    content: text.to_string(),
+                })
+            }
+            async fn verify_lease(&self, _lease: &crate::notebook::EvidenceLease) -> Result<crate::types::LeaseStatus> {
+                Ok(crate::types::LeaseStatus::Valid)
+            }
+        }
+
+        let task = TaskRequest {
+            run_id: "test-large-file-run".to_string(),
+            session_id: "test-large-file-session".to_string(),
+            workspace_path: None,
+            question: "where does the DeepProfileRoute get defined in the monolithic routes file".to_string(),
+            conversation: Vec::new(),
+            budgets: crate::types::Budgets::default(),
+            intake_only: false,
+        };
+
+        let progress = CollectProgress {
+            messages: std::sync::Arc::new(Mutex::new(Vec::new())),
+        };
+
+        let result = run_agent(
+            task,
+            AgentRuntime {
+                llm: &LargeFileMockLlm,
+                code_search: &LargeFileMockSearch,
+                file_reader: &LargeFileMockReader,
+                token_counter: &LargeFileMockLlm,
+                progress: &progress,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.answer.stop_reason, StopReason::Done);
+
+        // Active notebook leases must contain BOTH header/imports context and the focal chunk
+        let entries = result.answer.notebook.active_entries();
+        let header_lease = entries.iter().find(|e| e.statement.contains("lines 1-25 (header/imports context)"));
+        assert!(header_lease.is_some(), "Expected header/imports context lease in notebook, got: {:?}", entries.iter().map(|e| &e.statement).collect::<Vec<_>>());
+
+        let focal_lease = entries.iter().find(|e| e.statement.contains("lines 450-510"));
+        assert!(focal_lease.is_some(), "Expected focal range lease in notebook, got: {:?}", entries.iter().map(|e| &e.statement).collect::<Vec<_>>());
+
+        // Report must include both slices
+        assert!(result.answer.content.contains("src/MonolithicRoutes.tsx"));
+        assert!(result.answer.content.contains("DeepProfileRoute"));
+        assert!(result.answer.content.contains("@solidjs/router"));
     }
 }

@@ -553,6 +553,7 @@ pub fn prompt_candidate_gate_optimist(
     out.push_str("1. Entrypoint & Root Mount Context: Keep application entrypoints and mount files that bootstrap the primary UI hierarchy. Even if an entrypoint only renders a root component or sets up top-level providers, it provides vital evidence regarding framework selection, top-level providers, and top-level architecture.\n");
     out.push_str("2. Root Shells & View Switching: Keep main application shells and screen components. Modern UI applications frequently implement navigation and routing via conditional view switching, screen state signals, or panel containers rather than dedicated routing packages. These view-switching components are primary routing configurations.\n");
     out.push_str("3. Structural Context: Keep candidates that define state signals, lifecycle hooks, or data contracts that govern the requested feature.\n");
+    out.push_str("4. Alternative & Negative Evidence: When a request asks where an architectural capability (such as routing, navigation, or views) is configured, and the codebase handles it via conditional view switching or state signals rather than a standalone router library, the root component shell demonstrating this alternative IS primary evidence and must be kept.\n");
     out.push_str("If there is a valid architectural justification to keep a candidate for downstream synthesis, advocate for it with keep: true.\n\n");
     out.push_str("Return a JSON object matching schema `CandidateGateOutput` with an evaluation for each candidate.\n");
     out
@@ -571,7 +572,7 @@ pub fn prompt_candidate_gate_skeptic(
     out.push_str("1. Coincidental Matches: Drop candidates that only match keywords coincidentally without implementing or configuring the requested capability.\n");
     out.push_str("2. Generic Utilities: Drop isolated utility helpers (e.g. DOM manipulation, syntax highlighting, text formatting, or generic handlers) that do not configure core views or logic.\n");
     out.push_str("3. Stylesheets & Pure Presentation: Drop CSS/styling files unless the user explicitly requested styling rules.\n");
-    out.push_str("4. False Positives: If a candidate does not directly implement or define the target feature, reject it with keep: false.\n\n");
+    out.push_str("4. False Positives: If a candidate does not directly implement or define the target feature, reject it with keep: false. Note: Do not reject main application component shells that house the view rendering, screen state, or layout for the application.\n\n");
     out.push_str("Return a JSON object matching schema `CandidateGateOutput` with an evaluation for each candidate.\n");
     out
 }
