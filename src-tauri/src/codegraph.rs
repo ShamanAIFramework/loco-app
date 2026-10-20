@@ -447,6 +447,34 @@ impl CodeGraphStore {
         Ok(res)
     }
 
+    /// Retrieves parsed symbols for a given relative path in a project.
+    pub fn symbols_for_path(&self, project_id: &str, rel_path: &str) -> Result<Vec<Symbol>> {
+        let guard = self.conn.lock().map_err(|_| anyhow!("Mutex poisoned"))?;
+        let mut stmt = guard.prepare(
+            "SELECT s.id, s.file_id, s.name, s.kind, s.line, s.start_line, s.end_line, s.content_hash
+             FROM symbols s
+             JOIN files f ON f.id = s.file_id
+             WHERE f.project_id = ?1 AND f.path = ?2
+             ORDER BY s.start_line ASC, s.name ASC",
+        )?;
+
+        let res = stmt
+            .query_map(params![project_id, rel_path], |row| {
+                Ok(Symbol {
+                    id: row.get(0)?,
+                    file_id: row.get(1)?,
+                    name: row.get(2)?,
+                    kind: row.get(3)?,
+                    line: row.get(4)?,
+                    start_line: row.get(5)?,
+                    end_line: row.get(6)?,
+                    content_hash: row.get(7)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(res)
+    }
+
     /// Retrieves parsed symbols for all files in a project.
     pub fn project_symbols(&self, project_id: &str) -> Result<Vec<Symbol>> {
         let guard = self.conn.lock().map_err(|_| anyhow!("Mutex poisoned"))?;
@@ -710,6 +738,11 @@ mod tests {
         let edge_hits = store.search_symbols(&proj.id, "println").unwrap();
         assert!(edge_hits.iter().any(|(_, symbol)| symbol.name == "main"));
         assert!(edge_hits.iter().any(|(_, symbol)| symbol.name == "helper"));
+
+        let path_symbols = store.symbols_for_path(&proj.id, "src/main.rs").unwrap();
+        assert_eq!(path_symbols.len(), 2);
+        assert_eq!(path_symbols[0].name, "main");
+        assert_eq!(path_symbols[1].name, "helper");
 
         store.clear_file_symbols(&file.id).unwrap();
         assert!(store.file_symbols(&file.id).unwrap().is_empty());

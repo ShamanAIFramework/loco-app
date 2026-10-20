@@ -65,6 +65,9 @@ fn default_max_evidence_tokens() -> usize {
 pub enum Phase {
     Intake,
     IntakeCritic,
+    CandidateGate,
+    CandidateGateOptimist,
+    CandidateGateSkeptic,
     Plan,
     Extract,
     Synthesize,
@@ -249,6 +252,18 @@ pub struct VectorHit {
     pub symbol: Option<String>,
     pub snippet: String,
     pub score: f32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CandidateEvaluation {
+    pub path: String,
+    pub keep: bool,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CandidateGateOutput {
+    pub evaluations: Vec<CandidateEvaluation>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

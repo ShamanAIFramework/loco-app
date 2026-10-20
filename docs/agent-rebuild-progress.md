@@ -313,6 +313,13 @@ Rebuild the orchestrator and `agentv2` behavior so deterministic Rust code contr
   - deterministic retrieval uses already-found seed files plus intake queries to add nearby documentation before extraction, improving subsystem research without model-selected tools
   - Tauri ranks domain-matching docs in the seed's local package/docs scope above distant ancestors while rejecting sibling package docs
   - added regression coverage that nearby context docs are read as leased evidence and that package-local docs outrank global docs without sibling noise
+- Added Stereoscopic Gating Pattern:
+  - Implemented dual-lens dialectical verification across critical pipeline boundaries to eliminate local-model blind spots and recall-vs-precision trade-offs:
+    1. **Stereoscopic Intent Gate**: Evaluates user prompts with `Phase::Intake` (generator) and `Phase::IntakeCritic` (adversary), normalized by `TriadConsensus` to prevent dropped clauses or intent collapse.
+    2. **Stereoscopic Evidence Gate**: Evaluates top 10 retrieved candidates with `Phase::CandidateGateOptimist` (inclusion scout for entrypoints, root shells, state signals) and `Phase::CandidateGateSkeptic` (precision pruner for false positives, stylesheets, utilities).
+  - Built a deterministic Rust Host Arbiter that reconciles votes using CodeGraph AST import edges, topology distance, entrypoint identity, and domain constraints without calling a third LLM.
+  - Added `CodeGraphStore::symbols_for_path` and `CodeSearch::search_file_symbols` to resolve component definitions directly from indexed Tree-sitter symbols.
+  - Added unit and regression tests verifying split-decision arbitration, topology discovery, prompt portability, and noise elimination.
 
 ## Verified
 

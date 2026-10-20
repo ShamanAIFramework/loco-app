@@ -1,7 +1,9 @@
 use crate::notebook::{Notebook, Provenance};
 use crate::prompt::{
     global_prefix, intake_critic_instruction, intake_instruction, phase_prefix,
-    schema_intake, schema_intake_critic, task_block, PromptParts,
+    prompt_candidate_gate_optimist, prompt_candidate_gate_skeptic,
+    schema_candidate_gate, schema_intake, schema_intake_critic,
+    task_block, CandidateGateItem, PromptParts,
 };
 use crate::trace::{Trace, TraceEvent};
 use crate::traits::{
@@ -9,8 +11,9 @@ use crate::traits::{
     TokenCounter,
 };
 use crate::types::{
-    AgentAnswer, ContentHit, CriticOutput, EvidenceSlice, FileHit, IntakeOutput, IntentItem,
-    Phase, StopReason, SymbolHit, TaskRequest, TriadConsensus, UserIntent, VectorHit,
+    AgentAnswer, CandidateGateOutput, ContentHit, CriticOutput, EvidenceSlice, FileHit,
+    IntakeOutput, IntentItem, Phase, StopReason, SymbolHit, TaskRequest, TriadConsensus,
+    UserIntent, VectorHit,
 };
 use anyhow::{Context, Result};
 use serde::de::DeserializeOwned;
@@ -220,6 +223,8 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
     let mut all_symbol_hits: Vec<SymbolHit> = Vec::new();
     let mut all_vector_hits: Vec<VectorHit> = Vec::new();
     let mut all_content_hits: Vec<ContentHit> = Vec::new();
+    let mut expanded_hits: Vec<ExpandedHitDetail> = Vec::new();
+    let mut pruned_candidates: Vec<PrunedCandidateDetail> = Vec::new();
     let mut leased_slices: Vec<EvidenceSlice> = Vec::new();
 
     if intake.needs_workspace_search {
@@ -300,7 +305,13 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
         // 1. Top symbol hits (highest structural precision)
         all_symbol_hits.sort_by(|a, b| b.score.cmp(&a.score));
         for sym in &all_symbol_hits {
-            if is_excluded_plumbing(&sym.path, &task.question) {
+            if let Some(reason) = candidate_exclusion_reason(&sym.path, &task.question) {
+                if !pruned_candidates.iter().any(|p| p.path == sym.path) {
+                    pruned_candidates.push(PrunedCandidateDetail {
+                        path: sym.path.clone(),
+                        reason: reason.to_string(),
+                    });
+                }
                 continue;
             }
             if !candidate_targets.iter().any(|t| t.path == sym.path && t.symbol.as_deref() == Some(&sym.symbol)) {
@@ -318,7 +329,16 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
         // 2. Top vector hits (dense semantic similarity)
         all_vector_hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
         for v in &all_vector_hits {
-            if is_excluded_plumbing(&v.path, &task.question) || v.score < 0.15 {
+            if let Some(reason) = candidate_exclusion_reason(&v.path, &task.question) {
+                if !pruned_candidates.iter().any(|p| p.path == v.path) {
+                    pruned_candidates.push(PrunedCandidateDetail {
+                        path: v.path.clone(),
+                        reason: reason.to_string(),
+                    });
+                }
+                continue;
+            }
+            if v.score < 0.15 {
                 continue;
             }
             let overlaps = candidate_targets.iter().any(|t| {
@@ -339,7 +359,16 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
         // 3. Top content hits
         all_content_hits.sort_by(|a, b| b.score.cmp(&a.score));
         for ch in &all_content_hits {
-            if is_excluded_plumbing(&ch.path, &task.question) || ch.score < 40 {
+            if let Some(reason) = candidate_exclusion_reason(&ch.path, &task.question) {
+                if !pruned_candidates.iter().any(|p| p.path == ch.path) {
+                    pruned_candidates.push(PrunedCandidateDetail {
+                        path: ch.path.clone(),
+                        reason: reason.to_string(),
+                    });
+                }
+                continue;
+            }
+            if ch.score < 40 {
                 continue;
             }
             let start = ch.start_line.saturating_sub(4).max(1);
@@ -362,7 +391,16 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
         // 4. Top path hits
         all_path_hits.sort_by(|a, b| b.score.cmp(&a.score));
         for ph in &all_path_hits {
-            if is_excluded_plumbing(&ph.path, &task.question) || ph.score < 50 {
+            if let Some(reason) = candidate_exclusion_reason(&ph.path, &task.question) {
+                if !pruned_candidates.iter().any(|p| p.path == ph.path) {
+                    pruned_candidates.push(PrunedCandidateDetail {
+                        path: ph.path.clone(),
+                        reason: reason.to_string(),
+                    });
+                }
+                continue;
+            }
+            if ph.score < 50 {
                 continue;
             }
             if !candidate_targets.iter().any(|t| t.path == ph.path) {
@@ -377,7 +415,7 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
             }
         }
 
-        // If the question is about UI, prioritize frontend files and entrypoints
+        // --- Pass A2: Domain alignment & hygiene pruning ---
         let q_lower = task.question.to_lowercase();
         let is_ui_question = q_lower.contains("ui")
             || q_lower.contains("screen")
@@ -386,32 +424,336 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
             || q_lower.contains("navigation")
             || q_lower.contains("frontend");
 
+        let has_frontend_candidates = candidate_targets.iter().any(|t| {
+            let p = t.path.to_lowercase();
+            p.ends_with(".tsx")
+                || p.ends_with(".jsx")
+                || p.ends_with(".vue")
+                || p.ends_with(".svelte")
+                || p.ends_with(".html")
+        });
+
         if is_ui_question {
             for target in &mut candidate_targets {
                 let p = target.path.to_lowercase();
-                if p.ends_with(".tsx")
+                let is_frontend_ext = p.ends_with(".tsx")
                     || p.ends_with(".jsx")
                     || p.ends_with(".vue")
                     || p.ends_with(".svelte")
                     || p.ends_with(".html")
-                    || p.ends_with(".css")
-                {
+                    || p.ends_with(".css");
+
+                if is_frontend_ext {
                     target.score += 40;
-                }
-                if p.contains("app.") || p.contains("main.") || p.contains("index.") {
-                    target.score += 30;
+                    if !p.ends_with(".css")
+                        && (p.contains("app.")
+                            || p.contains("index.")
+                            || p.contains("main.")
+                            || p.contains("routes.")
+                            || p.contains("router."))
+                    {
+                        target.score += 30;
+                    }
+                } else if has_frontend_candidates
+                    && (p.ends_with(".rs") || p.contains("src-tauri/") || p.contains("server/"))
+                {
+                    target.score = -100;
+                    if !pruned_candidates.iter().any(|pr| pr.path == target.path) {
+                        pruned_candidates.push(PrunedCandidateDetail {
+                            path: target.path.clone(),
+                            reason: "Domain mismatch (Backend Rust logic filtered out for UI/frontend intent)".to_string(),
+                        });
+                    }
                 }
             }
         }
 
-        // Sort candidate targets by score descending
+        // Retain only candidates with positive score and sort descending before graph expansion
+        candidate_targets.retain(|t| t.score > 0);
+        candidate_targets.sort_by(|a, b| b.score.cmp(&a.score));
+
+        // --- Pass B: CodeGraph Topology Expansion (Unexpected Matches) ---
+        let mut seed_paths: Vec<String> = Vec::new();
+        for t in &candidate_targets {
+            if !seed_paths.contains(&t.path) && seed_paths.len() < 3 {
+                seed_paths.push(t.path.clone());
+            }
+        }
+
+        if !seed_paths.is_empty() {
+            runtime
+                .progress
+                .emit(AgentProgress::Status("Expanding CodeGraph topology for connected components".to_string()))
+                .await;
+
+            let imported = runtime.code_search.search_imported_files(&seed_paths, 20).await.unwrap_or_default();
+            record_trace!(TraceEvent::ToolCall {
+                name: "search_imported_files".to_string(),
+                args: json!({ "seed_paths": seed_paths, "limit": 20 }),
+                result_count: imported.len(),
+            });
+
+            for imp in imported {
+                if let Some(reason) = candidate_exclusion_reason(&imp.path, &task.question) {
+                    if !pruned_candidates.iter().any(|p| p.path == imp.path) {
+                        pruned_candidates.push(PrunedCandidateDetail {
+                            path: imp.path.clone(),
+                            reason: format!("CodeGraph imported file excluded: {}", reason),
+                        });
+                    }
+                    continue;
+                }
+                if is_ui_question && has_frontend_candidates && (imp.path.ends_with(".rs") || imp.path.contains("src-tauri/")) {
+                    continue;
+                }
+                if !candidate_targets.iter().any(|t| t.path == imp.path) {
+                    expanded_hits.push(ExpandedHitDetail {
+                        path: imp.path.clone(),
+                        source_seed: seed_paths.join(", "),
+                        reason: "Imported by seed entrypoint in CodeGraph".to_string(),
+                    });
+
+                    // Check if there is a primary symbol in this newly discovered file
+                    let stem = std::path::Path::new(&imp.path)
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("");
+                    let mut syms = runtime.code_search.search_file_symbols(&imp.path).await.unwrap_or_default();
+                    if syms.is_empty() && !stem.is_empty() {
+                        syms = runtime
+                            .code_search
+                            .search_symbols(stem, 25)
+                            .await
+                            .unwrap_or_default()
+                            .into_iter()
+                            .filter(|s| s.path == imp.path)
+                            .collect();
+                    }
+
+                    // Find primary symbol: prefers symbol matching file stem, or component/function with largest span
+                    let matched_sym = syms
+                        .iter()
+                        .find(|s| s.symbol.eq_ignore_ascii_case(stem))
+                        .cloned()
+                        .or_else(|| {
+                            syms.into_iter().max_by_key(|s| s.end_line.saturating_sub(s.start_line))
+                        });
+
+                    if let Some(sym) = matched_sym {
+                        // For large components (> 200 lines), target the render / return block at the end
+                        let (s_line, e_line) = if sym.end_line > sym.start_line + 200 {
+                            (sym.end_line.saturating_sub(120).max(sym.start_line), sym.end_line)
+                        } else {
+                            (sym.start_line, sym.end_line)
+                        };
+                        candidate_targets.push(SliceTarget {
+                            path: imp.path.clone(),
+                            symbol: Some(sym.symbol.clone()),
+                            start_line: s_line,
+                            end_line: e_line,
+                            score: imp.score + 100, // Strong boost for topology-discovered root component
+                            source: format!("CodeGraph topology (imported component `{}`)", sym.symbol),
+                        });
+                    } else {
+                        candidate_targets.push(SliceTarget {
+                            path: imp.path.clone(),
+                            symbol: None,
+                            start_line: 1,
+                            end_line: 250,
+                            score: imp.score + 70,
+                            source: "CodeGraph topology (imported file)".to_string(),
+                        });
+                    }
+                }
+            }
+        }
+
+        // Re-sort candidate targets with newly expanded hits included
         candidate_targets.sort_by(|a, b| b.score.cmp(&a.score));
 
         let max_files = task.budgets.max_files_to_read.max(1);
         let max_chars = task.budgets.max_evidence_chars / max_files;
 
-        // Acquire leases
-        for target in candidate_targets.into_iter().take(max_files) {
+        // Take top candidate pool (up to 10 candidates) for stereoscopic relevance evaluation
+        let candidate_pool: Vec<SliceTarget> = candidate_targets.into_iter().take(10).collect();
+        let mut final_targets: Vec<SliceTarget> = Vec::new();
+
+        if candidate_pool.len() >= 2 {
+            runtime
+                .progress
+                .emit(AgentProgress::Status("Executing Stereoscopic Gating (Optimist vs. Skeptic)".to_string()))
+                .await;
+
+            let mut gate_items = Vec::new();
+            for cand in &candidate_pool {
+                let preview = match runtime
+                    .file_reader
+                    .read_range(&cand.path, cand.symbol.as_deref(), cand.start_line, cand.end_line, 2500)
+                    .await
+                {
+                    Ok(slice) => slice.content,
+                    Err(_) => "Preview unavailable".to_string(),
+                };
+                gate_items.push(CandidateGateItem {
+                    path: cand.path.clone(),
+                    symbol: cand.symbol.clone(),
+                    start_line: cand.start_line,
+                    end_line: cand.end_line,
+                    source: cand.source.clone(),
+                    snippet: preview,
+                });
+            }
+
+            let target_intent_summary = intake
+                .intents
+                .iter()
+                .find(|i| i.needs_workspace_search)
+                .map(|i| i.summary.as_str())
+                .unwrap_or(task.question.as_str());
+
+            // --- Lens 1: Optimist (Architectural Scout) ---
+            let opt_prompt = prompt_candidate_gate_optimist(&task.question, target_intent_summary, &gate_items);
+            let opt_req = LlmRequest {
+                call_id: call_id("gate-opt"),
+                phase: Phase::CandidateGateOptimist,
+                schema_name: "CandidateGateOutput".to_string(),
+                schema: schema_candidate_gate(),
+                prompt_parts: None,
+                prompt: opt_prompt,
+                temperature: 0.1,
+            };
+
+            record_trace!(TraceEvent::PhaseStarted {
+                phase: Phase::CandidateGateOptimist,
+            });
+
+            let opt_output: Option<CandidateGateOutput> = match runtime.llm.complete_json(opt_req.clone()).await {
+                Ok(resp) => {
+                    record_trace!(TraceEvent::LlmCall {
+                        request: opt_req,
+                        response: resp.clone(),
+                    });
+                    parse_json::<CandidateGateOutput>(&resp.raw_json).ok()
+                }
+                Err(_) => None,
+            };
+
+            // --- Lens 2: Skeptic (Precision Critic) ---
+            let skep_prompt = prompt_candidate_gate_skeptic(&task.question, target_intent_summary, &gate_items);
+            let skep_req = LlmRequest {
+                call_id: call_id("gate-skep"),
+                phase: Phase::CandidateGateSkeptic,
+                schema_name: "CandidateGateOutput".to_string(),
+                schema: schema_candidate_gate(),
+                prompt_parts: None,
+                prompt: skep_prompt,
+                temperature: 0.1,
+            };
+
+            record_trace!(TraceEvent::PhaseStarted {
+                phase: Phase::CandidateGateSkeptic,
+            });
+
+            let skep_output: Option<CandidateGateOutput> = match runtime.llm.complete_json(skep_req.clone()).await {
+                Ok(resp) => {
+                    record_trace!(TraceEvent::LlmCall {
+                        request: skep_req,
+                        response: resp.clone(),
+                    });
+                    parse_json::<CandidateGateOutput>(&resp.raw_json).ok()
+                }
+                Err(_) => None,
+            };
+
+            // --- Node 3: Deterministic Rust Host Arbiter ---
+            if opt_output.is_none() && skep_output.is_none() {
+                final_targets = candidate_pool.clone();
+            } else {
+                for cand in &candidate_pool {
+                    let opt_eval = opt_output
+                        .as_ref()
+                        .and_then(|o| o.evaluations.iter().find(|e| e.path == cand.path));
+                    let skep_eval = skep_output
+                        .as_ref()
+                        .and_then(|s| s.evaluations.iter().find(|e| e.path == cand.path));
+
+                    let opt_keep = opt_eval.map(|e| e.keep).unwrap_or(true);
+                    let skep_keep = skep_eval.map(|e| e.keep).unwrap_or(false);
+
+                    let p_lower = cand.path.to_lowercase();
+                    let has_topology_backing = cand.source.contains("CodeGraph topology")
+                        || seed_paths.contains(&cand.path);
+                    let is_entrypoint_or_shell = p_lower.contains("index.")
+                        || p_lower.contains("app.")
+                        || p_lower.contains("main.")
+                        || p_lower.contains("routes.")
+                        || p_lower.contains("router.");
+                    let is_domain_aligned = if is_ui_question {
+                        !p_lower.ends_with(".css")
+                            && (p_lower.ends_with(".tsx")
+                                || p_lower.ends_with(".jsx")
+                                || p_lower.ends_with(".vue")
+                                || p_lower.ends_with(".svelte")
+                                || p_lower.ends_with(".html"))
+                    } else {
+                        true
+                    };
+
+                    // Stereoscopic Consensus Matrix
+                    if opt_keep && skep_keep {
+                        // Unanimous Keep
+                        final_targets.push(cand.clone());
+                    } else if !opt_keep && !skep_keep {
+                        // Unanimous Drop
+                        let reason = skep_eval
+                            .map(|e| e.reason.as_str())
+                            .or_else(|| opt_eval.map(|e| e.reason.as_str()))
+                            .unwrap_or("Stereoscopic Consensus: Pruned by both Optimist and Skeptic");
+                        pruned_candidates.push(PrunedCandidateDetail {
+                            path: cand.path.clone(),
+                            reason: format!("Stereoscopic consensus rejected: {}", reason),
+                        });
+                    } else if opt_keep && !skep_keep {
+                        // Split Decision: Optimist wanted to keep, Skeptic wanted to drop
+                        // Deterministic Host Arbiter tie-breaker:
+                        // Favor inclusion if backed by CodeGraph topology, entrypoint/shell identity, or domain alignment
+                        if (has_topology_backing || is_entrypoint_or_shell) && is_domain_aligned {
+                            final_targets.push(cand.clone());
+                        } else {
+                            let skep_reason = skep_eval.map(|e| e.reason.as_str()).unwrap_or("pruned by Skeptic");
+                            pruned_candidates.push(PrunedCandidateDetail {
+                                path: cand.path.clone(),
+                                reason: format!("Stereoscopic Arbiter pruned (unbacked by CodeGraph topology): {}", skep_reason),
+                            });
+                        }
+                    } else {
+                        // Split Decision: Skeptic wanted to keep, Optimist wanted to drop
+                        // If even the Skeptic found a compelling reason to keep, retain it if domain aligned
+                        if is_domain_aligned {
+                            final_targets.push(cand.clone());
+                        } else {
+                            pruned_candidates.push(PrunedCandidateDetail {
+                                path: cand.path.clone(),
+                                reason: "Stereoscopic Arbiter: Domain mismatch".to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+        } else {
+            final_targets = candidate_pool.clone();
+        }
+
+        // Safety fallback: if all targets were pruned, retain top candidate from vetted candidate_pool
+        // NEVER pull from raw unfiltered all_symbol_hits!
+        if final_targets.is_empty() {
+            if let Some(top_cand) = candidate_pool.into_iter().find(|c| candidate_exclusion_reason(&c.path, &task.question).is_none()) {
+                final_targets.push(top_cand);
+            }
+        }
+
+        // Acquire leases for final verified targets
+        for target in final_targets.into_iter().take(max_files) {
             runtime
                 .progress
                 .emit(AgentProgress::Status(format!("Reading evidence: {}:{}-{}", target.path, target.start_line, target.end_line)))
@@ -488,6 +830,8 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
         all_symbol_hits,
         all_vector_hits,
         all_content_hits,
+        expanded_hits,
+        pruned_candidates,
         leased_slices,
         elapsed_ms: phase2_elapsed_ms,
     };
@@ -794,17 +1138,6 @@ fn validate_and_normalize_intake(intake: &mut IntakeOutput, question: &str) {
                     && !ql.contains("react")
                     && !ql.contains("convention")
             });
-            // If the user asked about UI and search_queries only has "route" or "settings",
-            // ensure UI entrypoint / view concepts are included
-            let is_ui_question = lower.contains("ui") || lower.contains("frontend") || lower.contains("screen") || lower.contains("view");
-            if is_ui_question {
-                if !item.search_queries.iter().any(|q| q.eq_ignore_ascii_case("ui")) {
-                    item.search_queries.push("ui".to_string());
-                }
-                if !item.search_queries.iter().any(|q| q.eq_ignore_ascii_case("app")) {
-                    item.search_queries.push("App".to_string());
-                }
-            }
         }
     }
 
@@ -840,7 +1173,7 @@ fn extract_terms_for_search(question: &str) -> Vec<String> {
     terms
 }
 
-fn is_excluded_plumbing(path: &str, question: &str) -> bool {
+fn candidate_exclusion_reason(path: &str, question: &str) -> Option<&'static str> {
     let q_lower = question.to_lowercase();
     let asks_about_agent = q_lower.contains("agent")
         || q_lower.contains("prompt")
@@ -853,14 +1186,19 @@ fn is_excluded_plumbing(path: &str, question: &str) -> bool {
         || q_lower.contains("llama");
 
     if asks_about_agent {
-        return false;
+        return None;
     }
 
     let p_lower = path.to_lowercase();
-    p_lower.ends_with(".md")
-        || p_lower.contains("crates/agent-")
-        || p_lower.contains("target/")
-        || p_lower.contains("node_modules/")
+
+    // 1. Documentation files (unless user explicitly asks for docs/markdown)
+    let asks_about_docs = q_lower.contains("doc") || q_lower.contains("readme") || q_lower.contains("guide");
+    if !asks_about_docs && p_lower.ends_with(".md") {
+        return Some("Documentation file (.md)");
+    }
+
+    // 2. Internal agent plumbing
+    if p_lower.contains("crates/agent-")
         || p_lower.contains("orchestrator.")
         || p_lower.contains("vector_search.")
         || p_lower.contains("indexer.")
@@ -869,6 +1207,50 @@ fn is_excluded_plumbing(path: &str, question: &str) -> bool {
         || p_lower.contains("trace_writer.")
         || p_lower.contains("engine.")
         || p_lower.contains("src-tauri/src/agent")
+    {
+        return Some("Internal agent / harness plumbing");
+    }
+
+    // 3. Generated schemas and files
+    if p_lower.contains("/gen/")
+        || p_lower.starts_with("gen/")
+        || p_lower.contains("/schemas/")
+        || p_lower.starts_with("schemas/")
+        || p_lower.ends_with(".schema.json")
+    {
+        return Some("Generated JSON schema / codegen artifact");
+    }
+
+    // 4. Build output, dist, caches
+    if p_lower.contains("target/")
+        || p_lower.contains("node_modules/")
+        || p_lower.contains("dist/")
+        || p_lower.contains("/dist/")
+        || p_lower.contains("build/")
+        || p_lower.contains(".git/")
+    {
+        return Some("Build output / dependency directory");
+    }
+
+    // 5. Package lockfiles (unless question asks for dependencies/package/lockfile)
+    let asks_about_deps = q_lower.contains("dependency") || q_lower.contains("package") || q_lower.contains("lockfile");
+    if !asks_about_deps && (p_lower.ends_with(".lock") || p_lower.ends_with("-lock.json")) {
+        return Some("Package manager lockfile");
+    }
+
+    // 6. Build scripts (unless question asks for build/compilation/cargo)
+    let asks_about_build = q_lower.contains("build") || q_lower.contains("compil") || q_lower.contains("cargo");
+    if !asks_about_build && (p_lower.ends_with("build.rs") || p_lower.ends_with("makefile")) {
+        return Some("Auxiliary build script (build.rs)");
+    }
+
+    // 7. Generic JSON files unless question asks about config/schema/json
+    let asks_about_config = q_lower.contains("config") || q_lower.contains("schema") || q_lower.contains("json");
+    if !asks_about_config && p_lower.ends_with(".json") {
+        return Some("Generic JSON asset / metadata");
+    }
+
+    None
 }
 
 fn arbitrate_triad(
@@ -946,17 +1328,11 @@ fn arbitrate_triad(
     }
 }
 
-fn sanitize_search_queries(intents: &mut [IntentItem], q_lower: &str) {
+fn sanitize_search_queries(intents: &mut [IntentItem], _q_lower: &str) {
     let filter_words = [
         "best practices", "best practice", "practices", "aligned with",
-        "aligned", "conventions", "convention", "guidelines", "react", "solid", "how to"
+        "aligned", "conventions", "convention", "guidelines", "how to"
     ];
-
-    let is_ui_question = q_lower.contains("ui")
-        || q_lower.contains("screen")
-        || q_lower.contains("view")
-        || q_lower.contains("route")
-        || q_lower.contains("navigation");
 
     for item in intents.iter_mut() {
         if item.needs_workspace_search {
@@ -964,16 +1340,6 @@ fn sanitize_search_queries(intents: &mut [IntentItem], q_lower: &str) {
                 let ql = q.to_lowercase();
                 !filter_words.iter().any(|&fw| ql == fw || ql.contains(fw))
             });
-
-            // Ensure UI entrypoint / view query is included for UI questions
-            if is_ui_question {
-                if !item.search_queries.iter().any(|q| q.eq_ignore_ascii_case("app")) {
-                    item.search_queries.push("App".to_string());
-                }
-                if !item.search_queries.iter().any(|q| q.eq_ignore_ascii_case("ui")) {
-                    item.search_queries.push("ui".to_string());
-                }
-            }
         }
     }
 }
@@ -1167,6 +1533,19 @@ struct SliceTarget {
 }
 
 #[derive(Clone, Debug)]
+pub struct ExpandedHitDetail {
+    pub path: String,
+    pub source_seed: String,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct PrunedCandidateDetail {
+    pub path: String,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug)]
 struct Phase2Results {
     queries: Vec<String>,
     search_details: Vec<SearchQueryExecution>,
@@ -1174,6 +1553,8 @@ struct Phase2Results {
     all_symbol_hits: Vec<SymbolHit>,
     all_vector_hits: Vec<VectorHit>,
     all_content_hits: Vec<ContentHit>,
+    expanded_hits: Vec<ExpandedHitDetail>,
+    pruned_candidates: Vec<PrunedCandidateDetail>,
     leased_slices: Vec<EvidenceSlice>,
     elapsed_ms: u64,
 }
@@ -1315,6 +1696,33 @@ fn format_step1_and_step2_report(
             "| **Active Evidence Leases in Notebook** | 📦 **{} leased slices** |\n\n",
             phase2.leased_slices.len()
         ));
+
+        if !phase2.expanded_hits.is_empty() {
+            out.push_str("#### 🌐 CodeGraph Topology Expansion (Serendipitous Discovery)\n\n");
+            out.push_str("| Discovered Component | Seed Source | Traversal Type |\n");
+            out.push_str("|---|---|---|\n");
+            for exp in &phase2.expanded_hits {
+                out.push_str(&format!(
+                    "| **`{}`** | `{}` | {} |\n",
+                    exp.path, exp.source_seed, exp.reason
+                ));
+            }
+            out.push_str("\n");
+        }
+
+        if !phase2.pruned_candidates.is_empty() {
+            out.push_str("<details>\n<summary><b>🛡️ Pruned Candidates & False Positives (");
+            out.push_str(&format!("{} filtered)</b></summary>\n\n", phase2.pruned_candidates.len()));
+            out.push_str("| Candidate Path | Exclusion Rationale |\n");
+            out.push_str("|---|---|\n");
+            for pr in &phase2.pruned_candidates {
+                out.push_str(&format!(
+                    "| `{}` | {} |\n",
+                    pr.path, pr.reason
+                ));
+            }
+            out.push_str("\n</details>\n\n");
+        }
 
         if phase2.leased_slices.is_empty() {
             out.push_str("> ⚠️ **No evidence slices were leased.** No files or symbols matched the search queries in the active workspace.\n\n");
@@ -1501,6 +1909,13 @@ mod tests {
                     "has_dropped_clauses": false,
                     "has_contaminated_queries": false,
                     "corrected_intents": null
+                }"#
+                .to_string()
+            } else if request.phase == Phase::CandidateGate {
+                r#"{
+                    "evaluations": [
+                        { "path": "src/routes.tsx", "keep": true, "reason": "Configures application routing" }
+                    ]
                 }"#
                 .to_string()
             } else {
@@ -2153,5 +2568,198 @@ mod tests {
         assert!(result.answer.content.contains("Detected Intents (2)"));
         assert!(result.answer.content.contains("WorkspaceSearch"));
         assert!(result.answer.content.contains("GeneralQuestion"));
+    }
+
+    #[tokio::test]
+    async fn test_phase2_expands_topology_and_candidate_gate_prunes_noise() {
+        struct TopologyMockLlm;
+
+        #[async_trait]
+        impl LlmClient for TopologyMockLlm {
+            async fn complete_json(&self, request: LlmRequest) -> Result<LlmResponse> {
+                let raw_json = match request.phase {
+                    Phase::Intake => r#"{
+                        "reasoning": "User asks where UI configures route settings and best practices.",
+                        "needs_workspace_search": true,
+                        "intents": [
+                            {
+                                "intent": "WorkspaceSearch",
+                                "summary": "Locate UI route settings configuration in codebase",
+                                "needs_workspace_search": true,
+                                "direct_response": null,
+                                "search_queries": ["route", "view"]
+                            },
+                            {
+                                "intent": "GeneralQuestion",
+                                "summary": "Routing best practices",
+                                "needs_workspace_search": false,
+                                "direct_response": "Declarative routes are recommended.",
+                                "search_queries": []
+                            }
+                        ],
+                        "target_hints": ["route"],
+                        "constraints": []
+                    }"#.to_string(),
+                    Phase::IntakeCritic => r#"{
+                        "approved": true,
+                        "critique": "Approved decomposition.",
+                        "has_dropped_clauses": false,
+                        "has_contaminated_queries": false,
+                        "corrected_intents": null
+                    }"#.to_string(),
+                    Phase::CandidateGate | Phase::CandidateGateOptimist => r#"{
+                        "evaluations": [
+                            { "path": "src/App.tsx", "keep": true, "reason": "Configures root UI view and screen state switching" },
+                            { "path": "src/index.tsx", "keep": true, "reason": "Entrypoint mounting application root" },
+                            { "path": "src/AIConversation.tsx", "keep": false, "reason": "Chat message list display, does not configure view routes" }
+                        ]
+                    }"#.to_string(),
+                    Phase::CandidateGateSkeptic => r#"{
+                        "evaluations": [
+                            { "path": "src/App.tsx", "keep": true, "reason": "Direct view routing configuration" },
+                            { "path": "src/index.tsx", "keep": false, "reason": "Just the entrypoint mounting App" },
+                            { "path": "src/AIConversation.tsx", "keep": false, "reason": "DOM copy helper and prose styling" }
+                        ]
+                    }"#.to_string(),
+                    _ => "{}".to_string(),
+                };
+
+                Ok(LlmResponse {
+                    call_id: request.call_id,
+                    raw_json,
+                    usage: crate::traits::LlmUsage::default(),
+                })
+            }
+        }
+
+        #[async_trait]
+        impl TokenCounter for TopologyMockLlm {
+            async fn count_tokens(&self, text: &str) -> usize {
+                text.len() / 4
+            }
+        }
+
+        struct TopologyMockSearch;
+
+        #[async_trait]
+        impl CodeSearch for TopologyMockSearch {
+            async fn repo_map(&self, _max_entries: usize) -> Result<Vec<String>> {
+                Ok(Vec::new())
+            }
+            async fn search(&self, _query: &str, _limit: usize) -> Result<Vec<FileHit>> {
+                Ok(vec![
+                    FileHit { path: "src/index.tsx".to_string(), score: 90 },
+                    FileHit { path: "src-tauri/gen/schemas/macOS-schema.json".to_string(), score: 85 },
+                    FileHit { path: "src-tauri/build.rs".to_string(), score: 80 },
+                    FileHit { path: "src-tauri/src/main.rs".to_string(), score: 75 },
+                ])
+            }
+            async fn search_symbols(&self, query: &str, _limit: usize) -> Result<Vec<SymbolHit>> {
+                if query == "App" {
+                    Ok(vec![SymbolHit {
+                        path: "src/App.tsx".to_string(),
+                        symbol: "App".to_string(),
+                        kind: "Component".to_string(),
+                        start_line: 17,
+                        end_line: 171,
+                        score: 95,
+                    }])
+                } else {
+                    Ok(vec![SymbolHit {
+                        path: "src/AIConversation.tsx".to_string(),
+                        symbol: "AIConversation".to_string(),
+                        kind: "Component".to_string(),
+                        start_line: 99,
+                        end_line: 134,
+                        score: 70,
+                    }])
+                }
+            }
+            async fn search_vector(&self, _query: &str, _limit: usize) -> Result<Vec<VectorHit>> {
+                Ok(Vec::new())
+            }
+            async fn search_related_symbols(
+                &self,
+                _relation: crate::types::SymbolRelation,
+                _query: &str,
+                _limit: usize,
+            ) -> Result<Vec<SymbolHit>> {
+                Ok(Vec::new())
+            }
+            async fn search_content(&self, _query: &str, _limit: usize) -> Result<Vec<ContentHit>> {
+                Ok(Vec::new())
+            }
+            async fn search_imported_files(&self, seed_paths: &[String], _limit: usize) -> Result<Vec<FileHit>> {
+                if seed_paths.contains(&"src/index.tsx".to_string()) {
+                    Ok(vec![FileHit { path: "src/App.tsx".to_string(), score: 95 }])
+                } else {
+                    Ok(Vec::new())
+                }
+            }
+            async fn search_file_symbols(&self, path: &str) -> Result<Vec<SymbolHit>> {
+                if path == "src/App.tsx" {
+                    Ok(vec![SymbolHit {
+                        path: "src/App.tsx".to_string(),
+                        symbol: "App".to_string(),
+                        kind: "Component".to_string(),
+                        start_line: 17,
+                        end_line: 171,
+                        score: 95,
+                    }])
+                } else {
+                    Ok(Vec::new())
+                }
+            }
+        }
+
+        let task = TaskRequest {
+            run_id: "test-topo-run".to_string(),
+            session_id: "test-topo-session".to_string(),
+            workspace_path: None,
+            question: "where does our Ui configure the route settings, and is it aligned with best practices".to_string(),
+            conversation: Vec::new(),
+            budgets: crate::types::Budgets::default(),
+            intake_only: false,
+        };
+
+        let progress = CollectProgress {
+            messages: std::sync::Arc::new(Mutex::new(Vec::new())),
+        };
+
+        let result = run_agent(
+            task,
+            AgentRuntime {
+                llm: &TopologyMockLlm,
+                code_search: &TopologyMockSearch,
+                file_reader: &MockReader,
+                token_counter: &TopologyMockLlm,
+                progress: &progress,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.answer.stop_reason, StopReason::Done);
+
+        // Active notebook leases must contain App.tsx and index.tsx
+        let leased_paths: Vec<String> = result.answer.notebook.active_entries().iter().map(|e| e.statement.clone()).collect();
+        assert!(leased_paths.iter().any(|s| s.contains("src/App.tsx")), "Expected src/App.tsx in leases, got: {:?}", leased_paths);
+        assert!(leased_paths.iter().any(|s| s.contains("src/index.tsx")), "Expected src/index.tsx in leases, got: {:?}", leased_paths);
+
+        // Noise and pruned candidates must NOT be in leases
+        assert!(!leased_paths.iter().any(|s| s.contains("macOS-schema.json")));
+        assert!(!leased_paths.iter().any(|s| s.contains("build.rs")));
+        assert!(!leased_paths.iter().any(|s| s.contains("AIConversation.tsx")));
+        assert!(!leased_paths.iter().any(|s| s.contains("main.rs")));
+
+        // Report must document CodeGraph Topology Expansion
+        assert!(result.answer.content.contains("CodeGraph Topology Expansion"));
+        assert!(result.answer.content.contains("src/App.tsx"));
+
+        // Report must document Pruned Candidates
+        assert!(result.answer.content.contains("Pruned Candidates & False Positives"));
+        assert!(result.answer.content.contains("macOS-schema.json"));
+        assert!(result.answer.content.contains("build.rs"));
+        assert!(result.answer.content.contains("AIConversation.tsx"));
     }
 }

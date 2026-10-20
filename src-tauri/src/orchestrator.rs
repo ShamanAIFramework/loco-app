@@ -732,6 +732,31 @@ impl CodeSearch for TauriCodeSearch {
         .context("Failed to join symbol search task")?
     }
 
+    async fn search_file_symbols(&self, path: &str) -> Result<Vec<SymbolHit>> {
+        let Some(project_id) = self.project_id.clone() else {
+            return Ok(Vec::new());
+        };
+        let app = self.app.clone();
+        let path = path.to_string();
+        tauri::async_runtime::spawn_blocking(move || {
+            let state = app.state::<AppState>();
+            let symbols = state.codegraph.symbols_for_path(&project_id, &path)?;
+            Ok(symbols
+                .into_iter()
+                .map(|s| SymbolHit {
+                    path: path.clone(),
+                    symbol: s.name,
+                    kind: s.kind,
+                    start_line: s.start_line,
+                    end_line: s.end_line,
+                    score: 100,
+                })
+                .collect())
+        })
+        .await
+        .context("Failed to join file symbols task")?
+    }
+
     async fn search_vector(&self, query: &str, limit: usize) -> Result<Vec<VectorHit>> {
         let Some(project_id) = self.project_id.clone() else {
             return Ok(Vec::new());

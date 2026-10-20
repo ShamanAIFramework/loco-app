@@ -90,6 +90,9 @@ pub trait CodeSearch: Send + Sync {
     ) -> Result<Vec<FileHit>> {
         Ok(Vec::new())
     }
+    async fn search_file_symbols(&self, _path: &str) -> Result<Vec<SymbolHit>> {
+        Ok(Vec::new())
+    }
     async fn search(&self, query: &str, limit: usize) -> Result<Vec<FileHit>>;
     async fn search_symbols(&self, query: &str, limit: usize) -> Result<Vec<SymbolHit>>;
     async fn search_vector(&self, _query: &str, _limit: usize) -> Result<Vec<VectorHit>> {

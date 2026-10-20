@@ -10,6 +10,30 @@ This project is a local-first coding agent built around a deterministic Rust har
 - Keep context small and specific. Prefer indexed file/symbol search, narrow evidence ranges, and structured notebook entries over dumping broad tool lists or whole repo text.
 - Use source chips/events for UI source display. Do not put notebook ids, lease ids, hashes, or raw source bullet lists into the assistant answer text.
 
+## Stereoscopic Gating Pattern
+
+To overcome the recall-vs-precision trade-offs and context limits of local models (7B–14B), critical judgment boundaries use **Stereoscopic Gating** (an asymmetric dialectic reconciled by the deterministic Rust host). Do not collapse critical filtering or classification boundaries into a single monocular prompt.
+
+### Pattern Structure
+1. **Lens 1 (Inclusion / Recall - Thesis)**: A prompt explicitly incentivized to maximize recall, detect systemic/architectural value, entrypoints, root shells, state signals, and indirect callers.
+2. **Lens 2 (Precision / Pruning - Antithesis)**: An independent adversarial prompt incentivized to maximize precision, challenge false positives, eliminate coincidental keyword matches, generic utilities, and noise.
+3. **Node 3 (Deterministic Host Arbiter - Synthesis)**: The Rust engine reconciles votes using ground truth (CodeGraph AST import edges, topology distance, file domain alignment, and token budgets). The host breaks split decisions without calling a third LLM.
+
+### Active Stereoscopic Gates in the Pipeline
+- **Gate 1: Stereoscopic Intent Gate (Input Boundary)**:
+  - *Lens 1*: `Phase::Intake` drafts intent decomposition and search queries.
+  - *Lens 2*: `Phase::IntakeCritic` actively challenges dropped prompt clauses, intent collapse, and query contamination.
+  - *Host Arbiter*: `TriadConsensus` normalizes the decomposition, restores general questions, and sanitizes queries before execution.
+- **Gate 2: Stereoscopic Evidence Gate (Retrieval Boundary)**:
+  - *Lens 1*: `Phase::CandidateGateOptimist` acts as an Architectural Scout, advocating for framework entrypoints, root components, and view-switching shells.
+  - *Lens 2*: `Phase::CandidateGateSkeptic` acts as a Precision Pruner, rejecting stylesheets, isolated utilities, and superficial keyword hits.
+  - *Host Arbiter*: Evaluates the consensus matrix. On split decisions, breaks ties in favor of candidates backed by CodeGraph AST import topology, entrypoint identity, or domain alignment.
+
+### Rules for Future Agents and Loops
+- **Never collapse a Stereoscopic Gate into a single prompt**: Single-perspective prompts on local models inevitably skew into either hyper-permissive noise or hyper-restrictive rejections of context.
+- **Keep the Host as the Arbiter**: Do not invoke a third LLM to arbitrate unless qualitative trade-offs cannot be resolved by ground truth. Prefer host-mediated rules based on CodeGraph AST topology, checksums, and budgets.
+- **Apply Stereoscopic Gating to new decision boundaries**: If adding new capabilities (e.g. implementation plan validation, edit candidate selection, or patch verification), structure them as stereoscopic gates (Proposer/Optimist + Adversary/Critic + Deterministic Host Arbiter).
+
 ## Prompting Rules For Local Models
 
 - Prompts should be short, direct, and phase-specific. Avoid ornate roleplay, large tool catalogs, and fragile formatting instructions.
