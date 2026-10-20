@@ -1,6 +1,6 @@
 use crate::prompt::PromptParts;
 use crate::types::{
-    ContentHit, EvidenceSlice, FileHit, LeaseStatus, Phase, SymbolHit, SymbolRelation,
+    ContentHit, EvidenceSlice, FileHit, LeaseStatus, Phase, SymbolHit, SymbolRelation, VectorHit,
 };
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -92,6 +92,9 @@ pub trait CodeSearch: Send + Sync {
     }
     async fn search(&self, query: &str, limit: usize) -> Result<Vec<FileHit>>;
     async fn search_symbols(&self, query: &str, limit: usize) -> Result<Vec<SymbolHit>>;
+    async fn search_vector(&self, _query: &str, _limit: usize) -> Result<Vec<VectorHit>> {
+        Ok(Vec::new())
+    }
     async fn search_related_symbols(
         &self,
         relation: SymbolRelation,

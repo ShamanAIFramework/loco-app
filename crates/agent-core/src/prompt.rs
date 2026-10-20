@@ -15,15 +15,20 @@ pub struct PromptParts {
 
 impl PromptParts {
     pub fn render(&self) -> String {
-        [
+        let parts = [
             self.global_prefix.as_str(),
             self.phase_prefix.as_str(),
             self.task.as_str(),
             self.notebook.as_str(),
             self.evidence.as_str(),
             self.question.as_str(),
-        ]
-        .join("\n\n")
+        ];
+        parts
+            .iter()
+            .copied()
+            .filter(|p| !p.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n")
     }
 }
 
@@ -49,13 +54,13 @@ pub fn phase_prefix(phase: Phase, schema_name: &str) -> String {
 pub fn task_block(task: &TaskRequest) -> String {
     let conversation = recent_conversation_block(task);
     format!(
-        "TASK\nWorkspace: {}\n{}\nCurrent user request: {}",
+        "TASK\nWorkspace: {}\n{}\nCurrent user request: {}\n(Classify ONLY this current request; do NOT carry over greetings or tasks from prior conversation history)",
         task.workspace_path
             .as_ref()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "unknown".to_string()),
         conversation,
-        task.question
+        task.question.trim()
     )
 }
 
@@ -93,7 +98,10 @@ fn recent_conversation_block(task: &TaskRequest) -> String {
     if rendered.is_empty() {
         "Recent conversation: none".to_string()
     } else {
-        format!("Recent conversation:\n{}", rendered.join("\n"))
+        format!(
+            "Recent conversation:\n(PRIOR HISTORY ONLY - DO NOT extract intents or greetings from this history)\n{}",
+            rendered.join("\n")
+        )
     }
 }
 
@@ -112,11 +120,47 @@ fn compact_text(value: &str, max_chars: usize) -> String {
 pub fn intake_instruction() -> String {
     [
         "QUESTION",
-        "Classify the local coding request and propose deterministic code-search queries for the host to run.",
-        "Use `Edit` for requests to add, update, fix, remove, refactor, style, or otherwise change code. Use `Locate` for where/which-file questions, `Explain` for how/what/why/update-analysis questions, and `Unclear` only when the request has no actionable code target.",
-        "Prefer to proceed on short local-code questions if they mention UI, git, components, files, functions, panels, workspace, a programming language, framework, runtime, or concrete change intent.",
-        "Produce 3-6 short search queries likely to match paths, symbols, UI labels, component names, or domain nouns. Include exact identifiers and useful variants; omit filler words.",
-        "Do not answer the user here.",
+        "Analyze the user's request and decompose it into one or more distinct intents in `intents`.",
+        "",
+        "CRITICAL RULES:",
+        "1. MULTI-INTENT DECOMPOSITION: If the user request contains multiple questions, greetings, or tasks (often joined by 'and', 'also', 'then', or multiple '?'), you MUST produce a separate item in `intents` for EACH distinct part. Never collapse multiple questions into one item.",
+        "2. NO GHOST GREETINGS: Classify ONLY the current user request. Do NOT include a `Chat` / greeting intent unless the current request itself explicitly contains a greeting (such as 'hi', 'hello', 'hey', 'good morning', etc.). If the current request begins directly with a question (e.g., 'where...', 'how...', 'what...'), there is NO greeting intent. Never copy greetings from prior turns in the conversation history.",
+        "3. NO CODEBASE GUESSING IN DIRECT RESPONSE: `direct_response` is ONLY for general concepts or greetings. You must NEVER answer or guess where code is in this repository in `direct_response`.",
+        "4. REPOSITORY QUESTIONS: Any question asking about this codebase (e.g., 'where is', 'where do we', 'where does our', 'how do we', 'how does our', 'in our codebase', 'in this project', finding files, or editing code) MUST be classified as `WorkspaceSearch` or `WorkspaceEdit` with `needs_workspace_search: true` and 1-4 targeted `search_queries`.",
+        "5. INTENT CATEGORIES:",
+        "   - `Chat`: Greetings, acknowledgments, or pleasantries (ONLY if present in the CURRENT request).",
+        "   - `GeneralQuestion`: Programming concepts, language syntax, algorithms, or tools that do NOT refer to this local repository.",
+        "   - `WorkspaceSearch`: Questions asking to locate, inspect, explain, or trace code in this local repository.",
+        "   - `WorkspaceEdit`: Requests to modify, implement, refactor, style, or fix code in this local repository.",
+        "   - `Ambiguous`: Requests that are too vague to act on without clarification.",
+        "",
+        "6. SEARCH QUERY GENERATION & ARCHITECTURAL HYPOTHESES:",
+        "   - For `search_queries`, formulate 2-4 concise, targeted search terms (symbols, paths, or concepts).",
+        "   - Formulate both literal domain terms AND architectural hypotheses derived from the REPOSITORY CONTEXT / REPO MAP.",
+        "   - When the user asks about an architectural or cross-cutting concern (e.g. routing/views, lifecycle, configuration, auth, persistence) and no dedicated module is evident in the repo map, hypothesize candidate entrypoints, shells, root modules, or dispatchers visible in the repo outline.",
+        "   - Do not guess full file paths; use short identifier or concept queries.",
+        "",
+        "7. SEPARATING CODE LOCATION FROM BEST PRACTICES / CONVENTIONS:",
+        "   - When the user asks where code is located AND asks whether it follows best practices, conventions, or design patterns (e.g. 'where is X, and is it aligned with best practices?'), you MUST produce TWO distinct intents:",
+        "     1. `WorkspaceSearch`: To locate the relevant code. `search_queries` must contain ONLY terms targeting code files (e.g. entrypoint, view, component, shell). NEVER include 'best practices', 'conventions', 'guidelines', or framework evaluation in `search_queries`.",
+        "     2. `GeneralQuestion`: To explain the best practice or evaluate the pattern. `needs_workspace_search: false`. Provide a direct answer in `direct_response`.",
+        "",
+        "EXAMPLES:",
+        "",
+        "Example 1 (No greeting - compound question):",
+        "User: \"Where do we validate authentication tokens in the API, and what is the difference between symmetric and asymmetric JWT signing?\"",
+        "Output:",
+        "{\"reasoning\":\"The user asks to locate API authentication token validation in the local codebase, and asks a general conceptual question about JWT signing.\",\"needs_workspace_search\":true,\"intents\":[{\"intent\":\"WorkspaceSearch\",\"summary\":\"Locate authentication token validation in API\",\"needs_workspace_search\":true,\"direct_response\":null,\"search_queries\":[\"auth\", \"token\", \"jwt\", \"validate\"]},{\"intent\":\"GeneralQuestion\",\"summary\":\"Explain symmetric vs asymmetric JWT signing\",\"needs_workspace_search\":false,\"direct_response\":\"Symmetric signing uses a single shared secret key...\",\"search_queries\":[]}],\"target_hints\":[\"auth\",\"token\"],\"constraints\":[]}",
+        "",
+        "Example 2 (With greeting - compound question):",
+        "User: \"Hello! Where do we define database connection pools, and can you also explain connection pool sizing?\"",
+        "Output:",
+        "{\"reasoning\":\"The user greets, asks to find database connection pool configuration in the codebase, and asks a general conceptual question about connection pool sizing.\",\"needs_workspace_search\":true,\"intents\":[{\"intent\":\"Chat\",\"summary\":\"Greeting\",\"needs_workspace_search\":false,\"direct_response\":\"Hello! Happy to help.\",\"search_queries\":[]},{\"intent\":\"WorkspaceSearch\",\"summary\":\"Locate database connection pool configuration in codebase\",\"needs_workspace_search\":true,\"direct_response\":null,\"search_queries\":[\"connection\", \"pool\", \"database\", \"datasource\"]},{\"intent\":\"GeneralQuestion\",\"summary\":\"Explain connection pool sizing\",\"needs_workspace_search\":false,\"direct_response\":\"Connection pool sizing balances concurrency against resource limits...\",\"search_queries\":[]}],\"target_hints\":[\"connection\",\"pool\"],\"constraints\":[]}",
+        "",
+        "Example 3 (Code location + Best practice evaluation):",
+        "User: \"Where does our UI configure the route settings, and is it aligned with modern architecture best practices?\"",
+        "Output:",
+        "{\"reasoning\":\"The user asks to locate UI route/view configuration in the local codebase, and asks a general question about modern architecture best practices.\",\"needs_workspace_search\":true,\"intents\":[{\"intent\":\"WorkspaceSearch\",\"summary\":\"Locate UI route and view configuration in codebase\",\"needs_workspace_search\":true,\"direct_response\":null,\"search_queries\":[\"route\", \"view\", \"navigation\", \"App\"]},{\"intent\":\"GeneralQuestion\",\"summary\":\"Explain modern UI routing and navigation best practices\",\"needs_workspace_search\":false,\"direct_response\":\"Modern UI architecture typically favors declarative route definitions for multi-page flows or state-driven view switching for desktop single-window apps...\",\"search_queries\":[]}],\"target_hints\":[\"route\",\"view\",\"App\"],\"constraints\":[]}",
     ]
     .join("\n")
 }
@@ -233,28 +277,139 @@ pub fn schema_intake() -> serde_json::Value {
     json!({
         "type": "object",
         "properties": {
-            "task_type": {
+            "reasoning": {
                 "type": "string",
-                "enum": ["Explain", "Locate", "Edit", "Unclear"],
-                "description": "Edit for requested code changes, Locate for where/which-file questions, Explain for code behavior or change analysis, Unclear only when no actionable local-code target exists."
+                "description": "Brief explanation of how the user's prompt was broken down into intents."
+            },
+            "needs_workspace_search": {
+                "type": "boolean",
+                "description": "True if any intent item requires searching or reading files in the local workspace repository; false if all intents can be satisfied directly."
+            },
+            "intents": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "intent": {
+                            "type": "string",
+                            "enum": ["Chat", "GeneralQuestion", "WorkspaceSearch", "WorkspaceEdit", "Ambiguous"],
+                            "description": "Intent classification for this part of the user request."
+                        },
+                        "summary": {
+                            "type": "string",
+                            "description": "Short summary of what this specific intent requires."
+                        },
+                        "needs_workspace_search": {
+                            "type": "boolean",
+                            "description": "True if this specific intent requires searching or reading files in the local workspace."
+                        },
+                        "direct_response": {
+                            "type": ["string", "null"],
+                            "description": "Direct answer or reply if this intent does not need workspace search (greeting, general explanation, or clarification question). Null if workspace search is required."
+                        },
+                        "search_queries": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "1 to 4 targeted search queries (exact symbols, paths, function names) for this specific intent. Empty array if needs_workspace_search is false."
+                        }
+                    },
+                    "required": ["intent", "summary", "needs_workspace_search", "search_queries"],
+                    "additionalProperties": false
+                },
+                "description": "Decomposed list of distinct intents identified in the user prompt (1 or more)."
             },
             "target_hints": {
                 "type": "array",
                 "items": { "type": "string" },
-                "description": "Short identifiers, UI labels, filenames, symbols, and domain nouns relevant to the request."
+                "description": "Key identifiers, filenames, component names, or symbols identified across the request."
             },
             "constraints": {
                 "type": "array",
                 "items": { "type": "string" },
-                "description": "User constraints such as no edits, user-facing-only, service-layer-only, configuration-only, or exact behavior to inspect."
-            },
-            "search_queries": {
-                "type": "array",
-                "items": { "type": "string" },
-                "description": "Three to six concise queries likely to match indexed paths or symbols."
+                "description": "Any user-specified constraints mentioned in the request."
             }
         },
-        "required": ["task_type", "target_hints", "constraints", "search_queries"],
+        "required": ["reasoning", "needs_workspace_search", "intents"],
+        "additionalProperties": false
+    })
+}
+
+pub fn intake_critic_instruction(candidate_draft_json: &str) -> String {
+    [
+        "QUESTION",
+        "You are an Adversarial Intent Auditor (Node 2 of the Triad Consensus).",
+        "Your mission is to audit the candidate intent decomposition against the user's verbatim request and identify any failures.",
+        "",
+        "CANDIDATE DRAFT TO AUDIT:",
+        candidate_draft_json,
+        "",
+        "AUDIT CHECKLIST:",
+        "1. CLAUSE COVERAGE: Did the candidate draft drop any sub-question, condition, greeting, or clause? (Check for conjunctions like 'and', 'also', 'then', or multiple '?'). If the user asked both a codebase question AND a conceptual/best-practice question, they MUST be separated.",
+        "2. QUERY CONTAMINATION: Do any `search_queries` contain conversational words, non-code tokens, or meta-concepts (e.g. 'best practices', 'conventions', 'guidelines', 'how to', 'is it')? Search queries must ONLY be terms targeting code files/symbols.",
+        "3. INTENT BOUNDARIES: Is any general conceptual question improperly marked with `needs_workspace_search: true`?",
+        "",
+        "VERDICT:",
+        "- If the candidate draft is 100% complete, fully covers all clauses, and has clean code search queries, set `approved: true` with `has_dropped_clauses: false` and `has_contaminated_queries: false`.",
+        "- If ANY clause was missed, collapsed, or queries contaminated, set `approved: false` and supply the complete, corrected decomposition in `corrected_intents`.",
+    ]
+    .join("\n")
+}
+
+pub fn schema_intake_critic() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "approved": {
+                "type": "boolean",
+                "description": "True if the draft decomposition is 100% complete, captures all clauses, and has clean code-only search queries. False if any clause was dropped, contaminated, or misclassified."
+            },
+            "critique": {
+                "type": "string",
+                "description": "Adversarial critique explaining what was missed, dropped, contaminated with non-code words, or misclassified."
+            },
+            "has_dropped_clauses": {
+                "type": "boolean",
+                "description": "True if any sub-question, condition, or clause from the user request was dropped or collapsed."
+            },
+            "has_contaminated_queries": {
+                "type": "boolean",
+                "description": "True if search queries contain non-code meta words like 'best practices', 'conventions', 'guidelines', or 'is it'."
+            },
+            "corrected_intents": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "intent": {
+                            "type": "string",
+                            "enum": ["Chat", "GeneralQuestion", "WorkspaceSearch", "WorkspaceEdit", "Ambiguous"],
+                            "description": "Intent classification for this part of the user request."
+                        },
+                        "summary": {
+                            "type": "string",
+                            "description": "Short summary of what this specific intent requires."
+                        },
+                        "needs_workspace_search": {
+                            "type": "boolean",
+                            "description": "True if this specific intent requires searching or reading files in the local workspace."
+                        },
+                        "direct_response": {
+                            "type": ["string", "null"],
+                            "description": "Direct answer or reply if this intent does not need workspace search. Null if workspace search is required."
+                        },
+                        "search_queries": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "1 to 4 clean search queries targeting code files. Empty if needs_workspace_search is false."
+                        }
+                    },
+                    "required": ["intent", "summary", "needs_workspace_search", "search_queries"],
+                    "additionalProperties": false
+                },
+                "description": "The complete, corrected list of intents covering the entire user prompt without omissions or query contamination."
+            }
+        },
+        "required": ["approved", "critique", "has_dropped_clauses", "has_contaminated_queries", "corrected_intents"],
         "additionalProperties": false
     })
 }
@@ -395,6 +550,7 @@ mod tests {
             question: "Explain main".to_string(),
             conversation: Vec::new(),
             budgets: crate::types::Budgets::default(),
+            intake_only: false,
         };
         let mut notebook = Notebook::default();
         notebook.append_tool_fact(
@@ -451,9 +607,9 @@ mod tests {
 
         assert!(global.contains("never edit files"));
         assert!(global.contains("repo map as navigation only"));
-        assert!(intake.contains("Prefer to proceed on short local-code questions"));
-        assert!(intake.contains("Use `Edit`"));
-        assert!(intake.contains("UI"));
+        assert!(intake.contains("decompose it into one or more distinct intents"));
+        assert!(intake.contains("needs_workspace_search"));
+        assert!(intake.contains("direct_response"));
         assert!(plan.contains("safe implementation plan"));
         assert!(plan.contains("Do not propose an edit artifact yet"));
         assert!(plan.contains("Do not involve unrelated orchestration"));
@@ -469,10 +625,12 @@ mod tests {
         let rendered = [
             global_prefix(&[]),
             intake_instruction(),
+            intake_critic_instruction(""),
             plan_instruction(),
             extract_instruction(),
             synthesize_instruction(),
             schema_intake().to_string(),
+            schema_intake_critic().to_string(),
             schema_plan().to_string(),
             schema_extract().to_string(),
             schema_synthesize().to_string(),
@@ -510,10 +668,10 @@ mod tests {
         let extract = schema_extract();
         let synthesize = schema_synthesize();
 
-        assert!(intake["properties"]["task_type"]["description"]
+        assert!(intake["properties"]["intents"]["items"]["properties"]["intent"]["description"]
             .as_str()
             .unwrap()
-            .contains("requested code changes"));
+            .contains("Intent classification"));
         assert!(plan["properties"]["affected_files"]["description"]
             .as_str()
             .unwrap()
@@ -552,6 +710,7 @@ mod tests {
                 },
             ],
             budgets: crate::types::Budgets::default(),
+            intake_only: false,
         };
 
         let rendered = task_block(&task);
@@ -578,6 +737,7 @@ mod tests {
                 content: long,
             }],
             budgets: crate::types::Budgets::default(),
+            intake_only: false,
         };
 
         let rendered = task_block(&task);

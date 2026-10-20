@@ -10,7 +10,7 @@ use agent_core::{
     AgentProgress, AgentRuntime, Budgets, CodeSearch, ContentHit, ConversationTurn, EvidenceLease,
     EvidenceSlice, FileHit, FileReader, LeaseStatus, LineRange, LlmClient, LlmRequest, LlmResponse,
     LlmUsage, ProgressSink, RuntimeMetadata, SymbolHit, SymbolRelation, TaskRequest, TokenCounter,
-    TraceEvent,
+    TraceEvent, VectorHit,
 };
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -88,6 +88,7 @@ pub async fn prompt_agent_v2(
             })
             .collect(),
         budgets: load_budgets().await.unwrap_or_default(),
+        intake_only: false,
     };
 
     let llm = LlamaServerClient {
@@ -729,6 +730,29 @@ impl CodeSearch for TauriCodeSearch {
         })
         .await
         .context("Failed to join symbol search task")?
+    }
+
+    async fn search_vector(&self, query: &str, limit: usize) -> Result<Vec<VectorHit>> {
+        let Some(project_id) = self.project_id.clone() else {
+            return Ok(Vec::new());
+        };
+        let app = self.app.clone();
+        let query = query.to_string();
+        tauri::async_runtime::spawn_blocking(move || -> Result<Vec<VectorHit>> {
+            let state = app.state::<AppState>();
+            let project = state
+                .codegraph
+                .list_projects()?
+                .into_iter()
+                .find(|project| project.id == project_id)
+                .ok_or_else(|| anyhow!("Project not found for vector search"))?;
+            let root = PathBuf::from(project.root_path);
+            let files = state.codegraph.project_files(&project_id)?;
+            let symbols = state.codegraph.project_symbols(&project_id)?;
+            crate::vector_search::search_project_vectors(&root, &files, &symbols, &query, limit)
+        })
+        .await
+        .context("Failed to join vector search task")?
     }
 
     async fn search_related_symbols(

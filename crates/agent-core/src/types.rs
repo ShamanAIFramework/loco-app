@@ -9,6 +9,22 @@ pub struct TaskRequest {
     pub question: String,
     pub conversation: Vec<ConversationTurn>,
     pub budgets: Budgets,
+    #[serde(default)]
+    pub intake_only: bool,
+}
+
+impl Default for TaskRequest {
+    fn default() -> Self {
+        Self {
+            run_id: String::new(),
+            session_id: String::new(),
+            workspace_path: None,
+            question: String::new(),
+            conversation: Vec::new(),
+            budgets: Budgets::default(),
+            intake_only: false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -48,6 +64,7 @@ fn default_max_evidence_tokens() -> usize {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Phase {
     Intake,
+    IntakeCritic,
     Plan,
     Extract,
     Synthesize,
@@ -80,12 +97,56 @@ pub struct AgentAnswer {
     pub notebook: Notebook,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UserIntent {
+    Chat,
+    GeneralQuestion,
+    WorkspaceSearch,
+    WorkspaceEdit,
+    Ambiguous,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct IntentItem {
+    pub intent: UserIntent,
+    pub summary: String,
+    pub needs_workspace_search: bool,
+    #[serde(default)]
+    pub direct_response: Option<String>,
+    #[serde(default)]
+    pub search_queries: Vec<String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct IntakeOutput {
-    pub task_type: TaskType,
+    pub reasoning: String,
+    pub needs_workspace_search: bool,
+    pub intents: Vec<IntentItem>,
+    #[serde(default)]
     pub target_hints: Vec<String>,
+    #[serde(default)]
     pub constraints: Vec<String>,
-    pub search_queries: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CriticOutput {
+    pub approved: bool,
+    pub critique: String,
+    #[serde(default)]
+    pub has_dropped_clauses: bool,
+    #[serde(default)]
+    pub has_contaminated_queries: bool,
+    #[serde(default)]
+    pub corrected_intents: Option<Vec<IntentItem>>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TriadConsensus {
+    pub drafter_intents: Vec<IntentItem>,
+    pub critic_approved: bool,
+    pub critic_critique: String,
+    pub arbiter_decision: String,
+    pub final_intents: Vec<IntentItem>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -178,6 +239,16 @@ pub struct ContentHit {
     pub end_line: u32,
     pub preview: String,
     pub score: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct VectorHit {
+    pub path: String,
+    pub start_line: u32,
+    pub end_line: u32,
+    pub symbol: Option<String>,
+    pub snippet: String,
+    pub score: f32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

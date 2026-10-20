@@ -159,6 +159,10 @@ impl Notebook {
         )
     }
 
+    pub fn active_entries(&self) -> Vec<&NotebookEntry> {
+        self.active_entries_for_tags(&[], usize::MAX)
+    }
+
     pub fn active_entries_for_tags(&self, tags: &[String], limit: usize) -> Vec<&NotebookEntry> {
         let wanted: BTreeSet<&str> = tags.iter().map(String::as_str).collect();
         self.append_order
