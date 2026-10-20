@@ -1111,7 +1111,15 @@ fn collect_answer_sources(answer: &agent_core::AgentAnswer) -> Vec<SourceRef> {
         .cited_entries
         .iter()
         .filter_map(|entry_id| answer.notebook.get(entry_id))
-        .filter_map(|entry| source_from_entry(entry))
+        .filter_map(|entry| {
+            source_from_entry(entry).or_else(|| {
+                entry
+                    .depends_on
+                    .first()
+                    .and_then(|dep_id| answer.notebook.get(dep_id))
+                    .and_then(source_from_entry)
+            })
+        })
         .collect::<Vec<_>>();
 
     sources.sort_by_key(|source| {

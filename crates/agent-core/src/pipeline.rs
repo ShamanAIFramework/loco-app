@@ -1,10 +1,10 @@
 use std::collections::HashSet;
-use crate::notebook::{Notebook, Provenance};
+use crate::notebook::{EntryId, Notebook, Provenance};
 use crate::prompt::{
-    global_prefix, intake_critic_instruction, intake_instruction, phase_prefix,
-    prompt_candidate_gate_optimist, prompt_candidate_gate_skeptic,
-    schema_candidate_gate, schema_intake, schema_intake_critic,
-    task_block, CandidateGateItem, PromptParts,
+    evidence_block, extract_instruction, global_prefix, intake_critic_instruction,
+    intake_instruction, notebook_block, phase_prefix, prompt_candidate_gate_optimist,
+    prompt_candidate_gate_skeptic, schema_candidate_gate, schema_extract, schema_intake,
+    schema_intake_critic, task_block, CandidateGateItem, PromptParts,
 };
 use crate::trace::{Trace, TraceEvent};
 use crate::traits::{
@@ -12,9 +12,9 @@ use crate::traits::{
     TokenCounter,
 };
 use crate::types::{
-    AgentAnswer, CandidateGateOutput, ContentHit, CriticOutput, EvidenceSlice, FileHit,
-    IntakeOutput, IntentItem, Phase, StopReason, SymbolHit, TaskRequest, TriadConsensus,
-    UserIntent, VectorHit,
+    AgentAnswer, CandidateGateOutput, ContentHit, CriticOutput, EvidenceSlice, ExtractOutput,
+    FileHit, IntakeOutput, IntentItem, MissingEvidence, Phase, StopReason, SymbolHit, TaskRequest,
+    TriadConsensus, UserIntent, VectorHit,
 };
 use anyhow::{Context, Result};
 use serde::de::DeserializeOwned;
@@ -940,6 +940,132 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
         elapsed_ms: phase2_elapsed_ms,
     };
 
+    // =========================================================================
+    // STEP 3A: Evidence Extraction (Phase::Extract)
+    // =========================================================================
+    let mut extract_result: Option<ExtractStepResults> = None;
+
+    if intake.needs_workspace_search && !phase2.leased_slices.is_empty() {
+        runtime
+            .progress
+            .emit(AgentProgress::Status("Step 3A: Extracting evidence-backed inferences from leased code".to_string()))
+            .await;
+
+        let extract_start = std::time::Instant::now();
+        record_trace!(TraceEvent::PhaseStarted {
+            phase: Phase::Extract,
+        });
+
+        let extract_parts = PromptParts {
+            global_prefix: global_prefix(&repo_map),
+            phase_prefix: phase_prefix(Phase::Extract, "ExtractOutput"),
+            task: task_block(&task),
+            notebook: notebook_block(&notebook, &[], 25),
+            evidence: evidence_block(&phase2.leased_slices),
+            question: extract_instruction(),
+        };
+
+        let extract_prompt = [
+            extract_parts.global_prefix.as_str(),
+            extract_parts.phase_prefix.as_str(),
+            extract_parts.task.as_str(),
+            extract_parts.notebook.as_str(),
+            extract_parts.evidence.as_str(),
+            extract_parts.question.as_str(),
+        ]
+        .join("\n\n");
+
+        let extract_req = LlmRequest {
+            call_id: call_id("ext"),
+            phase: Phase::Extract,
+            schema_name: "ExtractOutput".to_string(),
+            schema: schema_extract(),
+            prompt_parts: Some(extract_parts.clone()),
+            prompt: extract_prompt.clone(),
+            temperature: 0.0,
+        };
+
+        let extract_resp = match runtime.llm.complete_json(extract_req.clone()).await {
+            Ok(resp) => {
+                record_trace!(TraceEvent::LlmCall {
+                    request: extract_req.clone(),
+                    response: resp.clone(),
+                });
+                Some(resp)
+            }
+            Err(err) => {
+                record_trace!(TraceEvent::ToolCall {
+                    name: "extract_failed".to_string(),
+                    args: json!({ "error": err.to_string() }),
+                    result_count: 0,
+                });
+                None
+            }
+        };
+
+        if let Some(resp) = &extract_resp {
+            if let Ok(extracted) = parse_json::<ExtractOutput>(&resp.raw_json) {
+                let mut verified_inferences = Vec::new();
+                for inf in &extracted.inferences {
+                    if let Some(fact_entry) = notebook.find_entry_by_lease_id(&inf.lease_id) {
+                        let dep_id = fact_entry.id.clone();
+                        let mut tags = inf.tags.clone();
+                        if !tags.iter().any(|t| t == "inference") {
+                            tags.push("inference".to_string());
+                        }
+                        let inf_id = notebook.append_model_inference(
+                            &inf.statement,
+                            Provenance::Model { call_id: resp.call_id.clone() },
+                            Phase::Extract,
+                            vec![dep_id],
+                            tags,
+                        );
+                        verified_inferences.push(VerifiedInference {
+                            statement: inf.statement.clone(),
+                            lease_id: inf.lease_id.0.clone(),
+                            is_valid: true,
+                            entry_id: Some(inf_id),
+                            rejection_reason: None,
+                        });
+                    } else {
+                        verified_inferences.push(VerifiedInference {
+                            statement: inf.statement.clone(),
+                            lease_id: inf.lease_id.0.clone(),
+                            is_valid: false,
+                            entry_id: None,
+                            rejection_reason: Some(format!("Lease ID `{}` not found among active notebook leases", inf.lease_id.0)),
+                        });
+                    }
+                }
+
+                extract_result = Some(ExtractStepResults {
+                    inferences: verified_inferences,
+                    sufficient: extracted.sufficient,
+                    missing: extracted.missing,
+                    raw_json: resp.raw_json.clone(),
+                    prompt: extract_prompt,
+                    elapsed_ms: extract_start.elapsed().as_millis() as u64,
+                });
+            }
+        }
+    }
+
+    let mut cited_entries: Vec<EntryId> = Vec::new();
+    if let Some(ext) = &extract_result {
+        for inf in &ext.inferences {
+            if let Some(entry_id) = &inf.entry_id {
+                cited_entries.push(entry_id.clone());
+                if let Some(entry) = notebook.get(entry_id) {
+                    for dep in &entry.depends_on {
+                        if !cited_entries.contains(dep) {
+                            cited_entries.push(dep.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let content = format_step1_and_step2_report(
         &task,
         &intake_prompt,
@@ -948,13 +1074,14 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
         &critic_output,
         &triad,
         &phase2,
+        extract_result.as_ref(),
         &notebook,
     );
 
     let answer = AgentAnswer {
         content,
         stop_reason: StopReason::Done,
-        cited_entries: Vec::new(),
+        cited_entries,
         notebook,
     };
 
@@ -1682,6 +1809,25 @@ struct Phase2Results {
     elapsed_ms: u64,
 }
 
+#[derive(Clone, Debug)]
+pub struct VerifiedInference {
+    pub statement: String,
+    pub lease_id: String,
+    pub is_valid: bool,
+    pub entry_id: Option<EntryId>,
+    pub rejection_reason: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ExtractStepResults {
+    pub inferences: Vec<VerifiedInference>,
+    pub sufficient: bool,
+    pub missing: Vec<MissingEvidence>,
+    pub raw_json: String,
+    pub prompt: String,
+    pub elapsed_ms: u64,
+}
+
 fn format_step1_and_step2_report(
     task: &TaskRequest,
     intake_prompt: &str,
@@ -1690,6 +1836,7 @@ fn format_step1_and_step2_report(
     critic_output: &CriticOutput,
     triad: &TriadConsensus,
     phase2: &Phase2Results,
+    extract: Option<&ExtractStepResults>,
     notebook: &Notebook,
 ) -> String {
     let mut out = String::new();
@@ -1921,6 +2068,71 @@ fn format_step1_and_step2_report(
         }
     }
 
+    // --- Step 3A Section ---
+    if let Some(ext) = extract {
+        out.push_str("### 🧠 Step 3A: Evidence Extraction (`Phase::Extract`)\n\n");
+        let valid_count = ext.inferences.iter().filter(|i| i.is_valid).count();
+        let rejected_count = ext.inferences.iter().filter(|i| !i.is_valid).count();
+        let sufficiency_badge = if ext.sufficient {
+            "✅ **Sufficient** (Retrieved evidence directly answers the request)"
+        } else {
+            "⚠️ **Insufficient** (Additional evidence required)"
+        };
+
+        out.push_str("| Metric | Status |\n");
+        out.push_str("|---|---|\n");
+        out.push_str(&format!("| **Sufficiency Evaluation** | {} |\n", sufficiency_badge));
+        out.push_str(&format!("| **Verified Inferences** | 💡 **{} inferences accepted** into Notebook |\n", valid_count));
+        if rejected_count > 0 {
+            out.push_str(&format!("| **Host-Rejected Inferences** | 🛡️ **{} inferences dropped** (unbacked lease IDs) |\n", rejected_count));
+        }
+        if !ext.missing.is_empty() {
+            out.push_str(&format!("| **Missing Evidence Identified** | 🔍 **{} missing items** |\n", ext.missing.len()));
+        }
+        out.push_str(&format!("| **Extraction Latency** | ⏱️ **{} ms** |\n\n", ext.elapsed_ms));
+
+        if valid_count > 0 {
+            out.push_str("#### 💡 Verified Inferences (Added to Notebook)\n\n");
+            for (idx, inf) in ext.inferences.iter().filter(|i| i.is_valid).enumerate() {
+                let entry_str = inf.entry_id.as_ref().map(|id| format!(" | Entry: `{}`", id.0)).unwrap_or_default();
+                out.push_str(&format!(
+                    "{}. **[Lease `{}`{}]**: {}\n",
+                    idx + 1,
+                    inf.lease_id,
+                    entry_str,
+                    inf.statement
+                ));
+                if !inf.statement.ends_with('\n') {
+                    out.push('\n');
+                }
+            }
+            out.push('\n');
+        }
+
+        if rejected_count > 0 {
+            out.push_str("#### ⚠️ Host-Rejected Inferences (Unbacked or Hallucinated Lease IDs)\n\n");
+            for inf in ext.inferences.iter().filter(|i| !i.is_valid) {
+                out.push_str(&format!(
+                    "- `{}`: {}\n",
+                    inf.statement,
+                    inf.rejection_reason.as_deref().unwrap_or("Invalid lease ID")
+                ));
+            }
+            out.push('\n');
+        }
+
+        if !ext.missing.is_empty() {
+            out.push_str("#### 🔍 Missing Evidence Identified by Coprocessor\n\n");
+            for m in &ext.missing {
+                out.push_str(&format!(
+                    "- **{:?}** for `{}`: {}\n",
+                    m.kind, m.target, m.reason
+                ));
+            }
+            out.push('\n');
+        }
+    }
+
     out.push_str("<details>\n<summary><b>📓 Current Notebook State (");
     let active_count = notebook.active_entries().len();
     out.push_str(&format!("{} Entries)</b></summary>\n\n", active_count));
@@ -1953,9 +2165,32 @@ fn format_step1_and_step2_report(
         wall_ms, prompt_tok, decode_tok
     ));
     out.push_str(&format!(
-        "- **Step 2 (Host Retrieval & Lease):** {} ms native Rust wall\n\n",
+        "- **Step 2 (Host Retrieval & Lease):** {} ms native Rust wall\n",
         phase2.elapsed_ms
     ));
+    if let Some(ext) = extract {
+        out.push_str(&format!(
+            "- **Step 3A (Model Extraction):** {} ms wall\n",
+            ext.elapsed_ms
+        ));
+    }
+    out.push('\n');
+
+    if let Some(ext) = extract {
+        out.push_str("<details>\n<summary><b>📄 Step 3A Raw Model Extraction JSON</b></summary>\n\n");
+        out.push_str("```json\n");
+        let pretty_json = serde_json::from_str::<serde_json::Value>(&ext.raw_json)
+            .ok()
+            .and_then(|v| serde_json::to_string_pretty(&v).ok())
+            .unwrap_or_else(|| ext.raw_json.trim().to_string());
+        out.push_str(&pretty_json);
+        out.push_str("\n```\n</details>\n\n");
+
+        out.push_str("<details>\n<summary><b>📝 Exact Step 3A Prompt Sent to Model</b></summary>\n\n");
+        out.push_str("```text\n");
+        out.push_str(ext.prompt.trim());
+        out.push_str("\n```\n</details>\n\n");
+    }
 
     out.push_str("<details>\n<summary><b>📄 Step 1 Raw Model JSON Output</b></summary>\n\n");
     out.push_str("```json\n");
@@ -3063,5 +3298,134 @@ mod tests {
         assert!(result.answer.content.contains("src/MonolithicRoutes.tsx"));
         assert!(result.answer.content.contains("DeepProfileRoute"));
         assert!(result.answer.content.contains("@solidjs/router"));
+    }
+
+    #[tokio::test]
+    async fn test_step3a_extraction_validates_leases_and_updates_notebook() {
+        struct ExtractMockLlm;
+
+        #[async_trait]
+        impl LlmClient for ExtractMockLlm {
+            async fn complete_json(&self, request: LlmRequest) -> Result<LlmResponse> {
+                let raw_json = match request.phase {
+                    Phase::Intake => r#"{
+                        "reasoning": "User asks where UI configures route settings.",
+                        "needs_workspace_search": true,
+                        "intents": [
+                            {
+                                "intent": "WorkspaceSearch",
+                                "summary": "Locate UI route settings configuration in codebase",
+                                "needs_workspace_search": true,
+                                "direct_response": null,
+                                "search_queries": ["route", "view"]
+                            }
+                        ],
+                        "target_hints": ["route"],
+                        "constraints": []
+                    }"#.to_string(),
+                    Phase::IntakeCritic => r#"{
+                        "approved": true,
+                        "critique": "Draft approved.",
+                        "has_dropped_clauses": false,
+                        "has_contaminated_queries": false,
+                        "corrected_intents": null
+                    }"#.to_string(),
+                    Phase::CandidateGate | Phase::CandidateGateOptimist | Phase::CandidateGateSkeptic => r#"{
+                        "evaluations": [
+                            { "path": "src/routes.tsx", "keep": true, "reason": "Configures routes" }
+                        ]
+                    }"#.to_string(),
+                    Phase::Extract => {
+                        // Extract valid lease ID from prompt
+                        let found_lease = request.prompt
+                            .lines()
+                            .find(|l| l.starts_with("LEASE "))
+                            .and_then(|l| l.strip_prefix("LEASE "))
+                            .unwrap_or("mock-lease");
+
+                        format!(r#"{{
+                            "inferences": [
+                                {{
+                                    "statement": "src/routes.tsx defines AppRoutes which renders application route tree.",
+                                    "lease_id": "{}",
+                                    "tags": ["route", "AppRoutes"]
+                                }},
+                                {{
+                                    "statement": "Hallucinated claim with invalid lease id.",
+                                    "lease_id": "lease-hallucinated-fake-id",
+                                    "tags": ["fake"]
+                                }}
+                            ],
+                            "sufficient": true,
+                            "missing": []
+                        }}"#, found_lease)
+                    }
+                    _ => "{}".to_string(),
+                };
+
+                Ok(LlmResponse {
+                    call_id: request.call_id,
+                    raw_json,
+                    usage: crate::traits::LlmUsage::default(),
+                })
+            }
+        }
+
+        #[async_trait]
+        impl TokenCounter for ExtractMockLlm {
+            async fn count_tokens(&self, text: &str) -> usize {
+                text.len() / 4
+            }
+        }
+
+        let task = TaskRequest {
+            run_id: "test-extract-run".to_string(),
+            session_id: "test-extract-session".to_string(),
+            workspace_path: None,
+            question: "where does the UI configure route settings".to_string(),
+            conversation: Vec::new(),
+            budgets: crate::types::Budgets::default(),
+            intake_only: false,
+        };
+
+        let progress = CollectProgress {
+            messages: std::sync::Arc::new(Mutex::new(Vec::new())),
+        };
+
+        let result = run_agent(
+            task,
+            AgentRuntime {
+                llm: &ExtractMockLlm,
+                code_search: &MockSearch,
+                file_reader: &MockReader,
+                token_counter: &ExtractMockLlm,
+                progress: &progress,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.answer.stop_reason, StopReason::Done);
+
+        // Active notebook entries must contain the verified inference
+        let active_entries = result.answer.notebook.active_entries();
+        let verified_inf = active_entries.iter().find(|e| e.statement.contains("src/routes.tsx defines AppRoutes"));
+        assert!(verified_inf.is_some(), "Expected verified inference in notebook");
+        assert_eq!(verified_inf.unwrap().kind, crate::notebook::EntryKind::Inference);
+
+        // Fake inference must NOT be in the notebook
+        let fake_inf = active_entries.iter().find(|e| e.statement.contains("Hallucinated claim"));
+        assert!(fake_inf.is_none(), "Fake inference should have been rejected by the host");
+
+        // The report must display Step 3A section with metrics
+        assert!(result.answer.content.contains("Step 3A: Evidence Extraction"));
+        assert!(result.answer.content.contains("Sufficient"));
+        assert!(result.answer.content.contains("1 inferences accepted"));
+        assert!(result.answer.content.contains("1 inferences dropped"));
+        assert!(result.answer.content.contains("lease-hallucinated-fake-id"));
+
+        // Cited entries must contain the verified inference ID
+        assert!(!result.answer.cited_entries.is_empty());
+        assert!(result.answer.cited_entries.contains(&verified_inf.unwrap().id));
     }
 }

@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct EntryId(pub String);
 
 impl EntryId {
@@ -14,6 +15,7 @@ impl EntryId {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct LeaseId(pub String);
 
 impl LeaseId {
@@ -178,6 +180,12 @@ impl Notebook {
 
     pub fn get(&self, id: &EntryId) -> Option<&NotebookEntry> {
         self.entries.get(id)
+    }
+
+    pub fn find_entry_by_lease_id(&self, lease_id: &LeaseId) -> Option<&NotebookEntry> {
+        self.entries
+            .values()
+            .find(|entry| provenance_uses_lease(&entry.provenance, lease_id))
     }
 
     pub fn mark_stale_by_lease(&mut self, lease_id: &LeaseId) {

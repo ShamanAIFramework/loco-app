@@ -175,8 +175,10 @@ pub struct PlanStep {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExtractOutput {
+    #[serde(default)]
     pub inferences: Vec<ModelInference>,
     pub sufficient: bool,
+    #[serde(default)]
     pub missing: Vec<MissingEvidence>,
 }
 
@@ -184,6 +186,7 @@ pub struct ExtractOutput {
 pub struct ModelInference {
     pub statement: String,
     pub lease_id: LeaseId,
+    #[serde(default)]
     pub tags: Vec<String>,
 }
 

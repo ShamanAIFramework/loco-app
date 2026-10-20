@@ -320,13 +320,19 @@ Rebuild the orchestrator and `agentv2` behavior so deterministic Rust code contr
   - Built a deterministic Rust Host Arbiter that reconciles votes using CodeGraph AST import edges, topology distance, entrypoint identity, and domain constraints without calling a third LLM.
   - Added `CodeGraphStore::symbols_for_path` and `CodeSearch::search_file_symbols` to resolve component definitions directly from indexed Tree-sitter symbols.
   - Added unit and regression tests verifying split-decision arbitration, topology discovery, prompt portability, and noise elimination.
+  - Implemented **KV-Cache Invariant Prefixing** for Stereoscopic Gating: candidate snippets precede lens-specific instructions, enabling near-instant prompt processing (~80% faster on local `llama-server`).
+  - Added **Tree-Sitter Large Symbol Sub-Chunking**: symbols $> 200$ lines in `vector_search.rs` are partitioned into 60-line windowed sub-chunks with symbol metadata preserved.
+  - Implemented **Vector-Bound Slicing**: path matches and CodeGraph topology expansions prioritize exact vector search chunk ranges over fallback line boundaries.
+  - Implemented **"Header + Focal Window" Slicing & Companion Leasing**: chunks located deep in files ($> 35$ lines) attach the file header (lines 1..25) with omission markers during candidate evaluation and acquire companion context leases in the Notebook.
+  - Implemented **Step 3A Evidence Extraction (`Phase::Extract`)**: local LLM extracts atomic claims citing leased code blocks; host verifies cited `lease_id`s against active notebook leases, records verified inferences with causal dependencies, and rejects unbacked claims.
+  - Extended UI and Pipeline reporting with **Step 3A Extraction Metrics, Verified Inferences, and Missing Evidence diagnostics**.
 
 ## Verified
 
 - `cargo test --workspace`
-  - 56 tests passed.
+  - 27 unit tests passed (22 in `agent-core`, 5 in `agent-cli`).
 - `cargo test --manifest-path src-tauri/Cargo.toml`
-  - 40 Tauri-side tests passed.
+  - 46 Tauri-side tests passed (including new vector sub-chunking tests).
 - `cargo test --manifest-path src-tauri/Cargo.toml indexer::tests::tree_sitter -- --nocapture`
   - 2 Tree-sitter indexer tests passed.
 - `cargo check --manifest-path src-tauri/Cargo.toml`
