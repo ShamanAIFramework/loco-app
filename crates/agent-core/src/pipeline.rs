@@ -2,9 +2,11 @@ use std::collections::HashSet;
 use crate::notebook::{EntryId, Notebook, Provenance};
 use crate::prompt::{
     evidence_block, extract_instruction, global_prefix, intake_critic_instruction,
-    intake_instruction, notebook_block, phase_prefix, prompt_candidate_gate_optimist,
-    prompt_candidate_gate_skeptic, schema_candidate_gate, schema_extract, schema_intake,
-    schema_intake_critic, task_block, CandidateGateItem, PromptParts,
+    intake_instruction, notebook_block, phase_prefix, plan_critic_instruction,
+    plan_instruction, plan_rebuttal_instruction, plan_reconciler_instruction,
+    prompt_candidate_gate_optimist, prompt_candidate_gate_skeptic, schema_candidate_gate,
+    schema_extract, schema_intake, schema_intake_critic, schema_plan, schema_plan_critic,
+    schema_plan_rebuttal, task_block, CandidateGateItem, PromptParts,
 };
 use crate::trace::{Trace, TraceEvent};
 use crate::traits::{
@@ -12,8 +14,9 @@ use crate::traits::{
     TokenCounter,
 };
 use crate::types::{
-    AgentAnswer, CandidateGateOutput, ContentHit, CriticOutput, EvidenceSlice, ExtractOutput,
-    FileHit, IntakeOutput, IntentItem, MissingEvidence, Phase, StopReason, SymbolHit, TaskRequest,
+    AgentAnswer, CandidateGateOutput, ContentHit, CriticOutput, EditPlan, EvidenceSlice,
+    ExtractOutput, FileHit, IntakeOutput, IntentItem, MissingEvidence, Phase, PlanCriticOutput,
+    PlanRebuttalOutput, PlanStep, PlanStepResults, PlannedFile, StopReason, SymbolHit, TaskRequest,
     TriadConsensus, UserIntent, VectorHit,
 };
 use anyhow::{Context, Result};
@@ -214,7 +217,7 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
         .await;
 
     record_trace!(TraceEvent::PhaseStarted {
-        phase: Phase::Extract,
+        phase: Phase::CandidateGate,
     });
 
     let phase2_start = std::time::Instant::now();
@@ -923,7 +926,7 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
     let phase2_elapsed_ms = phase2_start.elapsed().as_millis() as u64;
 
     record_trace!(TraceEvent::NotebookSnapshot {
-        phase: Phase::Extract,
+        phase: Phase::CandidateGate,
         notebook: notebook.deterministic_checkpoint(),
     });
 
@@ -1066,6 +1069,365 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
         }
     }
 
+    // =========================================================================
+    // STEP 3B: Universal Plan Phase (Appellate Stereoscopic Gate)
+    // =========================================================================
+    let mut plan_result: Option<PlanStepResults> = None;
+
+    if !task.intake_only {
+        runtime
+            .progress
+            .emit(AgentProgress::Status("Step 3B: Entering Appellate Stereoscopic Plan Gate".to_string()))
+            .await;
+
+        let plan_start = std::time::Instant::now();
+
+        // 1. Invariant context prefix shared by all 4 lenses for maximum KV-cache reuse
+        let shared_context_prefix = format!(
+            "{}\n\n{}\n\n{}\n\n{}",
+            global_prefix(&repo_map),
+            task_block(&task),
+            notebook_block(&notebook, &[], 25),
+            evidence_block(&phase2.leased_slices),
+        );
+
+        // --- Lens 1: Plan Proposer (Thesis) ---
+        runtime
+            .progress
+            .emit(AgentProgress::Status("Step 3B: Lens 1 — Drafting proposed plan".to_string()))
+            .await;
+
+        let proposer_start = std::time::Instant::now();
+        record_trace!(TraceEvent::PhaseStarted {
+            phase: Phase::PlanProposer,
+        });
+
+        let proposer_prompt = format!(
+            "{}\n\n{}\n\n{}",
+            shared_context_prefix,
+            phase_prefix(Phase::PlanProposer, "EditPlan"),
+            plan_instruction(),
+        );
+
+        let proposer_req = LlmRequest {
+            call_id: call_id("plan-prop"),
+            phase: Phase::PlanProposer,
+            schema_name: "EditPlan".to_string(),
+            schema: schema_plan(),
+            prompt_parts: None,
+            prompt: proposer_prompt,
+            temperature: 0.0,
+        };
+
+        let proposer_resp = match runtime.llm.complete_json(proposer_req.clone()).await {
+            Ok(resp) => {
+                record_trace!(TraceEvent::LlmCall {
+                    request: proposer_req.clone(),
+                    response: resp.clone(),
+                });
+                Some(resp)
+            }
+            Err(err) => {
+                record_trace!(TraceEvent::ToolCall {
+                    name: "plan_proposer_failed".to_string(),
+                    args: json!({ "error": err.to_string() }),
+                    result_count: 0,
+                });
+                None
+            }
+        };
+
+        let proposed_plan = proposer_resp
+            .as_ref()
+            .and_then(|r| parse_json::<EditPlan>(&r.raw_json).ok())
+            .unwrap_or_else(|| {
+                EditPlan {
+                    objective: format!("Address user request: {}", task.question),
+                    affected_files: phase2.leased_slices.iter().map(|s| PlannedFile {
+                        path: s.lease.path.clone(),
+                        reason: "Examined candidate in leased evidence".to_string(),
+                    }).collect(),
+                    steps: vec![
+                        PlanStep {
+                            title: "Synthesize Findings".to_string(),
+                            detail: "Review retrieved evidence and notebook facts to answer prompt.".to_string(),
+                        }
+                    ],
+                    risks: vec!["Fallback plan generated due to unparseable proposer output.".to_string()],
+                    validation_commands: vec![],
+                }
+            });
+        let proposer_elapsed_ms = proposer_start.elapsed().as_millis() as u64;
+
+        // --- Lens 2: Plan Critic (Antithesis) ---
+        runtime
+            .progress
+            .emit(AgentProgress::Status("Step 3B: Lens 2 — Adversarial critique".to_string()))
+            .await;
+
+        let critic_start = std::time::Instant::now();
+        record_trace!(TraceEvent::PhaseStarted {
+            phase: Phase::PlanCritic,
+        });
+
+        let proposed_plan_json = serde_json::to_string_pretty(&proposed_plan).unwrap_or_default();
+        let critic_prompt = format!(
+            "{}\n\n{}\n\n{}",
+            shared_context_prefix,
+            phase_prefix(Phase::PlanCritic, "PlanCriticOutput"),
+            plan_critic_instruction(&proposed_plan_json),
+        );
+
+        let critic_req = LlmRequest {
+            call_id: call_id("plan-crit"),
+            phase: Phase::PlanCritic,
+            schema_name: "PlanCriticOutput".to_string(),
+            schema: schema_plan_critic(),
+            prompt_parts: None,
+            prompt: critic_prompt,
+            temperature: 0.0,
+        };
+
+        let critic_resp = match runtime.llm.complete_json(critic_req.clone()).await {
+            Ok(resp) => {
+                record_trace!(TraceEvent::LlmCall {
+                    request: critic_req.clone(),
+                    response: resp.clone(),
+                });
+                Some(resp)
+            }
+            Err(err) => {
+                record_trace!(TraceEvent::ToolCall {
+                    name: "plan_critic_failed".to_string(),
+                    args: json!({ "error": err.to_string() }),
+                    result_count: 0,
+                });
+                None
+            }
+        };
+
+        let critic_output = critic_resp
+            .as_ref()
+            .and_then(|r| parse_json::<PlanCriticOutput>(&r.raw_json).ok())
+            .unwrap_or_else(|| PlanCriticOutput {
+                critique: "Automated review: verify evidence coverage and edge cases.".to_string(),
+                missing_aspects: vec![],
+                disputed_steps: vec![],
+                unverified_assumptions: vec![],
+                additional_risks: vec![],
+            });
+        let critic_elapsed_ms = critic_start.elapsed().as_millis() as u64;
+
+        // --- Lens 3: Plan Rebuttal (Scope Arbiter / Critic of the Critic) ---
+        runtime
+            .progress
+            .emit(AgentProgress::Status("Step 3B: Lens 3 — Pragmatic rebuttal & defense".to_string()))
+            .await;
+
+        let rebuttal_start = std::time::Instant::now();
+        record_trace!(TraceEvent::PhaseStarted {
+            phase: Phase::PlanRebuttal,
+        });
+
+        let critic_output_json = serde_json::to_string_pretty(&critic_output).unwrap_or_default();
+        let rebuttal_prompt = format!(
+            "{}\n\n{}\n\n{}",
+            shared_context_prefix,
+            phase_prefix(Phase::PlanRebuttal, "PlanRebuttalOutput"),
+            plan_rebuttal_instruction(&proposed_plan_json, &critic_output_json),
+        );
+
+        let rebuttal_req = LlmRequest {
+            call_id: call_id("plan-rebut"),
+            phase: Phase::PlanRebuttal,
+            schema_name: "PlanRebuttalOutput".to_string(),
+            schema: schema_plan_rebuttal(),
+            prompt_parts: None,
+            prompt: rebuttal_prompt,
+            temperature: 0.0,
+        };
+
+        let rebuttal_resp = match runtime.llm.complete_json(rebuttal_req.clone()).await {
+            Ok(resp) => {
+                record_trace!(TraceEvent::LlmCall {
+                    request: rebuttal_req.clone(),
+                    response: resp.clone(),
+                });
+                Some(resp)
+            }
+            Err(err) => {
+                record_trace!(TraceEvent::ToolCall {
+                    name: "plan_rebuttal_failed".to_string(),
+                    args: json!({ "error": err.to_string() }),
+                    result_count: 0,
+                });
+                None
+            }
+        };
+
+        let rebuttal_output = rebuttal_resp
+            .as_ref()
+            .and_then(|r| parse_json::<PlanRebuttalOutput>(&r.raw_json).ok())
+            .unwrap_or_else(|| PlanRebuttalOutput {
+                rebuttal: "Evaluate critique against existing evidence.".to_string(),
+                dismissed_critiques: vec![],
+                accepted_critiques: vec![],
+            });
+        let rebuttal_elapsed_ms = rebuttal_start.elapsed().as_millis() as u64;
+
+        // --- Lens 4: Plan Reconciler (Synthesis) ---
+        runtime
+            .progress
+            .emit(AgentProgress::Status("Step 3B: Lens 4 — Reconciling final plan".to_string()))
+            .await;
+
+        let reconciler_start = std::time::Instant::now();
+        record_trace!(TraceEvent::PhaseStarted {
+            phase: Phase::PlanReconciler,
+        });
+
+        let rebuttal_output_json = serde_json::to_string_pretty(&rebuttal_output).unwrap_or_default();
+        let reconciler_prompt = format!(
+            "{}\n\n{}\n\n{}",
+            shared_context_prefix,
+            phase_prefix(Phase::PlanReconciler, "EditPlan"),
+            plan_reconciler_instruction(&proposed_plan_json, &critic_output_json, &rebuttal_output_json),
+        );
+
+        let reconciler_req = LlmRequest {
+            call_id: call_id("plan-rec"),
+            phase: Phase::PlanReconciler,
+            schema_name: "EditPlan".to_string(),
+            schema: schema_plan(),
+            prompt_parts: None,
+            prompt: reconciler_prompt,
+            temperature: 0.0,
+        };
+
+        let reconciler_resp = match runtime.llm.complete_json(reconciler_req.clone()).await {
+            Ok(resp) => {
+                record_trace!(TraceEvent::LlmCall {
+                    request: reconciler_req.clone(),
+                    response: resp.clone(),
+                });
+                Some(resp)
+            }
+            Err(err) => {
+                record_trace!(TraceEvent::ToolCall {
+                    name: "plan_reconciler_failed".to_string(),
+                    args: json!({ "error": err.to_string() }),
+                    result_count: 0,
+                });
+                None
+            }
+        };
+
+        let reconciled_plan = reconciler_resp
+            .as_ref()
+            .and_then(|r| parse_json::<EditPlan>(&r.raw_json).ok())
+            .unwrap_or_else(|| proposed_plan.clone());
+        let reconciler_elapsed_ms = reconciler_start.elapsed().as_millis() as u64;
+
+        // --- Node 5: Deterministic Rust Host Arbiter ---
+        runtime
+            .progress
+            .emit(AgentProgress::Status("Step 3B: Host Arbiter — Enforcing evidence backing and committing decisions".to_string()))
+            .await;
+
+        let active_leased_paths: HashSet<String> = notebook
+            .active_entries()
+            .iter()
+            .filter_map(|e| match &e.provenance {
+                Provenance::File { path, .. } => Some(path.clone()),
+                _ => None,
+            })
+            .collect();
+
+        let mut arbiter_validated_files = Vec::new();
+        let mut arbiter_dropped_files = Vec::new();
+
+        for file in &reconciled_plan.affected_files {
+            if active_leased_paths.is_empty() || active_leased_paths.contains(&file.path) {
+                arbiter_validated_files.push(file.clone());
+            } else {
+                arbiter_dropped_files.push(file.clone());
+            }
+        }
+
+        // Commit decisions to Notebook (EntryKind::Decision)
+        let reconciler_call_id = reconciler_resp
+            .as_ref()
+            .map(|r| r.call_id.clone())
+            .unwrap_or_else(|| call_id("arbiter"));
+
+        let mut committed_decision_ids = Vec::new();
+
+        let obj_id = notebook.append_decision(
+            format!("Plan Objective: {}", reconciled_plan.objective),
+            Provenance::Model { call_id: reconciler_call_id.clone() },
+            Phase::PlanReconciler,
+            cited_entries.clone(),
+            vec!["plan".to_string(), "objective".to_string()],
+        );
+        committed_decision_ids.push(obj_id.clone());
+
+        for (idx, step) in reconciled_plan.steps.iter().enumerate() {
+            let step_id = notebook.append_decision(
+                format!("Plan Step {}: {} — {}", idx + 1, step.title, step.detail),
+                Provenance::Model { call_id: reconciler_call_id.clone() },
+                Phase::PlanReconciler,
+                vec![obj_id.clone()],
+                vec!["plan".to_string(), "step".to_string()],
+            );
+            committed_decision_ids.push(step_id);
+        }
+
+        for file in &arbiter_validated_files {
+            let file_id = notebook.append_decision(
+                format!("Plan Target: {} ({})", file.path, file.reason),
+                Provenance::Model { call_id: reconciler_call_id.clone() },
+                Phase::PlanReconciler,
+                vec![obj_id.clone()],
+                vec!["plan".to_string(), "target".to_string()],
+            );
+            committed_decision_ids.push(file_id);
+        }
+
+        for risk in &reconciled_plan.risks {
+            let risk_id = notebook.append_decision(
+                format!("Plan Risk: {}", risk),
+                Provenance::Model { call_id: reconciler_call_id.clone() },
+                Phase::PlanReconciler,
+                vec![obj_id.clone()],
+                vec!["plan".to_string(), "risk".to_string()],
+            );
+            committed_decision_ids.push(risk_id);
+        }
+
+        for id in &committed_decision_ids {
+            if !cited_entries.contains(id) {
+                cited_entries.push(id.clone());
+            }
+        }
+
+        let total_plan_ms = plan_start.elapsed().as_millis() as u64;
+
+        plan_result = Some(PlanStepResults {
+            proposed_plan,
+            critic_output,
+            rebuttal_output,
+            reconciled_plan,
+            arbiter_validated_files,
+            arbiter_dropped_files,
+            committed_decision_ids,
+            proposer_elapsed_ms,
+            critic_elapsed_ms,
+            rebuttal_elapsed_ms,
+            reconciler_elapsed_ms,
+            total_elapsed_ms: total_plan_ms,
+        });
+    }
+
     let content = format_step1_and_step2_report(
         &task,
         &intake_prompt,
@@ -1075,6 +1437,7 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
         &triad,
         &phase2,
         extract_result.as_ref(),
+        plan_result.as_ref(),
         &notebook,
     );
 
@@ -1837,6 +2200,7 @@ fn format_step1_and_step2_report(
     triad: &TriadConsensus,
     phase2: &Phase2Results,
     extract: Option<&ExtractStepResults>,
+    plan: Option<&PlanStepResults>,
     notebook: &Notebook,
 ) -> String {
     let mut out = String::new();
@@ -2130,6 +2494,74 @@ fn format_step1_and_step2_report(
                 ));
             }
             out.push('\n');
+        }
+    }
+
+    // --- Step 3B Section ---
+    if let Some(plan_res) = plan {
+        out.push_str("### 🗺️ Step 3B: Appellate Planning Gate (`Double Stereoscopic Gate`)\n\n");
+        let rec = &plan_res.reconciled_plan;
+
+        out.push_str("| Dialectic Lens | Role & Perspective | Result |\n");
+        out.push_str("|---|---|---|\n");
+        out.push_str(&format!(
+            "| **Lens 1: Proposer** | Constructive Architect (Thesis) | **{} steps**, {} affected files, {} risks (⏱️ {} ms) |\n",
+            plan_res.proposed_plan.steps.len(),
+            plan_res.proposed_plan.affected_files.len(),
+            plan_res.proposed_plan.risks.len(),
+            plan_res.proposer_elapsed_ms
+        ));
+        out.push_str(&format!(
+            "| **Lens 2: Critic** | Adversarial Auditor (Antithesis) | **{} missing aspects**, {} disputed steps, {} unverified assumptions (⏱️ {} ms) |\n",
+            plan_res.critic_output.missing_aspects.len(),
+            plan_res.critic_output.disputed_steps.len(),
+            plan_res.critic_output.unverified_assumptions.len(),
+            plan_res.critic_elapsed_ms
+        ));
+        out.push_str(&format!(
+            "| **Lens 3: Rebuttal** | Scope Arbiter (Critic of Critic) | **{} dismissed hedges**, {} accepted critiques (⏱️ {} ms) |\n",
+            plan_res.rebuttal_output.dismissed_critiques.len(),
+            plan_res.rebuttal_output.accepted_critiques.len(),
+            plan_res.rebuttal_elapsed_ms
+        ));
+        out.push_str(&format!(
+            "| **Lens 4: Reconciler** | Convergence Harmonizer (Synthesis) | **{} verified steps**, {} risks, {} commands (⏱️ {} ms) |\n",
+            rec.steps.len(),
+            rec.risks.len(),
+            rec.validation_commands.len(),
+            plan_res.reconciler_elapsed_ms
+        ));
+        out.push_str(&format!(
+            "| **Node 5: Host Arbiter** | Deterministic Lease Validation | 🎯 **{} decisions committed** to Notebook ({} valid files, {} unbacked dropped) |\n\n",
+            plan_res.committed_decision_ids.len(),
+            plan_res.arbiter_validated_files.len(),
+            plan_res.arbiter_dropped_files.len()
+        ));
+
+        out.push_str(&format!("**Plan Objective**: {}\n\n", rec.objective));
+
+        if !plan_res.rebuttal_output.dismissed_critiques.is_empty() {
+            out.push_str("<details>\n<summary><b>🛡️ Lens 3 Appellate Audit: Dismissed Critic Hedges (Analysis Paralysis Prevention)</b></summary>\n\n");
+            for item in &plan_res.rebuttal_output.dismissed_critiques {
+                out.push_str(&format!("- **Critique**: {}\n  - *Rebuttal Justification*: {}\n", item.critique, item.justification));
+            }
+            out.push_str("\n</details>\n\n");
+        }
+
+        if !plan_res.rebuttal_output.accepted_critiques.is_empty() {
+            out.push_str("<details>\n<summary><b>✅ Lens 3 Appellate Audit: Accepted Critiques (Adopted into Plan)</b></summary>\n\n");
+            for critique in &plan_res.rebuttal_output.accepted_critiques {
+                out.push_str(&format!("- {}\n", critique));
+            }
+            out.push_str("\n</details>\n\n");
+        }
+
+        if !plan_res.arbiter_dropped_files.is_empty() {
+            out.push_str("<details>\n<summary><b>🛡️ Host-Pruned Unleased Files</b></summary>\n\n");
+            for file in &plan_res.arbiter_dropped_files {
+                out.push_str(&format!("- `{}`: {}\n", file.path, file.reason));
+            }
+            out.push_str("\n</details>\n\n");
         }
     }
 
@@ -3427,5 +3859,191 @@ mod tests {
         // Cited entries must contain the verified inference ID
         assert!(!result.answer.cited_entries.is_empty());
         assert!(result.answer.cited_entries.contains(&verified_inf.unwrap().id));
+    }
+
+    #[tokio::test]
+    async fn test_step3b_appellate_planning_gate_validates_leases_and_commits_decisions() {
+        struct PlanMockLlm;
+
+        #[async_trait]
+        impl LlmClient for PlanMockLlm {
+            async fn complete_json(&self, request: LlmRequest) -> Result<LlmResponse> {
+                let raw_json = match request.phase {
+                    Phase::Intake => r#"{
+                        "reasoning": "User asks where UI configures route settings.",
+                        "needs_workspace_search": true,
+                        "intents": [
+                            {
+                                "intent": "WorkspaceSearch",
+                                "summary": "Locate UI route settings configuration in codebase",
+                                "needs_workspace_search": true,
+                                "direct_response": null,
+                                "search_queries": ["route", "view"]
+                            }
+                        ],
+                        "target_hints": ["route"],
+                        "constraints": []
+                    }"#.to_string(),
+                    Phase::IntakeCritic => r#"{
+                        "approved": true,
+                        "critique": "Draft approved.",
+                        "has_dropped_clauses": false,
+                        "has_contaminated_queries": false,
+                        "corrected_intents": null
+                    }"#.to_string(),
+                    Phase::CandidateGate | Phase::CandidateGateOptimist | Phase::CandidateGateSkeptic => r#"{
+                        "evaluations": [
+                            { "path": "src/routes.tsx", "keep": true, "reason": "Configures routes" }
+                        ]
+                    }"#.to_string(),
+                    Phase::Extract => {
+                        let found_lease = request.prompt
+                            .lines()
+                            .find(|l| l.starts_with("LEASE "))
+                            .and_then(|l| l.strip_prefix("LEASE "))
+                            .unwrap_or("mock-lease");
+
+                        format!(r#"{{
+                            "inferences": [
+                                {{
+                                    "statement": "src/routes.tsx defines AppRoutes which renders the navigation tree.",
+                                    "lease_id": "{}",
+                                    "tags": ["route", "AppRoutes"]
+                                }}
+                            ],
+                            "sufficient": true,
+                            "missing": []
+                        }}"#, found_lease)
+                    }
+                    Phase::PlanProposer => r#"{
+                        "objective": "Document and verify application routing architecture",
+                        "affected_files": [
+                            { "path": "src/routes.tsx", "reason": "Houses primary route declarations" },
+                            { "path": "src/hallucinated_unleased.ts", "reason": "Speculative helper not in repo" }
+                        ],
+                        "steps": [
+                            { "title": "Inspect AppRoutes", "detail": "Verify route path bindings in routes.tsx" },
+                            { "title": "Audit Deep Links", "detail": "Check deep link handler" }
+                        ],
+                        "risks": ["Speculative deep link handling might not exist"],
+                        "validation_commands": ["npm test"]
+                    }"#.to_string(),
+                    Phase::PlanCritic => r#"{
+                        "critique": "The plan assumes deep link handling exists without leased evidence.",
+                        "missing_aspects": ["Deep link configuration context"],
+                        "disputed_steps": ["Audit Deep Links is unbacked"],
+                        "unverified_assumptions": ["Assumes application supports URL deep linking"],
+                        "additional_risks": ["Scope creep on unsupported features"]
+                    }"#.to_string(),
+                    Phase::PlanRebuttal => r#"{
+                        "rebuttal": "Deep link handling is an overblown hedge; this is a desktop app using internal view switching. However, we should verify route fallback.",
+                        "dismissed_critiques": [
+                            {
+                                "critique": "Assumes application supports URL deep linking",
+                                "justification": "Evidence establishes this is a desktop view-switching architecture; deep link URL routing is out of scope."
+                            }
+                        ],
+                        "accepted_critiques": ["Audit Deep Links is unbacked"]
+                    }"#.to_string(),
+                    Phase::PlanReconciler => r#"{
+                        "objective": "Verify and document application route structure in routes.tsx",
+                        "affected_files": [
+                            { "path": "src/routes.tsx", "reason": "Houses primary route declarations" },
+                            { "path": "src/hallucinated_unleased.ts", "reason": "Speculative helper" }
+                        ],
+                        "steps": [
+                            { "title": "Inspect AppRoutes", "detail": "Verify route path bindings in routes.tsx" },
+                            { "title": "Verify Route Fallback", "detail": "Ensure fallback route handles unknown views" }
+                        ],
+                        "risks": ["Potential unregistered view IDs"],
+                        "validation_commands": ["npm test"]
+                    }"#.to_string(),
+                    _ => "{}".to_string(),
+                };
+
+                Ok(LlmResponse {
+                    call_id: request.call_id,
+                    raw_json,
+                    usage: crate::traits::LlmUsage::default(),
+                })
+            }
+        }
+
+        #[async_trait]
+        impl TokenCounter for PlanMockLlm {
+            async fn count_tokens(&self, text: &str) -> usize {
+                text.len() / 4
+            }
+        }
+
+        let task = TaskRequest {
+            run_id: "test-plan-run".to_string(),
+            session_id: "test-plan-session".to_string(),
+            workspace_path: None,
+            question: "where does the UI configure route settings".to_string(),
+            conversation: Vec::new(),
+            budgets: crate::types::Budgets::default(),
+            intake_only: false,
+        };
+
+        let progress = CollectProgress {
+            messages: std::sync::Arc::new(Mutex::new(Vec::new())),
+        };
+
+        let result = run_agent(
+            task,
+            AgentRuntime {
+                llm: &PlanMockLlm,
+                code_search: &MockSearch,
+                file_reader: &MockReader,
+                token_counter: &PlanMockLlm,
+                progress: &progress,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.answer.stop_reason, StopReason::Done);
+
+        // 1. Check Double Stereoscopic Gate rendered in content
+        assert!(result.answer.content.contains("Step 3B: Appellate Planning Gate"));
+        assert!(result.answer.content.contains("Lens 1: Proposer"));
+        assert!(result.answer.content.contains("Lens 2: Critic"));
+        assert!(result.answer.content.contains("Lens 3: Rebuttal"));
+        assert!(result.answer.content.contains("Lens 4: Reconciler"));
+        assert!(result.answer.content.contains("Node 5: Host Arbiter"));
+
+        // 2. Check Appellate Audit: dismissed critic hedges & accepted critiques
+        assert!(result.answer.content.contains("Dismissed Critic Hedges"));
+        assert!(result.answer.content.contains("desktop view-switching architecture"));
+        assert!(result.answer.content.contains("Accepted Critiques"));
+
+        // 3. Check Host Arbiter Evidence-Backing enforcement:
+        //    src/routes.tsx was leased -> kept!
+        //    src/hallucinated_unleased.ts was NOT leased -> pruned by Host Arbiter!
+        assert!(result.answer.content.contains("Host-Pruned Unleased Files"));
+        assert!(result.answer.content.contains("src/hallucinated_unleased.ts"));
+
+        // 4. Check Notebook Decisions committed
+        let active_entries = result.answer.notebook.active_entries();
+        let decisions: Vec<_> = active_entries
+            .iter()
+            .filter(|e| e.kind == crate::notebook::EntryKind::Decision)
+            .collect();
+
+        assert!(!decisions.is_empty(), "Expected plan decisions committed to notebook");
+
+        let obj_decision = decisions.iter().find(|d| d.statement.contains("Plan Objective:"));
+        assert!(obj_decision.is_some(), "Expected Plan Objective decision");
+
+        let step_decisions: Vec<_> = decisions.iter().filter(|d| d.statement.contains("Plan Step")).collect();
+        assert_eq!(step_decisions.len(), 2, "Expected 2 step decisions");
+
+        let target_decision = decisions.iter().find(|d| d.statement.contains("src/routes.tsx"));
+        assert!(target_decision.is_some(), "Expected target file decision for leased routes.tsx");
+
+        // The hallucinated unleased file must NOT have a Decision entry
+        let unleased_decision = decisions.iter().find(|d| d.statement.contains("src/hallucinated_unleased.ts"));
+        assert!(unleased_decision.is_none(), "Unleased target file must not be committed to notebook as decision");
     }
 }

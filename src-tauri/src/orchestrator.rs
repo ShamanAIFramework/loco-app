@@ -229,6 +229,13 @@ impl LlmClient for LlamaServerClient {
                 "strict": true
             }
         });
+        let max_tokens = match request.phase {
+            agent_core::Phase::Intake | agent_core::Phase::IntakeCritic => 512,
+            agent_core::Phase::CandidateGate | agent_core::Phase::CandidateGateOptimist | agent_core::Phase::CandidateGateSkeptic => 512,
+            agent_core::Phase::Extract => 768,
+            agent_core::Phase::Plan | agent_core::Phase::PlanProposer | agent_core::Phase::PlanCritic | agent_core::Phase::PlanRebuttal | agent_core::Phase::PlanReconciler => 768,
+            agent_core::Phase::Synthesize => 1024,
+        };
         let req_body = json!({
             "messages": [
                 {
@@ -238,7 +245,7 @@ impl LlmClient for LlamaServerClient {
             ],
             "temperature": request.temperature,
             "stream": false,
-            "max_tokens": 2048,
+            "max_tokens": max_tokens,
             "response_format": response_format
         });
 
@@ -703,15 +710,26 @@ impl CodeSearch for TauriCodeSearch {
                 }
             }
 
-            let mut hits = candidates
+            let mut candidate_list: Vec<_> = candidates
                 .into_values()
                 .map(|(file, symbol)| {
+                    let base_score = score_symbol_hit(&file.path, &symbol.name, &query);
+                    (file, symbol, base_score)
+                })
+                .collect();
+            candidate_list.sort_by(|a, b| b.2.cmp(&a.2));
+            let pool_size = limit.max(20).min(candidate_list.len());
+
+            let mut hits = candidate_list
+                .into_iter()
+                .take(pool_size)
+                .map(|(file, symbol, base_score)| {
                     let edge_boost = state
                         .codegraph
                         .symbol_graph_distance_to_query(&project_id, &symbol.id, &query, 2)
                         .map(|distance| symbol_graph_distance_boost(distance))
                         .unwrap_or_default();
-                    let score = score_symbol_hit(&file.path, &symbol.name, &query) + edge_boost;
+                    let score = base_score + edge_boost;
                     SymbolHit {
                         path: file.path,
                         symbol: symbol.name,

@@ -170,10 +170,94 @@ pub fn plan_instruction() -> String {
         "QUESTION",
         "Draft a safe implementation plan for this local coding change. Do not propose an edit artifact yet and do not claim files were changed.",
         "Use only active notebook entries and leased evidence. If evidence is incomplete, make the plan narrow and name the uncertainty in risks.",
-        "Affected files should include only files that current evidence supports as likely touch points.",
+        "For edit requests: propose concrete implementation actions, affected files, risks, and validation commands.",
+        "For location, search, or explanatory requests: propose concrete verification and synthesis steps, key files to cite, potential ambiguities or risks in the explanation, and validation checks.",
+        "Affected files should include only files that current evidence supports as likely touch points or primary citations.",
         "For user-facing, startup, loading, layout, styling, interaction, or display changes, prefer evidence-backed entrypoints, screens/views, components/widgets, templates, styles, routing/navigation, app shell, and app/window/display configuration. Do not involve unrelated orchestration, search, service, build, or model/AI plumbing files unless cited evidence shows they are directly required.",
-        "Steps should be concrete implementation actions the host could later turn into edit artifacts.",
-        "Validation commands should be commands the user or host can run in this workspace after edits. Infer them from evidence such as project manifests, scripts, build files, test files, or existing repository conventions; do not assume a language or framework.",
+        "Validation commands should be commands the user or host can run in this workspace. Infer them from evidence such as project manifests, scripts, build files, test files, or existing repository conventions; do not assume a language or framework.",
+    ]
+    .join("\n")
+}
+
+pub fn plan_critic_instruction(plan_json: &str) -> String {
+    [
+        "QUESTION",
+        "EVALUATION PERSPECTIVE: ADVERSARIAL PLAN CRITIC (ANTITHESIS)",
+        "Role: You are an adversarial code and plan auditor challenging the proposed plan.",
+        "Mission: Scrutinize every detail of the proposed plan. Challenge missing dependencies, uninspected files, unverified assumptions, and regression risks.",
+        "",
+        "Proposed Plan to Evaluate:",
+        "```json",
+        plan_json.trim(),
+        "```",
+        "",
+        "Audit Guidelines:",
+        "1. Missing Aspects: Identify any critical dependencies, caller/callee context, edge cases, configuration, or structural patterns that the plan failed to account for.",
+        "2. Disputed Steps: Challenge any step that assumes too much, makes unverified changes, lacks leased evidence backing, or is logically out of sequence.",
+        "3. Unverified Assumptions: Highlight any unverified hypothesis or dependency (e.g. 'assumes service X exists or function Y handles Z without evidence').",
+        "4. Additional Risks: List concrete regression hazards, breaking changes, or gaps in validation.",
+        "",
+        "Return one JSON object matching schema `PlanCriticOutput`.",
+    ]
+    .join("\n")
+}
+
+pub fn plan_rebuttal_instruction(plan_json: &str, critic_json: &str) -> String {
+    [
+        "QUESTION",
+        "EVALUATION PERSPECTIVE: PRAGMATIC SCOPE ARBITER / REBUTTAL (CRITIC OF THE CRITIC)",
+        "Role: You are an appellate defender and scope auditor evaluating the critic's objections.",
+        "Mission: Distinguish between genuine blocking hazards and pedantic analysis paralysis / overblown hedges.",
+        "",
+        "Proposed Plan:",
+        "```json",
+        plan_json.trim(),
+        "```",
+        "",
+        "Adversarial Critique:",
+        "```json",
+        critic_json.trim(),
+        "```",
+        "",
+        "Rebuttal Guidelines:",
+        "1. Eliminate Analysis Paralysis: If the critic demands unnecessary context (e.g., 'we don't know enough about Y'), evaluate whether knowing Y is strictly required to fulfill the user request. If current leased evidence and notebook entries are sufficient, dismiss the critique with clear technical justification.",
+        "2. Dismissed Critiques: Put overblown hedges, speculative unknowns, and out-of-scope concerns into `dismissed_critiques` with a precise justification explaining why the existing evidence is sufficient.",
+        "3. Accepted Critiques: Concede valid risks, missed edge cases, or genuine regressions into `accepted_critiques` so they can be incorporated into the final plan.",
+        "",
+        "Return one JSON object matching schema `PlanRebuttalOutput`.",
+    ]
+    .join("\n")
+}
+
+pub fn plan_reconciler_instruction(plan_json: &str, critic_json: &str, rebuttal_json: &str) -> String {
+    [
+        "QUESTION",
+        "EVALUATION PERSPECTIVE: CONVERGENCE RECONCILER (SYNTHESIS)",
+        "Role: You are the final planning reconciler harmonizing the proposal, critique, and rebuttal.",
+        "Mission: Produce a lean, verified, actionable final EditPlan.",
+        "",
+        "Initial Plan:",
+        "```json",
+        plan_json.trim(),
+        "```",
+        "",
+        "Adversarial Critique:",
+        "```json",
+        critic_json.trim(),
+        "```",
+        "",
+        "Pragmatic Rebuttal:",
+        "```json",
+        rebuttal_json.trim(),
+        "```",
+        "",
+        "Reconciliation Guidelines:",
+        "1. Adopt all `accepted_critiques` to harden the plan against real bugs, edge cases, and regressions.",
+        "2. Exclude all `dismissed_critiques` to avoid analysis paralysis, unnecessary rabbit holes, or out-of-scope files.",
+        "3. Ensure all affected files are supported by active leased evidence.",
+        "4. Output the final consolidated plan.",
+        "",
+        "Return one JSON object matching schema `EditPlan`.",
     ]
     .join("\n")
 }
@@ -181,11 +265,11 @@ pub fn plan_instruction() -> String {
 pub fn extract_instruction() -> String {
     [
         "QUESTION",
-        "Extract only atomic claims supported by leased evidence. Do not propose edits.",
+        "Extract 2 to 5 high-value, non-redundant atomic claims directly addressing the user request from leased evidence. Do not propose edits.",
+        "Quality over quantity: Provide only the most informative claims that directly inform or answer the user request. Never repeat similar or overlapping statements.",
         "Every inference must cite exactly one provided lease_id. Copy lease ids exactly.",
         "Each statement should preserve the most specific file path, line range, symbol/block name, and user-facing UI/code purpose available.",
         "For user-facing location questions, identify the exact render/output block, screen/view section, list/map/loop/conditional, template, component/widget, or display code when present.",
-        "For implementation questions, distinguish definitions, callers, state/data flow, API/command/event boundaries, configuration, persistence, and rendering/output code.",
         "Set sufficient=true when the evidence directly answers the request. Use missing only for concrete additional evidence the host should search for; do not ask the user for missing code evidence.",
     ]
     .join("\n")
@@ -460,6 +544,72 @@ pub fn schema_plan() -> serde_json::Value {
             }
         },
         "required": ["objective", "affected_files", "steps", "risks", "validation_commands"],
+        "additionalProperties": false
+    })
+}
+
+pub fn schema_plan_critic() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "critique": {
+                "type": "string",
+                "description": "Thorough critique challenging the proposed plan, dependencies, and assumptions."
+            },
+            "missing_aspects": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Critical dependencies, files, edge cases, or contexts overlooked by the plan."
+            },
+            "disputed_steps": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Proposed steps that are premature, risky, unsupported by evidence, or flawed."
+            },
+            "unverified_assumptions": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Assumptions in the plan that lack verification in leased evidence."
+            },
+            "additional_risks": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Potential regression or architectural failure risks."
+            }
+        },
+        "required": ["critique", "missing_aspects", "disputed_steps", "unverified_assumptions", "additional_risks"],
+        "additionalProperties": false
+    })
+}
+
+pub fn schema_plan_rebuttal() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "rebuttal": {
+                "type": "string",
+                "description": "Evaluation of the critique, defending viable paths and explaining why certain objections are unnecessary hedges."
+            },
+            "dismissed_critiques": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "critique": { "type": "string" },
+                        "justification": { "type": "string" }
+                    },
+                    "required": ["critique", "justification"],
+                    "additionalProperties": false
+                },
+                "description": "Critiques dismissed as overblown hedges, pedantic blockers, or out-of-scope concerns."
+            },
+            "accepted_critiques": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Valid critiques that must be addressed in the reconciled plan."
+            }
+        },
+        "required": ["rebuttal", "dismissed_critiques", "accepted_critiques"],
         "additionalProperties": false
     })
 }

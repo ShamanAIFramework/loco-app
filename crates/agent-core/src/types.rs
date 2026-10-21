@@ -47,7 +47,7 @@ pub struct Budgets {
 impl Default for Budgets {
     fn default() -> Self {
         Self {
-            max_llm_calls: 4,
+            max_llm_calls: 12,
             max_extract_rounds: 2,
             max_search_queries: 5,
             max_files_to_read: 6,
@@ -69,6 +69,10 @@ pub enum Phase {
     CandidateGateOptimist,
     CandidateGateSkeptic,
     Plan,
+    PlanProposer,
+    PlanCritic,
+    PlanRebuttal,
+    PlanReconciler,
     Extract,
     Synthesize,
 }
@@ -171,6 +175,50 @@ pub struct PlannedFile {
 pub struct PlanStep {
     pub title: String,
     pub detail: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PlanCriticOutput {
+    pub critique: String,
+    #[serde(default)]
+    pub missing_aspects: Vec<String>,
+    #[serde(default)]
+    pub disputed_steps: Vec<String>,
+    #[serde(default)]
+    pub unverified_assumptions: Vec<String>,
+    #[serde(default)]
+    pub additional_risks: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PlanRebuttalOutput {
+    pub rebuttal: String,
+    #[serde(default)]
+    pub dismissed_critiques: Vec<RebuttalItem>,
+    #[serde(default)]
+    pub accepted_critiques: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RebuttalItem {
+    pub critique: String,
+    pub justification: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PlanStepResults {
+    pub proposed_plan: EditPlan,
+    pub critic_output: PlanCriticOutput,
+    pub rebuttal_output: PlanRebuttalOutput,
+    pub reconciled_plan: EditPlan,
+    pub arbiter_validated_files: Vec<PlannedFile>,
+    pub arbiter_dropped_files: Vec<PlannedFile>,
+    pub committed_decision_ids: Vec<EntryId>,
+    pub proposer_elapsed_ms: u64,
+    pub critic_elapsed_ms: u64,
+    pub rebuttal_elapsed_ms: u64,
+    pub reconciler_elapsed_ms: u64,
+    pub total_elapsed_ms: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
