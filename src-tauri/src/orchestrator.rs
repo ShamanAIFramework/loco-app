@@ -1,7 +1,7 @@
 // src-tauri/src/orchestrator.rs
 //! Tauri host adapter for the deterministic agent-core runtime.
 
-use crate::agent::{AgentEvent, SourceRef};
+use crate::agent::{AgentEvent, NotebookEntryView, SourceRef};
 use crate::codegraph::{SourceFile, Symbol};
 use crate::conversation_store::Role;
 use crate::engine::EngineState;
@@ -148,9 +148,13 @@ pub async fn prompt_agent_v2(
 
     let final_response = result.answer.content.clone();
     let sources = collect_answer_sources(&result.answer);
+    let notebook_views = collect_notebook_views(&result.answer.notebook);
     let _ = on_chunk.send(AgentEvent::Chunk(final_response.clone()));
     if !sources.is_empty() {
         let _ = on_chunk.send(AgentEvent::Sources(sources));
+    }
+    if !notebook_views.is_empty() {
+        let _ = on_chunk.send(AgentEvent::Notebook(notebook_views));
     }
 
     tauri::async_runtime::spawn_blocking(move || -> Result<_> {
@@ -1147,6 +1151,43 @@ fn collect_answer_sources(answer: &agent_core::AgentAnswer) -> Vec<SourceRef> {
 
     sources.truncate(3);
     sources
+}
+
+fn collect_notebook_views(notebook: &agent_core::Notebook) -> Vec<NotebookEntryView> {
+    notebook
+        .active_entries()
+        .into_iter()
+        .map(|entry| {
+            let (file_path, line_range, symbol, lease_id) = match &entry.provenance {
+                agent_core::Provenance::File {
+                    path,
+                    symbol,
+                    range,
+                    lease_id,
+                } => (
+                    Some(path.clone()),
+                    Some([range.start, range.end]),
+                    symbol.clone(),
+                    Some(lease_id.0.clone()),
+                ),
+                _ => (None, None, None, None),
+            };
+
+            NotebookEntryView {
+                id: entry.id.0.clone(),
+                kind: format!("{:?}", entry.kind),
+                statement: entry.statement.clone(),
+                phase: format!("{:?}", entry.phase),
+                status: format!("{:?}", entry.status),
+                tags: entry.tags.iter().cloned().collect(),
+                file_path,
+                line_range,
+                symbol,
+                lease_id,
+                depends_on: entry.depends_on.iter().map(|id| id.0.clone()).collect(),
+            }
+        })
+        .collect()
 }
 
 fn source_from_entry(entry: &agent_core::NotebookEntry) -> Option<SourceRef> {

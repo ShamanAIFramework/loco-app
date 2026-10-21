@@ -2,15 +2,17 @@ import { createSignal, createEffect, onCleanup, Show } from "solid-js";
 import { invoke, Channel } from "@tauri-apps/api/core";
 import AIConversation, { Message, SourceRef } from "./AIConversation";
 import { SessionDetails } from "./App";
+import { NotebookEntryView } from "./types/notebook";
 
 interface AiChatProps {
   session: SessionDetails;
+  onNotebookUpdate?: (entries: NotebookEntryView[]) => void;
 }
 
 // Define the structured event we expect from Rust
 interface AgentEvent {
-  type: "Status" | "Chunk" | "Sources";
-  data: string | SourceRef[];
+  type: "Status" | "Chunk" | "Sources" | "Notebook";
+  data: string | SourceRef[] | NotebookEntryView[];
 }
 
 export default function AiChat(props: AiChatProps) {
@@ -125,6 +127,8 @@ export default function AiChat(props: AiChatProps) {
             }
             return updated;
           });
+        } else if (event.type === "Notebook") {
+          props.onNotebookUpdate?.(event.data as NotebookEntryView[]);
         }
       };
 
