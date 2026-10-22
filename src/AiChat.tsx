@@ -29,7 +29,6 @@ export default function AiChat(props: AiChatProps) {
   const [statusElapsedMs, setStatusElapsedMs] = createSignal(0);
 
   let chatContainerRef: HTMLDivElement | undefined;
-  let scrollPending = false;
   let statusStartedAt = 0;
   let statusTimer: number | undefined;
 
@@ -49,13 +48,10 @@ export default function AiChat(props: AiChatProps) {
   };
 
   const scheduleScroll = () => {
-    if (scrollPending) return;
-    scrollPending = true;
-    requestAnimationFrame(() => {
+    queueMicrotask(() => {
       if (chatContainerRef) {
         chatContainerRef.scrollTop = chatContainerRef.scrollHeight;
       }
-      scrollPending = false;
     });
   };
 
@@ -66,7 +62,6 @@ export default function AiChat(props: AiChatProps) {
   });
 
   onCleanup(() => {
-    scrollPending = false;
     if (statusTimer) window.clearInterval(statusTimer);
   });
 

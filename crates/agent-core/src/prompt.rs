@@ -278,11 +278,15 @@ pub fn extract_instruction() -> String {
 pub fn synthesize_instruction() -> String {
     [
         "QUESTION",
-        "Write a concise final answer for a local coding assistant.",
-        "For location questions, lead with the exact file and line range, then explain what that block does.",
+        "Write a direct, accurate, and concise final answer for a local coding assistant addressing the user's request.",
+        "Address all parts and intents of the request:",
+        "- For code location questions, lead with the exact file and line range, then explain what that block does based on active evidence and notebook inferences.",
+        "- For questions asking whether code aligns with best practices or conventions, evaluate the observed codebase patterns authoritatively against standard software engineering practices.",
+        "- Do not defensively hedge (e.g. do not say 'without further context it is uncertain' or 'requires more detailed review') when evaluating visible architecture against standard design patterns.",
+        "- If the request mentions a specific library or pattern that differs from the observed code (such as a multi-page routing framework when the app uses state-driven view switching), clearly explain what the codebase actually does and compare the trade-offs.",
+        "- Ground code-level facts in active notebook entry ids. Prefer the narrowest relevant file range and avoid background citations.",
+        "- If code evidence was genuinely not found in the repository, state that clearly instead of guessing.",
         "Do not include a markdown Sources section, notebook ids, lease ids, hashes, or internal tracing details; the UI renders structured sources separately.",
-        "Cite only active notebook entry ids that directly support claims in the answer. Prefer the narrowest relevant file range and avoid background citations.",
-        "If evidence is weak or incomplete, say exactly what is uncertain and why.",
     ]
     .join("\n")
 }
@@ -783,7 +787,7 @@ pub fn schema_synthesize() -> serde_json::Value {
         "properties": {
             "answer": {
                 "type": "string",
-                "description": "Concise user-facing answer. Do not include Sources, notebook ids, lease ids, or hashes."
+                "description": "Concise user-facing answer. Ground code facts in leased evidence and architectural evaluation in standard conventions without defensive hedging. Do not include Sources, notebook ids, lease ids, or hashes."
             },
             "cited_entries": {
                 "type": "array",
@@ -901,6 +905,7 @@ mod tests {
         assert!(extract.contains("Copy lease ids exactly"));
         assert!(synthesize.contains("Do not include a markdown Sources section"));
         assert!(synthesize.contains("structured sources separately"));
+        assert!(synthesize.contains("Do not defensively hedge"));
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use crate::knowledge::{detect_stack_tags, KnowledgeDomain, KnowledgeEngine};
 use crate::notebook::{EntryId, Notebook, Provenance};
 use crate::prompt::{
     evidence_block, extract_instruction, global_prefix, intake_critic_instruction,
@@ -6,7 +7,8 @@ use crate::prompt::{
     plan_instruction, plan_rebuttal_instruction, plan_reconciler_instruction,
     prompt_candidate_gate_optimist, prompt_candidate_gate_skeptic, schema_candidate_gate,
     schema_extract, schema_intake, schema_intake_critic, schema_plan, schema_plan_critic,
-    schema_plan_rebuttal, task_block, CandidateGateItem, PromptParts,
+    schema_plan_rebuttal, schema_synthesize, synthesize_instruction, task_block,
+    CandidateGateItem, PromptParts,
 };
 use crate::trace::{Trace, TraceEvent};
 use crate::traits::{
@@ -16,8 +18,8 @@ use crate::traits::{
 use crate::types::{
     AgentAnswer, CandidateGateOutput, ContentHit, CriticOutput, EditPlan, EvidenceSlice,
     ExtractOutput, FileHit, IntakeOutput, IntentItem, MissingEvidence, Phase, PlanCriticOutput,
-    PlanRebuttalOutput, PlanStep, PlanStepResults, PlannedFile, StopReason, SymbolHit, TaskRequest,
-    TriadConsensus, UserIntent, VectorHit,
+    PlanRebuttalOutput, PlanStep, PlanStepResults, PlannedFile, StopReason, SymbolHit,
+    SynthesizeOutput, TaskRequest, TriadConsensus, UserIntent, VectorHit,
 };
 use anyhow::{Context, Result};
 use serde::de::DeserializeOwned;
@@ -1073,6 +1075,9 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
     // STEP 3B: Universal Plan Phase (Appellate Stereoscopic Gate)
     // =========================================================================
     let mut plan_result: Option<PlanStepResults> = None;
+    let knowledge_engine = KnowledgeEngine::new_with_builtin();
+    let leased_paths: Vec<String> = phase2.leased_slices.iter().map(|s| s.lease.path.clone()).collect();
+    let detected_tags = detect_stack_tags(&repo_map, &task.question, &leased_paths);
 
     if !task.intake_only {
         runtime
@@ -1082,13 +1087,26 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
 
         let plan_start = std::time::Instant::now();
 
+        let plan_cards = knowledge_engine.match_cards(
+            &task.question,
+            &detected_tags,
+            Some(&[KnowledgeDomain::CodeReview, KnowledgeDomain::Architecture]),
+            2,
+        );
+        let rubric_block = if !plan_cards.is_empty() {
+            format!("\n\n{}", knowledge_engine.format_cards_for_prompt(&plan_cards))
+        } else {
+            String::new()
+        };
+
         // 1. Invariant context prefix shared by all 4 lenses for maximum KV-cache reuse
         let shared_context_prefix = format!(
-            "{}\n\n{}\n\n{}\n\n{}",
+            "{}\n\n{}\n\n{}\n\n{}{}",
             global_prefix(&repo_map),
             task_block(&task),
             notebook_block(&notebook, &[], 25),
             evidence_block(&phase2.leased_slices),
+            rubric_block,
         );
 
         // --- Lens 1: Plan Proposer (Thesis) ---
@@ -1428,7 +1446,7 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
         });
     }
 
-    let content = format_step1_and_step2_report(
+    let diagnostic_report = format_step1_and_step2_report(
         &task,
         &intake_prompt,
         &intake_resp,
@@ -1441,15 +1459,147 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
         &notebook,
     );
 
+    // =========================================================================
+    // STEP 3C: Final Answer Synthesis (Phase::Synthesize)
+    // =========================================================================
+    let (final_content, stop_reason) = if !task.intake_only {
+        runtime
+            .progress
+            .emit(AgentProgress::Status("Step 3C: Synthesizing final answer from verified evidence".to_string()))
+            .await;
+
+        let synth_start = std::time::Instant::now();
+        record_trace!(TraceEvent::PhaseStarted {
+            phase: Phase::Synthesize,
+        });
+
+        let mut guidance_block = String::new();
+        let direct_guidance: Vec<_> = triad
+            .final_intents
+            .iter()
+            .filter_map(|i| {
+                i.direct_response
+                    .as_deref()
+                    .map(|r| (i.summary.as_str(), r))
+            })
+            .collect();
+
+        let synth_cards = knowledge_engine.match_cards(
+            &task.question,
+            &detected_tags,
+            Some(&[KnowledgeDomain::Architecture, KnowledgeDomain::StackIdiom, KnowledgeDomain::Security]),
+            2,
+        );
+
+        if !direct_guidance.is_empty() || !synth_cards.is_empty() {
+            guidance_block.push_str("ESTABLISHED ARCHITECTURAL CONTEXT & GUIDANCE\n");
+            for (summary, response) in direct_guidance {
+                guidance_block.push_str(&format!("- {}: {}\n", summary, response));
+            }
+            for card in synth_cards {
+                guidance_block.push_str(&format!("### {}\n{}\n", card.title, card.summary));
+                for rule in &card.rules {
+                    guidance_block.push_str(&format!("- {}\n", rule));
+                }
+            }
+            guidance_block.push_str("Use this guidance authoritatively to address general/best-practice questions without defensive hedging.");
+        }
+
+        let mut prompt_sections = vec![
+            global_prefix(&repo_map),
+            phase_prefix(Phase::Synthesize, "SynthesizeOutput"),
+            task_block(&task),
+            notebook_block(&notebook, &[], 35),
+            evidence_block(&phase2.leased_slices),
+        ];
+        if !guidance_block.is_empty() {
+            prompt_sections.push(guidance_block);
+        }
+        prompt_sections.push(synthesize_instruction());
+
+        let synth_prompt = prompt_sections.join("\n\n");
+
+        let synth_req = LlmRequest {
+            call_id: call_id("synth"),
+            phase: Phase::Synthesize,
+            schema_name: "SynthesizeOutput".to_string(),
+            schema: schema_synthesize(),
+            prompt_parts: None,
+            prompt: synth_prompt,
+            temperature: 0.0,
+        };
+
+        let synth_resp = match runtime.llm.complete_json(synth_req.clone()).await {
+            Ok(resp) => {
+                record_trace!(TraceEvent::LlmCall {
+                    request: synth_req.clone(),
+                    response: resp.clone(),
+                });
+                Some(resp)
+            }
+            Err(err) => {
+                record_trace!(TraceEvent::ToolCall {
+                    name: "synthesize_failed".to_string(),
+                    args: json!({ "error": err.to_string() }),
+                    result_count: 0,
+                });
+                None
+            }
+        };
+
+        let synth_output = synth_resp
+            .as_ref()
+            .and_then(|r| parse_json::<SynthesizeOutput>(&r.raw_json).ok());
+
+        let (synth_answer, synth_stop_reason) = if let Some(out) = synth_output {
+            for entry_id in out.cited_entries {
+                if notebook.get(&entry_id).is_some() && !cited_entries.contains(&entry_id) {
+                    cited_entries.push(entry_id);
+                }
+            }
+            (out.answer, out.stop_reason)
+        } else {
+            let fallback_answer = if let Some(ext) = &extract_result {
+                let inferences: Vec<_> = ext
+                    .inferences
+                    .iter()
+                    .filter(|i| i.is_valid)
+                    .map(|i| i.statement.as_str())
+                    .collect();
+                if !inferences.is_empty() {
+                    format!("Based on the codebase evidence:\n\n{}", inferences.join("\n\n"))
+                } else {
+                    format!("Evaluated workspace evidence for: {}", task.question)
+                }
+            } else {
+                format!("Evaluated workspace evidence for: {}", task.question)
+            };
+            (fallback_answer, StopReason::Done)
+        };
+
+        let synth_elapsed_ms = synth_start.elapsed().as_millis() as u64;
+
+        let full_content = format!(
+            "{}\n\n<details>\n<summary><b>🛠️ Pipeline Diagnostics & Appellate Audit (Steps 1 – 3B | Synth: {}ms)</b></summary>\n\n{}\n</details>",
+            synth_answer.trim(),
+            synth_elapsed_ms,
+            diagnostic_report.trim(),
+        );
+
+        (full_content, synth_stop_reason)
+    } else {
+        (diagnostic_report, StopReason::Done)
+    };
+
     let answer = AgentAnswer {
-        content,
-        stop_reason: StopReason::Done,
+        content: final_content,
+        stop_reason,
         cited_entries,
         notebook,
     };
 
     record_trace!(TraceEvent::RunFinished {
-        stop_reason: StopReason::Done,
+        stop_reason,
     });
 
     Ok(AgentRunResult { answer, trace })
@@ -1922,7 +2072,7 @@ fn arbitrate_triad(
                 summary: bp_summary,
                 needs_workspace_search: false,
                 direct_response: Some(
-                    "In frontend desktop and single-window applications, navigation is commonly structured either via state-driven view switching (e.g. conditional rendering based on active session or application state) or via dedicated declarative routers (e.g. React Router, Solid Router, or TanStack Router). When URLs or browser history are not required, state-driven view switching is clean, minimal, and avoids unnecessary routing dependencies.".to_string(),
+                    "In desktop and single-window client applications, navigation is commonly structured either via state-driven view switching (e.g. conditional rendering based on active session or application state) or via dedicated declarative routers. When browser URL history or deep-linking is not required, state-driven view switching is clean, minimal, and avoids unnecessary routing dependencies.".to_string(),
                 ),
                 search_queries: Vec::new(),
             });
@@ -4045,5 +4195,168 @@ mod tests {
         // The hallucinated unleased file must NOT have a Decision entry
         let unleased_decision = decisions.iter().find(|d| d.statement.contains("src/hallucinated_unleased.ts"));
         assert!(unleased_decision.is_none(), "Unleased target file must not be committed to notebook as decision");
+    }
+
+    #[tokio::test]
+    async fn test_step3c_synthesis_answers_compound_intents_and_validates_citations() {
+        struct SynthMockLlm;
+
+        #[async_trait]
+        impl LlmClient for SynthMockLlm {
+            async fn complete_json(&self, request: LlmRequest) -> Result<LlmResponse> {
+                let raw_json = match request.phase {
+                    Phase::Intake => r#"{
+                        "reasoning": "User asks where UI configures route settings and if aligned with modern best practices.",
+                        "needs_workspace_search": true,
+                        "intents": [
+                            {
+                                "intent": "WorkspaceSearch",
+                                "summary": "Locate UI route configuration in codebase",
+                                "needs_workspace_search": true,
+                                "direct_response": null,
+                                "search_queries": ["route", "view"]
+                            },
+                            {
+                                "intent": "GeneralQuestion",
+                                "summary": "Explain modern UI routing best practices",
+                                "needs_workspace_search": false,
+                                "direct_response": "Modern single-window desktop apps favor state-driven conditional view switching.",
+                                "search_queries": []
+                            }
+                        ],
+                        "target_hints": ["route"],
+                        "constraints": []
+                    }"#.to_string(),
+                    Phase::IntakeCritic => r#"{
+                        "approved": true,
+                        "critique": "Approved decomposition.",
+                        "has_dropped_clauses": false,
+                        "has_contaminated_queries": false,
+                        "corrected_intents": null
+                    }"#.to_string(),
+                    Phase::CandidateGate | Phase::CandidateGateOptimist | Phase::CandidateGateSkeptic => r#"{
+                        "evaluations": [
+                            { "path": "src/routes.tsx", "keep": true, "reason": "Configures routes" }
+                        ]
+                    }"#.to_string(),
+                    Phase::Extract => {
+                        let found_lease = request.prompt
+                            .lines()
+                            .find(|l| l.starts_with("LEASE "))
+                            .and_then(|l| l.strip_prefix("LEASE "))
+                            .unwrap_or("mock-lease");
+
+                        format!(r#"{{
+                            "inferences": [
+                                {{
+                                    "statement": "src/routes.tsx lines 1-10 defines AppRoutes with declarative route objects.",
+                                    "lease_id": "{}",
+                                    "tags": ["route", "AppRoutes"]
+                                }}
+                            ],
+                            "sufficient": true,
+                            "missing": []
+                        }}"#, found_lease)
+                    }
+                    Phase::PlanProposer | Phase::PlanReconciler => r#"{
+                        "objective": "Document route structure and evaluate against modern architecture best practices",
+                        "affected_files": [
+                            { "path": "src/routes.tsx", "reason": "Configures route tree" }
+                        ],
+                        "steps": [
+                            { "title": "Explain route declarations", "detail": "Document route paths and component bindings" },
+                            { "title": "Evaluate architecture alignment", "detail": "Compare against declarative routing standards" }
+                        ],
+                        "risks": [],
+                        "validation_commands": ["npm test"]
+                    }"#.to_string(),
+                    Phase::PlanCritic => r#"{
+                        "critique": "Verify edge cases in route transitions.",
+                        "missing_aspects": [],
+                        "disputed_steps": [],
+                        "unverified_assumptions": [],
+                        "additional_risks": []
+                    }"#.to_string(),
+                    Phase::PlanRebuttal => r#"{
+                        "rebuttal": "Route transition edge cases are minor for read-only inquiry.",
+                        "dismissed_critiques": [],
+                        "accepted_critiques": []
+                    }"#.to_string(),
+                    Phase::Synthesize => {
+                        assert!(request.prompt.contains("ESTABLISHED ARCHITECTURAL CONTEXT & GUIDANCE"));
+                        assert!(request.prompt.contains("Do not defensively hedge"));
+
+                        let entry_id = request.prompt
+                            .lines()
+                            .find(|l| l.starts_with("- ") && l.contains(" Fact Active"))
+                            .and_then(|l| l.split_whitespace().nth(1))
+                            .unwrap_or("entry-1");
+
+                        format!(r#"{{
+                            "answer": "The application configures its route settings in `src/routes.tsx` (lines 1-10) using declarative `AppRoutes`. This design aligns with modern frontend best practices by decoupling route path definitions from view renderers, keeping routing state centralized and testable.",
+                            "cited_entries": ["{}"],
+                            "stop_reason": "Done"
+                        }}"#, entry_id)
+                    }
+                    _ => "{}".to_string(),
+                };
+
+                Ok(LlmResponse {
+                    call_id: request.call_id,
+                    raw_json,
+                    usage: crate::traits::LlmUsage::default(),
+                })
+            }
+        }
+
+        #[async_trait]
+        impl TokenCounter for SynthMockLlm {
+            async fn count_tokens(&self, text: &str) -> usize {
+                text.len() / 4
+            }
+        }
+
+        let task = TaskRequest {
+            run_id: "test-synth-run".to_string(),
+            session_id: "test-synth-session".to_string(),
+            workspace_path: None,
+            question: "where does our UI configure route settings, and is it aligned with modern architecture best practices".to_string(),
+            conversation: Vec::new(),
+            budgets: crate::types::Budgets::default(),
+            intake_only: false,
+        };
+
+        let progress = CollectProgress {
+            messages: std::sync::Arc::new(Mutex::new(Vec::new())),
+        };
+
+        let result = run_agent(
+            task,
+            AgentRuntime {
+                llm: &SynthMockLlm,
+                code_search: &MockSearch,
+                file_reader: &MockReader,
+                token_counter: &SynthMockLlm,
+                progress: &progress,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.answer.stop_reason, StopReason::Done);
+
+        // 1. Check synthesized answer leads the response text
+        assert!(result.answer.content.starts_with("The application configures its route settings in `src/routes.tsx`"));
+        assert!(result.answer.content.contains("aligns with modern frontend best practices"));
+
+        // 2. Check that diagnostics are cleanly housed in a collapsible details block
+        assert!(result.answer.content.contains("<details>\n<summary><b>🛠️ Pipeline Diagnostics"));
+        assert!(result.answer.content.contains("Step 1: Multi-Intent Intake"));
+        assert!(result.answer.content.contains("Step 2: Deterministic Evidence Acquisition"));
+        assert!(result.answer.content.contains("Step 3A: Evidence Extraction"));
+        assert!(result.answer.content.contains("Step 3B: Appellate Planning Gate"));
+
+        // 3. Check citations are properly validated
+        assert!(!result.answer.cited_entries.is_empty(), "Cited entries must not be empty");
     }
 }

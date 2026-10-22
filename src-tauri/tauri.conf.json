@@ -31,6 +31,9 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
+    "macOS": {
+      "infoPlist": "Info.plist"
+    },
     "externalBin": ["binaries/llama-server"],
     "resources": ["resources/models/*"]
   }
