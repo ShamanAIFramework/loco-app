@@ -234,6 +234,7 @@ impl LlmClient for LlamaServerClient {
             agent_core::Phase::CandidateGate | agent_core::Phase::CandidateGateOptimist | agent_core::Phase::CandidateGateSkeptic => 512,
             agent_core::Phase::Extract => 768,
             agent_core::Phase::Plan | agent_core::Phase::PlanProposer | agent_core::Phase::PlanCritic | agent_core::Phase::PlanRebuttal | agent_core::Phase::PlanReconciler => 768,
+            agent_core::Phase::PatchProposer | agent_core::Phase::PatchCritic | agent_core::Phase::PatchRebuttal | agent_core::Phase::PatchReconciler => 768,
             agent_core::Phase::Synthesize => 1024,
         };
         let req_body = json!({

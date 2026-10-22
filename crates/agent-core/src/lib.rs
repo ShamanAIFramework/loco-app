@@ -5,6 +5,7 @@
 
 mod knowledge;
 mod notebook;
+mod patch;
 mod pipeline;
 mod prompt;
 mod trace;
@@ -13,6 +14,7 @@ mod types;
 
 pub use knowledge::*;
 pub use notebook::*;
+pub use patch::*;
 pub use pipeline::*;
 pub use prompt::*;
 pub use trace::*;

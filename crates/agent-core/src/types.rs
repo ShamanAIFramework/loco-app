@@ -74,6 +74,10 @@ pub enum Phase {
     PlanRebuttal,
     PlanReconciler,
     Extract,
+    PatchProposer,
+    PatchCritic,
+    PatchRebuttal,
+    PatchReconciler,
     Synthesize,
 }
 
@@ -219,6 +223,69 @@ pub struct PlanStepResults {
     pub rebuttal_elapsed_ms: u64,
     pub reconciler_elapsed_ms: u64,
     pub total_elapsed_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PatchProposal {
+    pub target_path: String,
+    pub target_symbol: Option<String>,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub lease_id: LeaseId,
+    pub replacement_code: String,
+    pub justification: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PatchCriticOutput {
+    pub approved: bool,
+    pub critique: String,
+    #[serde(default)]
+    pub disputed_changes: Vec<String>,
+    #[serde(default)]
+    pub unhandled_edge_cases: Vec<String>,
+    #[serde(default)]
+    pub convention_violations: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PatchRebuttalOutput {
+    pub rebuttal: String,
+    #[serde(default)]
+    pub dismissed_points: Vec<RebuttalItem>,
+    #[serde(default)]
+    pub accepted_points: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PatchReconcilerOutput {
+    pub hardened_code: String,
+    pub reconciliation_summary: String,
+    #[serde(default)]
+    pub remaining_uncertainties: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PartitionedConsensus {
+    pub confirmed_code: Option<String>,
+    pub disputed_issue: Option<String>,
+    pub is_split: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EditArtifact {
+    pub patch_id: String,
+    pub target_path: String,
+    pub original_start_line: usize,
+    pub original_end_line: usize,
+    pub replacement_code: String,
+    pub diff: String,
+    pub critic_approved: bool,
+    pub critic_notes: String,
+    #[serde(default)]
+    pub impacted_callers: Vec<String>,
+    #[serde(default)]
+    pub validation_commands: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
