@@ -20,6 +20,7 @@ mod orchestrator;
 mod phoenix;
 mod trace_writer;
 mod vector_search;
+pub mod worktree;
 
 #[derive(Debug)]
 pub struct AppError(anyhow::Error);

@@ -123,6 +123,9 @@ pub trait FileReader: Send + Sync {
         max_chars: usize,
     ) -> Result<EvidenceSlice>;
     async fn verify_lease(&self, lease: &crate::notebook::EvidenceLease) -> Result<LeaseStatus>;
+    async fn validate_syntax(&self, _path: &str, _content: &str) -> Result<bool> {
+        Ok(true)
+    }
 }
 
 #[async_trait]

@@ -262,6 +262,120 @@ pub fn plan_reconciler_instruction(plan_json: &str, critic_json: &str, rebuttal_
     .join("\n")
 }
 
+pub fn patch_proposer_instruction(
+    target_path: &str,
+    target_symbol: Option<&str>,
+    start_line: usize,
+    end_line: usize,
+    objective: &str,
+) -> String {
+    let symbol_info = match target_symbol {
+        Some(sym) => format!(" (symbol `{}`)", sym),
+        None => String::new(),
+    };
+    [
+        "QUESTION",
+        "EVALUATION PERSPECTIVE: PATCH PROPOSER (THESIS)",
+        "Role: You are an expert software engineer drafting a precise code replacement.",
+        &format!("Objective: {}", objective),
+        &format!("Target: `{}` lines {}-{}{}", target_path, start_line, end_line, symbol_info),
+        "",
+        "Requirements for Replacement Code:",
+        "1. Complete & Valid: Provide the exact, drop-in replacement code for the targeted block. It must be syntactically complete and valid.",
+        "2. No Placeholders: Do not write lazy placeholders or comments like '// ... rest of code unchanged' or '/* keep existing */'.",
+        "3. Match Idioms: Strictly match existing repository style, indentation, type conventions, and patterns shown in the leased evidence and sibling exemplars.",
+        "4. Minimal Blast Radius: Change only what is strictly required to fulfill the plan objective.",
+        "",
+        "Return one JSON object matching schema `PatchProposal`.",
+    ]
+    .join("\n")
+}
+
+pub fn patch_critic_instruction(proposed_patch_json: &str) -> String {
+    [
+        "QUESTION",
+        "EVALUATION PERSPECTIVE: ADVERSARIAL PATCH CRITIC (ANTITHESIS)",
+        "Role: You are an uncompromising senior code reviewer auditing the proposed patch for defects, regressions, and style mismatches.",
+        "",
+        "Proposed Patch:",
+        "```json",
+        proposed_patch_json.trim(),
+        "```",
+        "",
+        "Audit Criteria:",
+        "1. Interface Regressions: Does the patch break callers, change public function/method signatures, or alter expected return types?",
+        "2. Unhandled Edge Cases: Does the code omit null/empty checks, error path handling, or unexpected state transitions?",
+        "3. Convention Violations: Does the code deviate from the idioms and styling shown in the sibling exemplar or active knowledge rubrics?",
+        "4. Fragility & Leaks: Does it introduce unhandled unwraps, resource leaks, or missing teardown logic?",
+        "",
+        "If the patch is fully sound, safe, and ready to apply, set approved=true.",
+        "Return one JSON object matching schema `PatchCriticOutput`.",
+    ]
+    .join("\n")
+}
+
+pub fn patch_rebuttal_instruction(proposed_patch_json: &str, critic_json: &str) -> String {
+    [
+        "QUESTION",
+        "EVALUATION PERSPECTIVE: PRAGMATIC SCOPE ARBITER / PATCH REBUTTAL (DEFENSE)",
+        "Role: You are an appellate defender and scope auditor evaluating the critic's objections.",
+        "Mission: Distinguish between genuine blocking bugs and pedantic nitpicks or speculative hedges.",
+        "",
+        "Proposed Patch:",
+        "```json",
+        proposed_patch_json.trim(),
+        "```",
+        "",
+        "Adversarial Critique:",
+        "```json",
+        critic_json.trim(),
+        "```",
+        "",
+        "Rebuttal Guidelines:",
+        "1. Protect Functional Progress: If the critic demands out-of-scope refactoring, speculative abstractions, or raises concerns contradicted by active evidence, dismiss the critique with clear technical justification in `dismissed_points`.",
+        "2. Concede Real Flaws: Accept genuine bugs, syntax hazards, or broken interfaces into `accepted_points` so the reconciler can surgically fix them.",
+        "",
+        "Return one JSON object matching schema `PatchRebuttalOutput`.",
+    ]
+    .join("\n")
+}
+
+pub fn patch_reconciler_instruction(
+    proposed_patch_json: &str,
+    critic_json: &str,
+    rebuttal_json: &str,
+) -> String {
+    [
+        "QUESTION",
+        "EVALUATION PERSPECTIVE: CONVERGENCE RECONCILER (SYNTHESIS)",
+        "Role: You are the final patch reconciler harmonizing the proposal, critique, and rebuttal.",
+        "Mission: Produce the finalized, hardened replacement code.",
+        "",
+        "Initial Patch:",
+        "```json",
+        proposed_patch_json.trim(),
+        "```",
+        "",
+        "Adversarial Critique:",
+        "```json",
+        critic_json.trim(),
+        "```",
+        "",
+        "Pragmatic Rebuttal:",
+        "```json",
+        rebuttal_json.trim(),
+        "```",
+        "",
+        "Reconciliation Guidelines:",
+        "1. Incorporate all `accepted_points` to fix genuine bugs, edge cases, and interface mismatches.",
+        "2. Exclude `dismissed_points` to avoid over-engineering or unnecessary scope creep.",
+        "3. Output the finalized replacement code, ready to drop directly into the target file.",
+        "",
+        "Return one JSON object matching schema `PatchReconcilerOutput`.",
+    ]
+    .join("\n")
+}
+
 pub fn extract_instruction() -> String {
     [
         "QUESTION",
@@ -618,6 +732,77 @@ pub fn schema_plan_rebuttal() -> serde_json::Value {
     })
 }
 
+pub fn schema_patch_proposer() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "replacement_code": {
+                "type": "string",
+                "description": "Complete, valid replacement code for the targeted block. Do not include placeholders or omission comments."
+            },
+            "justification": {
+                "type": "string",
+                "description": "Technical justification of how the replacement fulfills the objective."
+            }
+        },
+        "required": ["replacement_code", "justification"],
+        "additionalProperties": false
+    })
+}
+
+pub fn schema_patch_critic() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "approved": { "type": "boolean", "description": "True if the patch is safe, clean, and ready to apply." },
+            "critique": { "type": "string", "description": "Technical critique evaluating interface stability and edge cases." },
+            "disputed_changes": { "type": "array", "items": { "type": "string" }, "description": "Specific code changes that introduce bugs or regressions." },
+            "unhandled_edge_cases": { "type": "array", "items": { "type": "string" }, "description": "Edge cases or error conditions not handled." },
+            "convention_violations": { "type": "array", "items": { "type": "string" }, "description": "Deviations from project styling or conventions." }
+        },
+        "required": ["approved", "critique", "disputed_changes", "unhandled_edge_cases", "convention_violations"],
+        "additionalProperties": false
+    })
+}
+
+pub fn schema_patch_rebuttal() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "rebuttal": { "type": "string", "description": "Appellate evaluation distinguishing real flaws from speculative nitpicks." },
+            "accepted_points": { "type": "array", "items": { "type": "string" }, "description": "Genuine issues that must be addressed." },
+            "dismissed_points": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "critique": { "type": "string" },
+                        "justification": { "type": "string" }
+                    },
+                    "required": ["critique", "justification"],
+                    "additionalProperties": false
+                },
+                "description": "Objections dismissed with technical justification."
+            }
+        },
+        "required": ["rebuttal", "accepted_points", "dismissed_points"],
+        "additionalProperties": false
+    })
+}
+
+pub fn schema_patch_reconciler() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "hardened_code": { "type": "string", "description": "Finalized replacement code ready for in-memory patch application." },
+            "reconciliation_summary": { "type": "string", "description": "Summary of adjustments made to resolve accepted critiques." },
+            "remaining_uncertainties": { "type": "array", "items": { "type": "string" }, "description": "Any unresolved ambiguities." }
+        },
+        "required": ["hardened_code", "reconciliation_summary", "remaining_uncertainties"],
+        "additionalProperties": false
+    })
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CandidateGateItem {
     pub path: String,
@@ -926,6 +1111,14 @@ mod tests {
             schema_plan().to_string(),
             schema_extract().to_string(),
             schema_synthesize().to_string(),
+            patch_proposer_instruction("", None, 1, 1, ""),
+            patch_critic_instruction(""),
+            patch_rebuttal_instruction("", ""),
+            patch_reconciler_instruction("", "", ""),
+            schema_patch_proposer().to_string(),
+            schema_patch_critic().to_string(),
+            schema_patch_rebuttal().to_string(),
+            schema_patch_reconciler().to_string(),
         ]
         .join("\n");
 

@@ -133,6 +133,42 @@ pub fn extract_exemplar_header(content: &str, max_lines: usize) -> String {
     lines.join("\n")
 }
 
+/// Generates a unified git-style diff header and hunk for a replaced line range.
+pub fn generate_unified_diff(
+    path: &str,
+    start_line: usize,
+    original_lines: &str,
+    replacement_code: &str,
+) -> String {
+    let orig: Vec<&str> = if original_lines.is_empty() {
+        Vec::new()
+    } else {
+        original_lines.lines().collect()
+    };
+    let repl: Vec<&str> = if replacement_code.is_empty() {
+        Vec::new()
+    } else {
+        replacement_code.lines().collect()
+    };
+
+    let orig_count = orig.len();
+    let repl_count = repl.len();
+
+    let mut out = format!(
+        "--- a/{}\n+++ b/{}\n@@ -{},{} +{},{} @@\n",
+        path, path, start_line, orig_count, start_line, repl_count
+    );
+
+    for line in orig {
+        out.push_str(&format!("-{}\n", line));
+    }
+    for line in repl {
+        out.push_str(&format!("+{}\n", line));
+    }
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,5 +249,24 @@ mod tests {
         let content = "import React from 'react';\n\nexport function Component() {\n  return <div>Hello</div>;\n}\n";
         let header = extract_exemplar_header(content, 3);
         assert_eq!(header, "import React from 'react';\n\nexport function Component() {");
+    }
+
+    #[test]
+    fn test_generate_unified_diff() {
+        let diff = generate_unified_diff(
+            "src/App.tsx",
+            10,
+            "const x = 1;\nconst y = 2;",
+            "const x = 100;\nconst y = 200;\nconst z = 300;",
+        );
+
+        assert!(diff.contains("--- a/src/App.tsx"));
+        assert!(diff.contains("+++ b/src/App.tsx"));
+        assert!(diff.contains("@@ -10,2 +10,3 @@"));
+        assert!(diff.contains("-const x = 1;"));
+        assert!(diff.contains("-const y = 2;"));
+        assert!(diff.contains("+const x = 100;"));
+        assert!(diff.contains("+const y = 200;"));
+        assert!(diff.contains("+const z = 300;"));
     }
 }
