@@ -16,15 +16,59 @@ use tree_sitter::{Node, Parser};
 
 pub fn index_workspace(store: &CodeGraphStore, project_id: &str, root_path: &Path) -> Result<()> {
     log::info!("Indexing workspace: {:?}", root_path);
-    walk_and_index(store, project_id, root_path, root_path)?;
-    refresh_project_symbol_edges(store, project_id, root_path)
+
+    // 1. Fetch all existing indexed files for fast O(1) change detection
+    let existing_files: std::collections::HashMap<String, crate::codegraph::SourceFile> = store
+        .project_files(project_id)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|f| (f.path.clone(), f))
+        .collect();
+
+    let mut seen_paths = std::collections::HashSet::<String>::new();
+    let mut changed_count = 0usize;
+
+    walk_and_index_incremental(
+        store,
+        project_id,
+        root_path,
+        root_path,
+        &existing_files,
+        &mut seen_paths,
+        &mut changed_count,
+    )?;
+
+    // 2. Prune any files that were in SQLite but no longer exist on disk
+    for (old_path, _) in &existing_files {
+        if !seen_paths.contains(old_path) {
+            log::info!("Pruning removed file from index: {}", old_path);
+            let _ = store.remove_file(project_id, old_path);
+            changed_count += 1;
+        }
+    }
+
+    // 3. Only run edge refresh if files were added, modified, or removed
+    if changed_count > 0 || existing_files.is_empty() {
+        log::info!(
+            "Refreshed symbol edges (changed/added files: {})",
+            changed_count
+        );
+        refresh_project_symbol_edges(store, project_id, root_path)?;
+    } else {
+        log::info!("Workspace index up-to-date; skipped symbol edge refresh.");
+    }
+
+    Ok(())
 }
 
-fn walk_and_index(
+fn walk_and_index_incremental(
     store: &CodeGraphStore,
     project_id: &str,
     current_dir: &Path,
     root_path: &Path,
+    existing_files: &std::collections::HashMap<String, crate::codegraph::SourceFile>,
+    seen_paths: &mut std::collections::HashSet<String>,
+    changed_count: &mut usize,
 ) -> Result<()> {
     let entries = match fs::read_dir(current_dir) {
         Ok(e) => e,
@@ -41,11 +85,36 @@ fn walk_and_index(
         }
 
         if path.is_dir() {
-            let _ = walk_and_index(store, project_id, &path, root_path);
+            let _ = walk_and_index_incremental(
+                store,
+                project_id,
+                &path,
+                root_path,
+                existing_files,
+                seen_paths,
+                changed_count,
+            );
         } else if path.is_file() {
             if let Ok(rel_path) = path.strip_prefix(root_path) {
                 let rel_str = rel_path.to_string_lossy().to_string();
-                let _ = index_workspace_file(store, project_id, &path, &rel_str);
+                seen_paths.insert(rel_str.clone());
+
+                let is_source = looks_like_source(&rel_str);
+                let checksum = if is_source {
+                    file_checksum(&path).ok()
+                } else {
+                    None
+                };
+
+                // Fast skip: if already indexed with identical checksum, avoid Tree-sitter & DB writes entirely
+                if let Some(existing) = existing_files.get(&rel_str) {
+                    if existing.checksum == checksum {
+                        continue;
+                    }
+                }
+
+                *changed_count += 1;
+                let _ = index_workspace_file_with_checksum(store, project_id, &path, &rel_str, checksum);
             }
         }
     }
@@ -134,7 +203,7 @@ fn file_checksum(path: &Path) -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn index_workspace_file(
+pub fn index_workspace_file(
     store: &CodeGraphStore,
     project_id: &str,
     path: &Path,
@@ -146,6 +215,17 @@ fn index_workspace_file(
     } else {
         None
     };
+    index_workspace_file_with_checksum(store, project_id, path, rel_path, checksum)
+}
+
+fn index_workspace_file_with_checksum(
+    store: &CodeGraphStore,
+    project_id: &str,
+    path: &Path,
+    rel_path: &str,
+    checksum: Option<String>,
+) -> Result<()> {
+    let is_source = looks_like_source(rel_path);
     let file = store.upsert_file(project_id, rel_path, checksum.as_deref())?;
     store.clear_file_symbols(&file.id)?;
 
@@ -757,6 +837,52 @@ export default function GitPanel(props: { workspacePath: string }) {
             .find(|(_, symbol)| symbol.name == "useHelper")
             .map(|(file, _)| file.path.as_str());
         assert_eq!(feature_file, Some("src/feature.ts"));
+
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn incremental_indexing_skips_unchanged_files_and_updates_modified() {
+        let root = env::temp_dir().join(format!("loco_incr_{}", Uuid::new_v4()));
+        let db_path = env::temp_dir().join(format!("loco_incr_{}.db", Uuid::new_v4()));
+        fs::create_dir_all(root.join("src")).unwrap();
+        let file_a = root.join("src/a.ts");
+        let file_b = root.join("src/b.ts");
+        fs::write(&file_a, "export function alpha() { return 1; }\n").unwrap();
+        fs::write(&file_b, "export function beta() { return 2; }\n").unwrap();
+
+        let store = CodeGraphStore::new(&db_path).unwrap();
+        let project = store.register_project("TestIncr", &root).unwrap();
+
+        // Pass 1: Fresh full index
+        index_workspace(&store, &project.id, &root).unwrap();
+        let files_pass1 = store.project_files(&project.id).unwrap();
+        assert_eq!(files_pass1.len(), 2);
+        let symbols_pass1 = store.project_symbols(&project.id).unwrap();
+        assert_eq!(symbols_pass1.len(), 2);
+
+        // Pass 2: Re-index without modifying anything (all files unchanged)
+        index_workspace(&store, &project.id, &root).unwrap();
+        let files_pass2 = store.project_files(&project.id).unwrap();
+        assert_eq!(files_pass2.len(), 2);
+        let f1 = files_pass1.iter().find(|f| f.path == "src/a.ts").unwrap();
+        let f2 = files_pass2.iter().find(|f| f.path == "src/a.ts").unwrap();
+        assert_eq!(f1.index_version, f2.index_version);
+
+        // Pass 3: Modify one file and remove one file
+        fs::write(&file_a, "export function alphaModified() { return 99; }\n").unwrap();
+        fs::remove_file(&file_b).unwrap();
+        index_workspace(&store, &project.id, &root).unwrap();
+
+        let files_pass3 = store.project_files(&project.id).unwrap();
+        assert_eq!(files_pass3.len(), 1); // b.ts was pruned
+        assert_eq!(files_pass3[0].path, "src/a.ts");
+        assert_eq!(files_pass3[0].index_version, f1.index_version + 1);
+
+        let symbols_pass3 = store.project_symbols(&project.id).unwrap();
+        assert_eq!(symbols_pass3.len(), 1);
+        assert_eq!(symbols_pass3[0].name, "alphaModified");
 
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_file(db_path);

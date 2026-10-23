@@ -296,8 +296,11 @@ async fn create_session(
     .await
     .context("Failed to join session creation task")??;
 
-    // 2. Launch workspace indexing in the background so window loads instantly
-    start_workspace_indexing(app, resolved);
+    // 2. Only launch workspace indexing if this workspace has not already completed indexing
+    let state = app.state::<AppState>();
+    if !state.indexing_coordinator.is_completed(&resolved) && !state.indexing_coordinator.is_indexing(&resolved) {
+        start_workspace_indexing(app, resolved);
+    }
 
     Ok(conv)
 }
