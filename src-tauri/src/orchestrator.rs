@@ -59,6 +59,11 @@ pub async fn prompt_agent_v2(
     let workspace_root = crate::resolve_workspace_root(conversation.workspace_path.clone());
     let workspace_str = workspace_root.to_string_lossy().to_string();
 
+    // Ensure the workspace is properly indexed before processing any prompts in this workspace
+    crate::ensure_workspace_indexed(&app, &workspace_root, Some(&on_chunk))
+        .await
+        .context("Failed to ensure workspace indexing")?;
+
     let project_id = {
         let app_c = app.clone();
         let workspace_c = workspace_str.clone();

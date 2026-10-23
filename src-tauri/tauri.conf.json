@@ -13,7 +13,7 @@
     "windows": [
       {
         "title": "loco-app",
-        "fullscreen": true,
+        "maximized": true,
         "width": 1200,
         "height": 800
       }

@@ -44,6 +44,68 @@ pub struct AppState {
     pub codegraph: codegraph::CodeGraphStore,
     pub active_watcher: Mutex<Option<Debouncer<RecommendedWatcher>>>,
     pub llm_slot: Arc<Semaphore>,
+    pub indexing_coordinator: WorkspaceIndexCoordinator,
+}
+
+pub struct WorkspaceIndexCoordinator {
+    in_flight: Mutex<std::collections::HashMap<std::path::PathBuf, tokio::sync::watch::Receiver<bool>>>,
+    pub completed: Mutex<std::collections::HashSet<std::path::PathBuf>>,
+}
+
+impl WorkspaceIndexCoordinator {
+    pub fn new() -> Self {
+        Self {
+            in_flight: Mutex::new(std::collections::HashMap::new()),
+            completed: Mutex::new(std::collections::HashSet::new()),
+        }
+    }
+
+    pub fn is_indexing(&self, root: &std::path::Path) -> bool {
+        let guard = self.in_flight.lock().unwrap();
+        guard.contains_key(root)
+    }
+
+    pub fn is_completed(&self, root: &std::path::Path) -> bool {
+        let guard = self.completed.lock().unwrap();
+        guard.contains(root)
+    }
+
+    pub fn begin_indexing(
+        &self,
+        root: &std::path::Path,
+    ) -> (Option<tokio::sync::watch::Sender<bool>>, tokio::sync::watch::Receiver<bool>) {
+        let mut guard = self.in_flight.lock().unwrap();
+        if let Some(existing) = guard.get(root) {
+            (None, existing.clone())
+        } else {
+            let (tx, rx) = tokio::sync::watch::channel(false);
+            guard.insert(root.to_path_buf(), rx.clone());
+            (Some(tx), rx)
+        }
+    }
+
+    pub fn finish_indexing(
+        &self,
+        root: &std::path::Path,
+        tx: Option<tokio::sync::watch::Sender<bool>>,
+    ) {
+        {
+            let mut guard = self.in_flight.lock().unwrap();
+            guard.remove(root);
+        }
+        {
+            let mut comp = self.completed.lock().unwrap();
+            comp.insert(root.to_path_buf());
+        }
+        if let Some(sender) = tx {
+            let _ = sender.send(true);
+        }
+    }
+
+    pub fn get_receiver(&self, root: &std::path::Path) -> Option<tokio::sync::watch::Receiver<bool>> {
+        let guard = self.in_flight.lock().unwrap();
+        guard.get(root).cloned()
+    }
 }
 
 #[tauri::command]
@@ -95,6 +157,118 @@ pub fn resolve_workspace_root(requested: Option<String>) -> std::path::PathBuf {
     std::path::PathBuf::from(".")
 }
 
+pub fn start_workspace_indexing(
+    app: tauri::AppHandle,
+    workspace_root: std::path::PathBuf,
+) -> tokio::sync::watch::Receiver<bool> {
+    let state = app.state::<AppState>();
+    let (tx_opt, rx) = state.indexing_coordinator.begin_indexing(&workspace_root);
+
+    let Some(tx) = tx_opt else {
+        return rx;
+    };
+
+    let bg_app = app.clone();
+    let bg_path = workspace_root.clone();
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = bg_app.state::<AppState>();
+        let project = match state.codegraph.register_project("Active Workspace", &bg_path) {
+            Ok(p) => p,
+            Err(e) => {
+                log::error!("Failed to register project for indexing: {:?}", e);
+                state.indexing_coordinator.finish_indexing(&bg_path, Some(tx));
+                return;
+            }
+        };
+
+        let _ = bg_app.emit("workspace-index-status", "indexing");
+        log::info!("Starting background indexing for workspace: {:?}", bg_path);
+
+        if let Err(e) = crate::indexer::index_workspace(&state.codegraph, &project.id, &bg_path) {
+            log::warn!("Background indexing encountered an error: {:?}", e);
+        }
+
+        if let Ok(watcher) = crate::indexer::start_watcher(
+            bg_app.clone(),
+            project.id,
+            bg_path.clone(),
+        ) {
+            let mut guard = state.active_watcher.lock().unwrap();
+            *guard = Some(watcher);
+        }
+
+        state.indexing_coordinator.finish_indexing(&bg_path, Some(tx));
+        let _ = bg_app.emit("workspace-index-status", "ready");
+        log::info!("Background indexing complete for: {:?}", bg_path);
+    });
+
+    rx
+}
+
+pub async fn ensure_workspace_indexed(
+    app: &tauri::AppHandle,
+    workspace_root: &std::path::Path,
+    on_chunk: Option<&tauri::ipc::Channel<crate::agent::AgentEvent>>,
+) -> Result<(), anyhow::Error> {
+    let state = app.state::<AppState>();
+
+    // 1. If indexing is currently in-flight, notify UI and await completion
+    if let Some(mut rx) = state.indexing_coordinator.get_receiver(workspace_root) {
+        if !*rx.borrow_and_update() {
+            if let Some(channel) = on_chunk {
+                let _ = channel.send(crate::agent::AgentEvent::Status(
+                    "Indexing codebase before processing prompt...".to_string(),
+                ));
+            }
+            log::info!("Waiting for in-flight indexing on: {:?}", workspace_root);
+            while !*rx.borrow_and_update() {
+                if rx.changed().await.is_err() {
+                    break;
+                }
+            }
+            return Ok(());
+        }
+    }
+
+    // 2. If already completed in this process run, proceed immediately
+    if state.indexing_coordinator.is_completed(workspace_root) {
+        return Ok(());
+    }
+
+    // 3. Check if SQLite codegraph already has indexed files from previous runs
+    let root_c = workspace_root.to_path_buf();
+    let app_c = app.clone();
+    let has_indexed_files = tauri::async_runtime::spawn_blocking(move || -> anyhow::Result<bool> {
+        let state = app_c.state::<AppState>();
+        let project = state.codegraph.register_project("Active Workspace", &root_c)?;
+        let files = state.codegraph.project_files(&project.id)?;
+        Ok(!files.is_empty())
+    })
+    .await??;
+
+    if has_indexed_files {
+        state.indexing_coordinator.completed.lock().unwrap().insert(workspace_root.to_path_buf());
+        return Ok(());
+    }
+
+    // 4. Not yet indexed: start indexing and await completion
+    if let Some(channel) = on_chunk {
+        let _ = channel.send(crate::agent::AgentEvent::Status(
+            "Indexing codebase before processing prompt...".to_string(),
+        ));
+    }
+    log::info!("Starting required workspace indexing before prompt: {:?}", workspace_root);
+    let mut rx = start_workspace_indexing(app.clone(), workspace_root.to_path_buf());
+    while !*rx.borrow_and_update() {
+        if rx.changed().await.is_err() {
+            break;
+        }
+    }
+
+    Ok(())
+}
+
 #[tauri::command]
 async fn create_session(
     app: tauri::AppHandle,
@@ -106,10 +280,10 @@ async fn create_session(
     let path_clone = path_str.clone();
 
     // 1. Fast path: register project and create conversation in SQLite immediately (<5ms)
-    let (conv, project_id) = tauri::async_runtime::spawn_blocking(move || -> anyhow::Result<_> {
+    let conv = tauri::async_runtime::spawn_blocking(move || -> anyhow::Result<_> {
         let state = app_clone.state::<AppState>();
         let path_obj = std::path::Path::new(&path_clone);
-        let project = state.codegraph.register_project("Active Workspace", path_obj)?;
+        let _ = state.codegraph.register_project("Active Workspace", path_obj)?;
 
         let conv = state.conversations.create_conversation(
             Some("Active Workspace"),
@@ -117,37 +291,13 @@ async fn create_session(
             Some("Qwen2.5-Coder"),
         )?;
 
-        Ok((conv, project.id))
+        Ok(conv)
     })
     .await
     .context("Failed to join session creation task")??;
 
     // 2. Launch workspace indexing in the background so window loads instantly
-    let bg_app = app.clone();
-    let bg_path = path_str.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let state = bg_app.state::<AppState>();
-        let path_obj = std::path::Path::new(&bg_path);
-
-        let _ = bg_app.emit("workspace-index-status", "indexing");
-        log::info!("Starting background indexing for workspace: {:?}", path_obj);
-
-        if let Err(e) = crate::indexer::index_workspace(&state.codegraph, &project_id, path_obj) {
-            log::warn!("Background indexing encountered an error: {:?}", e);
-        }
-
-        if let Ok(watcher) = crate::indexer::start_watcher(
-            bg_app.clone(),
-            project_id,
-            path_obj.to_path_buf(),
-        ) {
-            let mut guard = state.active_watcher.lock().unwrap();
-            *guard = Some(watcher);
-        }
-
-        let _ = bg_app.emit("workspace-index-status", "ready");
-        log::info!("Background indexing complete for: {:?}", path_obj);
-    });
+    start_workspace_indexing(app, resolved);
 
     Ok(conv)
 }
@@ -173,40 +323,7 @@ async fn trigger_index_workspace(
     workspace_path: Option<String>,
 ) -> Result<(), AppError> {
     let resolved = resolve_workspace_root(workspace_path);
-    let path_str = resolved.to_string_lossy().to_string();
-    let bg_app = app.clone();
-
-    tauri::async_runtime::spawn_blocking(move || {
-        let state = bg_app.state::<AppState>();
-        let path_obj = std::path::Path::new(&path_str);
-        let project = match state.codegraph.register_project("Active Workspace", path_obj) {
-            Ok(p) => p,
-            Err(e) => {
-                log::error!("Failed to register project for indexing: {:?}", e);
-                return;
-            }
-        };
-
-        let _ = bg_app.emit("workspace-index-status", "indexing");
-        log::info!("Triggering background indexing for workspace: {:?}", path_obj);
-
-        if let Err(e) = crate::indexer::index_workspace(&state.codegraph, &project.id, path_obj) {
-            log::warn!("Background indexing encountered an error: {:?}", e);
-        }
-
-        if let Ok(watcher) = crate::indexer::start_watcher(
-            bg_app.clone(),
-            project.id,
-            path_obj.to_path_buf(),
-        ) {
-            let mut guard = state.active_watcher.lock().unwrap();
-            *guard = Some(watcher);
-        }
-
-        let _ = bg_app.emit("workspace-index-status", "ready");
-        log::info!("Background indexing complete for: {:?}", path_obj);
-    });
-
+    start_workspace_indexing(app, resolved);
     Ok(())
 }
 
@@ -263,6 +380,7 @@ pub fn run() {
                 codegraph,
                 active_watcher: Mutex::new(None),
                 llm_slot: Arc::new(Semaphore::new(1)),
+                indexing_coordinator: WorkspaceIndexCoordinator::new(),
             });
 
             app.manage(engine::EngineState::new());

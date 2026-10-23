@@ -6,6 +6,7 @@ import { NotebookEntryView } from "./types/notebook";
 
 interface AiChatProps {
   session: SessionDetails;
+  indexingStatus?: "idle" | "indexing" | "ready";
   onNotebookUpdate?: (entries: NotebookEntryView[]) => void;
 }
 
@@ -278,9 +279,15 @@ export default function AiChat(props: AiChatProps) {
             </svg>
           </button>
         </form>
-        <p class="text-center text-xs text-gray-600 mt-3">
-          Shift + Enter for newline.
-        </p>
+        <div class="flex items-center justify-between max-w-3xl mx-auto mt-2 text-xs text-gray-600 px-1">
+          <p>Shift + Enter for newline.</p>
+          <Show when={props.indexingStatus === "indexing"}>
+            <span class="flex items-center gap-1.5 text-amber-400/90 text-[11px] animate-pulse">
+              <span class="w-1.5 h-1.5 rounded-full bg-amber-400"></span>
+              Indexing workspace in background...
+            </span>
+          </Show>
+        </div>
       </div>
     </div>
   );

@@ -399,6 +399,7 @@ export default function App() {
         <Show when={appState() === "ready" && activeSession() !== null}>
           <AiChat
             session={activeSession()!}
+            indexingStatus={indexingStatus()}
             onNotebookUpdate={handleNotebookUpdate}
           />
         </Show>
