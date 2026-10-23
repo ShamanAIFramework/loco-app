@@ -5,3 +5,25 @@ models
 target
 crates/*/target
 crates/*/Cargo.lock
+
+# Worktrees and local agent state
+.loco-worktrees/
+.loco/
+
+# Environment and sensitive keys
+.env
+.env.*
+*.env
+*.pem
+*.key
+
+# Database and SQLite
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.db
+
+# OS files & logs
+.DS_Store
+Thumbs.db
+*.log

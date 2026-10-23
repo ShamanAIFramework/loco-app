@@ -132,3 +132,95 @@ button {
     background-color: #0f0f0f69;
   }
 }
+
+/* ==========================================================================
+   Diff2Html Dark Mode Overrides (Unified across GitPanel and Chat)
+   ========================================================================== */
+.d2h-wrapper, 
+.d2h-file-wrapper, 
+.d2h-files-diff { 
+  background: transparent !important; 
+  border: none !important; 
+  color: #c9d1d9 !important; 
+}
+
+.d2h-file-wrapper {
+  margin-bottom: 0 !important;
+}
+
+/* Redundant default header hidden; custom header used instead */
+.d2h-file-header { 
+  display: none !important; 
+}
+
+/* Code lines font and background */
+.d2h-code-line, 
+.d2h-code-side-line { 
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace !important; 
+  font-size: 12px !important; 
+  line-height: 1.5 !important;
+  background-color: transparent !important;
+}
+
+/* Line numbers column */
+.d2h-code-linenumber, 
+.d2h-code-side-linenumber {
+  background-color: #0d1117 !important;
+  color: #6e7681 !important;
+  border-color: #30363d !important;
+  user-select: none;
+}
+
+/* Empty placeholder rows */
+.d2h-emptyplaceholder, 
+.d2h-code-side-emptyplaceholder {
+  background-color: #010409 !important;
+  border-color: #30363d !important;
+}
+
+/* Insertions (Green) */
+.d2h-ins,
+.d2h-ins .d2h-code-line-ctn,
+.d2h-ins .d2h-code-line-prefix { 
+  background-color: rgba(46, 160, 67, 0.15) !important; 
+  color: #c9d1d9 !important;
+}
+
+/* Chunk info headers (@@ -x,y +x,y @@) */
+.d2h-info,
+.d2h-code-line.d2h-info {
+  background-color: rgba(56, 139, 253, 0.1) !important; 
+  color: #8b949e !important;
+  border-color: #30363d !important;
+}
+
+.d2h-code-linenumber.d2h-info {
+  background-color: #0d1117 !important;
+  color: #8b949e !important;
+  border-color: #30363d !important;
+}
+
+/* Highlight specific word changes in insertions */
+.d2h-ins ins {
+  background-color: rgba(46, 160, 67, 0.4) !important;
+  text-decoration: none !important;
+}
+
+/* Deletions (Red) */
+.d2h-del,
+.d2h-del .d2h-code-line-ctn,
+.d2h-del .d2h-code-line-prefix { 
+  background-color: rgba(248, 81, 73, 0.15) !important; 
+  color: #c9d1d9 !important;
+}
+
+/* Highlight specific word changes in deletions */
+.d2h-del del {
+  background-color: rgba(248, 81, 73, 0.4) !important;
+  text-decoration: none !important;
+}
+
+/* Hide the default +/- symbols for a clean editor look */
+.d2h-code-line-prefix { 
+  display: none !important; 
+}

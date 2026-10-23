@@ -11,7 +11,7 @@ interface AiChatProps {
 
 // Define the structured event we expect from Rust
 interface AgentEvent {
-  type: "Status" | "Chunk" | "Sources" | "Notebook";
+  type: "Status" | "Chunk" | "Sources" | "Notebook" | "Diff";
   data: string | SourceRef[] | NotebookEntryView[];
 }
 
@@ -118,6 +118,18 @@ export default function AiChat(props: AiChatProps) {
               updated[lastIndex] = {
                 ...updated[lastIndex],
                 sources: event.data as SourceRef[],
+              };
+            }
+            return updated;
+          });
+        } else if (event.type === "Diff") {
+          setMessages((prev) => {
+            const updated = [...prev];
+            const lastIndex = updated.length - 1;
+            if (lastIndex >= 0 && updated[lastIndex].role === "assistant") {
+              updated[lastIndex] = {
+                ...updated[lastIndex],
+                diff: event.data as string,
               };
             }
             return updated;

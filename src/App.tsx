@@ -33,7 +33,8 @@ export default function App() {
   const [notebookEntries, setNotebookEntries] = createSignal<NotebookEntryView[]>([]);
   const [leftPanelTab, setLeftPanelTab] = createSignal<"notebook" | "workspace">("notebook");
 
-  const workspacePath = "/Users/ruckus/workspace/loco/loco-app";
+  // If null or undefined, the backend defaults to the active repository working directory
+  const workspacePath: string | null = null;
 
   const handleNotebookUpdate = (entries: NotebookEntryView[]) => {
     setNotebookEntries(entries);

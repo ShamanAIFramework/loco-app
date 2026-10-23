@@ -156,6 +156,9 @@ pub async fn prompt_agent_v2(
     if !notebook_views.is_empty() {
         let _ = on_chunk.send(AgentEvent::Notebook(notebook_views));
     }
+    if let Some(artifact) = &result.answer.edit_artifact {
+        let _ = on_chunk.send(AgentEvent::Diff(artifact.diff.clone()));
+    }
 
     tauri::async_runtime::spawn_blocking(move || -> Result<_> {
         let state = app.state::<AppState>();

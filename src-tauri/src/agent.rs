@@ -36,4 +36,5 @@ pub enum AgentEvent {
     Chunk(String),
     Sources(Vec<SourceRef>),
     Notebook(Vec<NotebookEntryView>),
+    Diff(String),
 }

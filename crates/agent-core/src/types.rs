@@ -106,6 +106,8 @@ pub struct AgentAnswer {
     pub stop_reason: StopReason,
     pub cited_entries: Vec<EntryId>,
     pub notebook: Notebook,
+    #[serde(default)]
+    pub edit_artifact: Option<EditArtifact>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

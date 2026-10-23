@@ -212,6 +212,7 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
             stop_reason: StopReason::Done,
             cited_entries: Vec::new(),
             notebook,
+            edit_artifact: None,
         };
         record_trace!(TraceEvent::RunFinished {
             stop_reason: StopReason::Done,
@@ -1991,6 +1992,7 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
         stop_reason,
         cited_entries,
         notebook,
+        edit_artifact,
     };
 
     record_trace!(TraceEvent::RunFinished {

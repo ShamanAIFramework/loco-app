@@ -64,7 +64,10 @@ async fn create_session(
     app: tauri::AppHandle,
     workspace_path: Option<String>,
 ) -> Result<conversation_store::Conversation, AppError> {
-    let path = workspace_path.clone();
+    // Resolve path, falling back to current working dir if path doesn't exist
+    let path = workspace_path
+        .filter(|p| !p.trim().is_empty() && std::path::Path::new(p).exists())
+        .or_else(|| std::env::current_dir().ok().map(|d| d.to_string_lossy().to_string()));
     let app_clone = app.clone();
 
     let conv = tauri::async_runtime::spawn_blocking(move || {
@@ -170,6 +173,7 @@ pub fn run() {
             create_session,
             get_session_details,
             orchestrator::prompt_agent_v2,
+            git_api::get_git_branch,
             git_api::get_git_status,
             git_api::get_git_diff
         ])

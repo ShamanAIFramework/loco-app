@@ -1,6 +1,6 @@
 # Agent Rebuild Progress
 
-This file tracks the reconstruction of Loco's agent loop toward the local-first deterministic architecture in `/Users/ruckus/Downloads/local-coding-agent-build-prompt.md`.
+This file tracks the reconstruction of Loco's agent loop toward the local-first deterministic architecture specified in the architectural roadmap.
 
 ## Current Objective
 

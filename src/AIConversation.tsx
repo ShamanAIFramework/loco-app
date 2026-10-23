@@ -2,6 +2,9 @@ import { For, Show, createSignal, createEffect, onCleanup } from "solid-js";
 import { marked } from "marked";
 import hljs from "highlight.js";
 import "highlight.js/styles/github-dark.css";
+import * as Diff2Html from "diff2html";
+import "diff2html/bundles/css/diff2html.min.css";
+import InlineDiffViewer from "./InlineDiffViewer";
 
 // Configure marked to support GitHub Flavored Markdown (tables, etc.) and line breaks
 marked.setOptions({
@@ -13,6 +16,7 @@ export interface Message {
   role: "user" | "assistant" | "system";
   content: string;
   sources?: SourceRef[];
+  diff?: string;
 }
 
 export interface SourceRef {
@@ -37,7 +41,13 @@ export default function AIConversation(props: AIConversationProps) {
         {(msg) => (
           <Show
             when={msg.role === "user"}
-            fallback={<AssistantBubble content={msg.content} sources={msg.sources} />}
+            fallback={
+              <AssistantBubble
+                content={msg.content}
+                sources={msg.sources}
+                diff={msg.diff}
+              />
+            }
           >
             <UserBubble content={msg.content} />
           </Show>
@@ -80,7 +90,11 @@ function UserBubble(props: { content: string }) {
   );
 }
 
-function AssistantBubble(props: { content: string; sources?: SourceRef[] }) {
+function AssistantBubble(props: {
+  content: string;
+  sources?: SourceRef[];
+  diff?: string;
+}) {
   let contentRef: HTMLDivElement | undefined;
 
   // Re-run markdown parsing, highlighting, and button injection when content streams
@@ -96,12 +110,30 @@ function AssistantBubble(props: { content: string; sources?: SourceRef[] }) {
 
     preBlocks.forEach((pre) => {
       const codeBlock = pre.querySelector("code");
+      let textToCopy = "";
+
       if (codeBlock) {
-        hljs.highlightElement(codeBlock as HTMLElement);
-        // codeBlock.style.borderRadius = "14px";
-        // codeBlock.style.maxHeight = "33vh";
-        // codeBlock.style.overflow = "auto";
-        // codeBlock.style.padding = "4ch";
+        textToCopy = codeBlock.textContent || "";
+        const isDiff =
+          codeBlock.classList.contains("language-diff") ||
+          codeBlock.classList.contains("language-patch");
+
+        if (isDiff && (textToCopy.includes("---") || textToCopy.includes("@@"))) {
+          try {
+            const renderedHtml = Diff2Html.html(textToCopy, {
+              drawFileList: false,
+              matching: "lines",
+              outputFormat: "line-by-line",
+            });
+            pre.className =
+              "d2h-inline-container rounded-xl border border-gray-800 bg-[#0d1117] overflow-x-auto my-3 !p-0";
+            pre.innerHTML = `<div class="diff-container min-w-full text-xs">${renderedHtml}</div>`;
+          } catch (e) {
+            hljs.highlightElement(codeBlock as HTMLElement);
+          }
+        } else {
+          hljs.highlightElement(codeBlock as HTMLElement);
+        }
       }
 
       // 3. Create a wrapper div to isolate positioning from Tailwind Prose
@@ -144,9 +176,7 @@ function AssistantBubble(props: { content: string; sources?: SourceRef[] }) {
 
       // 6. Attach the copy logic
       btn.addEventListener("click", async () => {
-        if (!codeBlock) return;
         try {
-          const textToCopy = codeBlock.textContent || "";
           await navigator.clipboard.writeText(textToCopy);
 
           btn.innerHTML = checkIcon;
@@ -165,16 +195,41 @@ function AssistantBubble(props: { content: string; sources?: SourceRef[] }) {
 
   return (
     <div class="flex w-full justify-start px-4">
-      <div class="flex gap-4 w-full rounded-xl p-2 -ml-2">
+      <div class="flex flex-col gap-4 w-full rounded-xl p-2 -ml-2">
         <div
           ref={contentRef}
-          class="flex-1 min-w-0 prose prose-invert prose-sm md:prose-base prose-pre:bg-[#0d1117] prose-pre:border prose-pre:border-gray-800 prose-pre:rounded-xl text-gray-300 max-w-none"
+          class="w-full min-w-0 prose prose-invert prose-sm md:prose-base prose-pre:bg-[#0d1117] prose-pre:border prose-pre:border-gray-800 prose-pre:rounded-xl text-gray-300 max-w-none"
         ></div>
+
+        {/* Dedicated Inline Diff Viewer (when diff is attached to message) */}
+        <Show when={props.diff}>
+          {(diff) => <InlineDiffViewer diff={diff()} />}
+        </Show>
+
+        {/* Referenced Sources Stacked Vertically Below, with Chips Flowing Horizontally */}
         <Show when={props.sources && props.sources.length > 0}>
-          <div class="mt-4 flex flex-wrap gap-2">
-            <For each={props.sources}>
-              {(source) => <SourceChip source={source} />}
-            </For>
+          <div class="w-full pt-3 border-t border-gray-800/80">
+            <div class="text-[11px] font-semibold tracking-wider text-gray-400 uppercase mb-2 flex items-center gap-1.5 select-none">
+              <svg
+                class="w-3.5 h-3.5 text-blue-400 shrink-0"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+              >
+                <path
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1"
+                />
+              </svg>
+              <span>Referenced Sources ({props.sources!.length})</span>
+            </div>
+            <div class="flex flex-wrap gap-2">
+              <For each={props.sources}>
+                {(source) => <SourceChip source={source} />}
+              </For>
+            </div>
           </div>
         </Show>
       </div>
