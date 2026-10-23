@@ -41,6 +41,30 @@ export default function AiChat(props: AiChatProps) {
       : `${seconds}s`;
   };
 
+  // Load conversation history whenever session changes
+  createEffect(async () => {
+    const sessionId = props.session.id;
+    if (!sessionId) return;
+    try {
+      const details = await invoke<any>("get_session_details", { sessionId });
+      if (details && details.messages && details.messages.length > 0) {
+        setMessages([
+          { role: "system", content: "You are a helpful coding assistant." },
+          ...details.messages.map((m: any) => ({
+            role: m.role.toLowerCase() as "user" | "assistant" | "system",
+            content: m.content,
+          })),
+        ]);
+      } else {
+        setMessages([
+          { role: "system", content: "You are a helpful coding assistant." },
+        ]);
+      }
+    } catch (e) {
+      console.error("Failed to load conversation history:", e);
+    }
+  });
+
   const updateStatus = (status: string | null) => {
     setActiveStatus(status);
     statusStartedAt = status ? Date.now() : 0;

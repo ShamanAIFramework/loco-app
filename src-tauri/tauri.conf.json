@@ -13,8 +13,9 @@
     "windows": [
       {
         "title": "loco-app",
-        "width": 800,
-        "height": 600
+        "fullscreen": true,
+        "width": 1200,
+        "height": 800
       }
     ],
     "security": {

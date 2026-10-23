@@ -133,8 +133,14 @@ impl CodeGraphStore {
     pub fn register_project(&self, name: &str, root_path: &Path) -> Result<Project> {
         let guard = self.conn.lock().map_err(|_| anyhow!("Mutex poisoned"))?;
 
-        let canonical_path = std::fs::canonicalize(root_path)
+        let mut canonical_path = std::fs::canonicalize(root_path)
             .context("Failed to resolve absolute path for project root. Does it exist?")?;
+
+        if canonical_path.file_name() == Some(std::ffi::OsStr::new("src-tauri")) {
+            if let Some(parent) = canonical_path.parent() {
+                canonical_path = parent.to_path_buf();
+            }
+        }
 
         let path_str = canonical_path.to_string_lossy().to_string();
 

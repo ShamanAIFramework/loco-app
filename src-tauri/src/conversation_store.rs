@@ -146,6 +146,31 @@ impl ConversationStore {
         })
     }
 
+    pub fn list_conversations(&self) -> Result<Vec<Conversation>> {
+        let guard = self.conn.lock().map_err(|_| anyhow!("Mutex poisoned"))?;
+        let mut stmt = guard.prepare(
+            "SELECT id, title, workspace_path, model_name, created_at, updated_at FROM conversations ORDER BY updated_at DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let created_raw: String = row.get(4)?;
+            let updated_raw: String = row.get(5)?;
+            Ok(Conversation {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                workspace_path: row.get(2)?,
+                model_name: row.get(3)?,
+                created_at: parse_dt(&created_raw).unwrap_or_default(),
+                updated_at: parse_dt(&updated_raw).unwrap_or_default(),
+            })
+        })?;
+
+        let mut list = Vec::new();
+        for r in rows {
+            list.push(r?);
+        }
+        Ok(list)
+    }
+
     pub fn load_conversation(&self, id: &str) -> Result<Option<ConversationDetail>> {
         let guard = self.conn.lock().map_err(|_| anyhow!("Mutex poisoned"))?;
 

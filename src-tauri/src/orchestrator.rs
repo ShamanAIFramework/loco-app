@@ -56,9 +56,12 @@ pub async fn prompt_agent_v2(
     .await
     .context("Failed to join blocking conversation task")??;
 
-    let project_id = if let Some(workspace) = &conversation.workspace_path {
+    let workspace_root = crate::resolve_workspace_root(conversation.workspace_path.clone());
+    let workspace_str = workspace_root.to_string_lossy().to_string();
+
+    let project_id = {
         let app_c = app.clone();
-        let workspace_c = workspace.clone();
+        let workspace_c = workspace_str.clone();
         Some(
             tauri::async_runtime::spawn_blocking(move || {
                 let state = app_c.state::<AppState>();
@@ -70,15 +73,13 @@ pub async fn prompt_agent_v2(
             .await
             .context("Failed to join project registration task")??,
         )
-    } else {
-        None
     };
 
     let run_id = Uuid::new_v4().to_string();
     let task = TaskRequest {
         run_id: run_id.clone(),
         session_id: session_id.clone(),
-        workspace_path: conversation.workspace_path.as_ref().map(PathBuf::from),
+        workspace_path: Some(workspace_root.clone()),
         question: question.clone(),
         conversation: messages
             .iter()
@@ -114,7 +115,7 @@ pub async fn prompt_agent_v2(
         project_id,
     };
     let reader = WorkspaceFileReader {
-        workspace_path: conversation.workspace_path.clone().map(PathBuf::from),
+        workspace_path: Some(workspace_root),
     };
     let progress = TauriProgressSink {
         channel: on_chunk.clone(),
@@ -236,7 +237,7 @@ impl LlmClient for LlamaServerClient {
             agent_core::Phase::Intake | agent_core::Phase::IntakeCritic => 512,
             agent_core::Phase::CandidateGate | agent_core::Phase::CandidateGateOptimist | agent_core::Phase::CandidateGateSkeptic => 512,
             agent_core::Phase::Extract => 768,
-            agent_core::Phase::Plan | agent_core::Phase::PlanProposer | agent_core::Phase::PlanCritic | agent_core::Phase::PlanRebuttal | agent_core::Phase::PlanReconciler => 768,
+            agent_core::Phase::PlanProposer | agent_core::Phase::PlanCritic | agent_core::Phase::PlanRebuttal | agent_core::Phase::PlanReconciler => 768,
             agent_core::Phase::PatchProposer | agent_core::Phase::PatchCritic | agent_core::Phase::PatchRebuttal | agent_core::Phase::PatchReconciler => 768,
             agent_core::Phase::Synthesize => 1024,
         };

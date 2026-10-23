@@ -845,14 +845,6 @@ pub fn schema_candidate_gate() -> serde_json::Value {
     })
 }
 
-pub fn prompt_candidate_gate(
-    task_question: &str,
-    intent_summary: &str,
-    candidates: &[CandidateGateItem],
-) -> String {
-    prompt_candidate_gate_optimist(task_question, intent_summary, candidates)
-}
-
 pub fn prompt_candidate_gate_prefix(
     task_question: &str,
     intent_summary: &str,
@@ -1105,7 +1097,6 @@ mod tests {
             schema_intake().to_string(),
             schema_intake_critic().to_string(),
             schema_candidate_gate().to_string(),
-            prompt_candidate_gate("", "", &[]),
             prompt_candidate_gate_optimist("", "", &[]),
             prompt_candidate_gate_skeptic("", "", &[]),
             schema_plan().to_string(),

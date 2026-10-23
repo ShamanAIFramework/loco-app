@@ -4891,7 +4891,6 @@ mod tests {
                             "stop_reason": "Done"
                         }}"#, patch_id)
                     }
-                    _ => "{}".to_string(),
                 };
 
                 Ok(LlmResponse {

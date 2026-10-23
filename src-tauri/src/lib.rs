@@ -6,11 +6,10 @@ use notify_debouncer_mini::notify::RecommendedWatcher;
 use notify_debouncer_mini::Debouncer;
 use std::sync::Arc;
 use std::sync::Mutex;
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 use tokio::sync::Semaphore;
 
 mod agent;
-mod agentv2;
 mod codegraph;
 mod conversation_store;
 mod engine;
@@ -59,52 +58,156 @@ fn get_ai_connection(
     state.connection_details()
 }
 
+pub fn resolve_workspace_root(requested: Option<String>) -> std::path::PathBuf {
+    if let Some(req) = requested {
+        let p = std::path::PathBuf::from(req.trim());
+        if !req.trim().is_empty() && p.exists() {
+            if p.file_name() == Some(std::ffi::OsStr::new("src-tauri")) {
+                if let Some(parent) = p.parent() {
+                    return parent.to_path_buf();
+                }
+            }
+            return p;
+        }
+    }
+
+    if let Ok(cwd) = std::env::current_dir() {
+        if cwd.file_name() == Some(std::ffi::OsStr::new("src-tauri")) {
+            if let Some(parent) = cwd.parent() {
+                return parent.to_path_buf();
+            }
+        }
+
+        let mut probe = cwd.clone();
+        while let Some(parent) = probe.parent() {
+            if probe.join("src-tauri").exists() {
+                return probe;
+            }
+            if parent.join("src-tauri").exists() {
+                return parent.to_path_buf();
+            }
+            probe = parent.to_path_buf();
+        }
+
+        return cwd;
+    }
+
+    std::path::PathBuf::from(".")
+}
+
 #[tauri::command]
 async fn create_session(
     app: tauri::AppHandle,
     workspace_path: Option<String>,
 ) -> Result<conversation_store::Conversation, AppError> {
-    // Resolve path, falling back to current working dir if path doesn't exist
-    let path = workspace_path
-        .filter(|p| !p.trim().is_empty() && std::path::Path::new(p).exists())
-        .or_else(|| std::env::current_dir().ok().map(|d| d.to_string_lossy().to_string()));
+    let resolved = resolve_workspace_root(workspace_path);
+    let path_str = resolved.to_string_lossy().to_string();
     let app_clone = app.clone();
+    let path_clone = path_str.clone();
 
-    let conv = tauri::async_runtime::spawn_blocking(move || {
+    // 1. Fast path: register project and create conversation in SQLite immediately (<5ms)
+    let (conv, project_id) = tauri::async_runtime::spawn_blocking(move || -> anyhow::Result<_> {
         let state = app_clone.state::<AppState>();
+        let path_obj = std::path::Path::new(&path_clone);
+        let project = state.codegraph.register_project("Active Workspace", path_obj)?;
 
-        // If a path is provided, register the project and trigger the indexer immediately
-        if let Some(p) = &path {
-            let path_obj = std::path::Path::new(p);
-            if let Ok(project) = state
-                .codegraph
-                .register_project("Active Workspace", path_obj)
-            {
-                // 1. Do the initial full index
-                let _ = crate::indexer::index_workspace(&state.codegraph, &project.id, path_obj);
-
-                // 2. Start the incremental watcher
-                if let Ok(watcher) = crate::indexer::start_watcher(
-                    app_clone.clone(),
-                    project.id,
-                    path_obj.to_path_buf(),
-                ) {
-                    let mut guard = state.active_watcher.lock().unwrap();
-                    *guard = Some(watcher);
-                }
-            }
-        }
-
-        state.conversations.create_conversation(
+        let conv = state.conversations.create_conversation(
             Some("Active Workspace"),
-            path.as_deref(),
+            Some(&path_clone),
             Some("Qwen2.5-Coder"),
-        )
+        )?;
+
+        Ok((conv, project.id))
     })
     .await
-    .context("Failed to join blocking task")??;
+    .context("Failed to join session creation task")??;
+
+    // 2. Launch workspace indexing in the background so window loads instantly
+    let bg_app = app.clone();
+    let bg_path = path_str.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = bg_app.state::<AppState>();
+        let path_obj = std::path::Path::new(&bg_path);
+
+        let _ = bg_app.emit("workspace-index-status", "indexing");
+        log::info!("Starting background indexing for workspace: {:?}", path_obj);
+
+        if let Err(e) = crate::indexer::index_workspace(&state.codegraph, &project_id, path_obj) {
+            log::warn!("Background indexing encountered an error: {:?}", e);
+        }
+
+        if let Ok(watcher) = crate::indexer::start_watcher(
+            bg_app.clone(),
+            project_id,
+            path_obj.to_path_buf(),
+        ) {
+            let mut guard = state.active_watcher.lock().unwrap();
+            *guard = Some(watcher);
+        }
+
+        let _ = bg_app.emit("workspace-index-status", "ready");
+        log::info!("Background indexing complete for: {:?}", path_obj);
+    });
 
     Ok(conv)
+}
+
+#[tauri::command]
+async fn list_conversations(
+    app: tauri::AppHandle,
+) -> Result<Vec<conversation_store::Conversation>, AppError> {
+    let app_clone = app.clone();
+    let list = tauri::async_runtime::spawn_blocking(move || {
+        let state = app_clone.state::<AppState>();
+        state.conversations.list_conversations()
+    })
+    .await
+    .context("Failed to join list conversations task")??;
+
+    Ok(list)
+}
+
+#[tauri::command]
+async fn trigger_index_workspace(
+    app: tauri::AppHandle,
+    workspace_path: Option<String>,
+) -> Result<(), AppError> {
+    let resolved = resolve_workspace_root(workspace_path);
+    let path_str = resolved.to_string_lossy().to_string();
+    let bg_app = app.clone();
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = bg_app.state::<AppState>();
+        let path_obj = std::path::Path::new(&path_str);
+        let project = match state.codegraph.register_project("Active Workspace", path_obj) {
+            Ok(p) => p,
+            Err(e) => {
+                log::error!("Failed to register project for indexing: {:?}", e);
+                return;
+            }
+        };
+
+        let _ = bg_app.emit("workspace-index-status", "indexing");
+        log::info!("Triggering background indexing for workspace: {:?}", path_obj);
+
+        if let Err(e) = crate::indexer::index_workspace(&state.codegraph, &project.id, path_obj) {
+            log::warn!("Background indexing encountered an error: {:?}", e);
+        }
+
+        if let Ok(watcher) = crate::indexer::start_watcher(
+            bg_app.clone(),
+            project.id,
+            path_obj.to_path_buf(),
+        ) {
+            let mut guard = state.active_watcher.lock().unwrap();
+            *guard = Some(watcher);
+        }
+
+        let _ = bg_app.emit("workspace-index-status", "ready");
+        log::info!("Background indexing complete for: {:?}", path_obj);
+    });
+
+    Ok(())
 }
 
 #[tauri::command]
@@ -171,7 +274,9 @@ pub fn run() {
             greet,
             get_ai_connection,
             create_session,
+            list_conversations,
             get_session_details,
+            trigger_index_workspace,
             orchestrator::prompt_agent_v2,
             git_api::get_git_branch,
             git_api::get_git_status,

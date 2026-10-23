@@ -68,7 +68,6 @@ pub enum Phase {
     CandidateGate,
     CandidateGateOptimist,
     CandidateGateSkeptic,
-    Plan,
     PlanProposer,
     PlanCritic,
     PlanRebuttal,
@@ -79,14 +78,6 @@ pub enum Phase {
     PatchRebuttal,
     PatchReconciler,
     Synthesize,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum TaskType {
-    Explain,
-    Locate,
-    Edit,
-    Unclear,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
