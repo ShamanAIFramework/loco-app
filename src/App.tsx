@@ -51,15 +51,26 @@ export default function App() {
   const [isCreatingSession, setIsCreatingSession] = createSignal(false);
   const [sessionError, setSessionError] = createSignal<string | null>(null);
   const [notebookEntries, setNotebookEntries] = createSignal<NotebookEntryView[]>([]);
-  const [leftPanelTab, setLeftPanelTab] = createSignal<"notebook" | "chats" | "workspace">("notebook");
+
+  // Accordion section collapse/expand states
+  const [isWorkspaceOpen, setIsWorkspaceOpen] = createSignal(true);
+  const [isChatsOpen, setIsChatsOpen] = createSignal(true);
+  const [isNotebookOpen, setIsNotebookOpen] = createSignal(true);
 
   // If null or undefined, the backend defaults to the active repository working directory
   const workspacePath: string | null = null;
 
+  const projectName = () => {
+    const path = activeSession()?.workspace_path;
+    if (!path) return "Active Project";
+    const parts = path.split("/").filter(Boolean);
+    return parts[parts.length - 1] || "Active Project";
+  };
+
   const handleNotebookUpdate = (entries: NotebookEntryView[]) => {
     setNotebookEntries(entries);
     if (entries.length > 0) {
-      setLeftPanelTab("notebook");
+      setIsNotebookOpen(true);
     }
   };
 
@@ -176,148 +187,84 @@ export default function App() {
 
   return (
     <div class="flex h-screen w-full bg-gray-950 text-white overflow-hidden">
-      {/* Left Panel: Workspace & Session Details */}
-      <div class="w-[22vw] min-w-[240px] max-w-[340px] bg-gray-900 border-r border-gray-800 flex flex-col h-full overflow-hidden">
-        {/* Header with New Session button */}
-        <div class="p-3.5 border-b border-gray-800 flex items-center justify-between shrink-0">
-          <div>
-            <h1 class="font-bold text-gray-200 tracking-wide text-sm flex items-center gap-1.5">
-              LOCO
+      {/* Left Panel: Project Root & Accordion Children */}
+      <div class="w-[22vw] min-w-[250px] max-w-[360px] bg-gray-900 border-r border-gray-800 flex flex-col h-full overflow-hidden">
+        {/* Brand Bar */}
+        <div class="px-3 py-2 border-b border-gray-800 bg-gray-950 flex items-center justify-between shrink-0">
+          <div class="flex items-center gap-1.5">
+            <span class="font-black text-gray-200 tracking-wider text-xs">LOCO</span>
+            <span class="text-[9px] px-1 py-0.2 rounded bg-gray-800 text-gray-400 font-mono">v0.1</span>
+          </div>
+          <span class="text-[10px] text-gray-500">Local-First Agent</span>
+        </div>
+
+        {/* Project Root Header (Single Project) */}
+        <div class="p-3 border-b border-gray-800 bg-gray-900/90 flex items-center justify-between shrink-0">
+          <div class="min-w-0 pr-2">
+            <div class="flex items-center gap-1.5">
+              <span class="text-xs text-blue-400">📁</span>
+              <h2 class="font-semibold text-gray-100 text-xs truncate" title={activeSession()?.workspace_path || "Active Project"}>
+                {projectName()}
+              </h2>
               <Show when={indexingStatus() === "indexing"}>
-                <span class="inline-block w-2 h-2 rounded-full bg-amber-400 animate-pulse" title="Workspace indexing in background"></span>
+                <span class="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse shrink-0" title="Workspace indexing in background"></span>
               </Show>
-            </h1>
-            <p class="text-[10px] text-gray-500">Local-First AI Agent</p>
+            </div>
+            <p
+              class="text-[10px] text-gray-500 font-mono truncate mt-0.5"
+              title={activeSession()?.workspace_path || "No workspace loaded"}
+            >
+              {activeSession()?.workspace_path || "No workspace loaded"}
+            </p>
           </div>
           <button
             onClick={createNewSession}
             disabled={isCreatingSession()}
-            class="flex items-center gap-1 px-2.5 py-1 text-xs font-medium bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white rounded-md transition-colors cursor-pointer shadow-sm"
-            title="Start a new conversation"
+            class="flex items-center gap-1 px-2.5 py-1 text-[11px] font-medium bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white rounded transition-colors cursor-pointer shrink-0 shadow-sm"
+            title="Start a new chat session in this project"
           >
             <span>+</span>
             <span>New Chat</span>
           </button>
         </div>
 
-        {/* Modular Panel Slot Navigation */}
-        <div class="flex items-center border-b border-gray-800 bg-gray-950/40 px-2 pt-1 shrink-0">
-          <button
-            onClick={() => setLeftPanelTab("notebook")}
-            class={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium border-b-2 transition-colors cursor-pointer ${
-              leftPanelTab() === "notebook"
-                ? "border-blue-500 text-white bg-gray-800/40"
-                : "border-transparent text-gray-400 hover:text-gray-200"
-            }`}
-          >
-            <span>📓 Notebook</span>
-            <Show when={notebookEntries().length > 0}>
-              <span class="px-1.5 py-0.2 rounded-full bg-blue-900/60 text-blue-300 font-mono text-[10px]">
-                {notebookEntries().length}
-              </span>
-            </Show>
-          </button>
-          <button
-            onClick={() => setLeftPanelTab("chats")}
-            class={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium border-b-2 transition-colors cursor-pointer ${
-              leftPanelTab() === "chats"
-                ? "border-blue-500 text-white bg-gray-800/40"
-                : "border-transparent text-gray-400 hover:text-gray-200"
-            }`}
-          >
-            <span>💬 Chats</span>
-            <Show when={conversations().length > 0}>
-              <span class="px-1.5 py-0.2 rounded-full bg-gray-800 text-gray-400 font-mono text-[10px]">
-                {conversations().length}
-              </span>
-            </Show>
-          </button>
-          <button
-            onClick={() => setLeftPanelTab("workspace")}
-            class={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium border-b-2 transition-colors cursor-pointer ${
-              leftPanelTab() === "workspace"
-                ? "border-blue-500 text-white bg-gray-800/40"
-                : "border-transparent text-gray-400 hover:text-gray-200"
-            }`}
-          >
-            <span>⚙️ Workspace</span>
-            <Show when={indexingStatus() === "indexing"}>
-              <span class="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse"></span>
-            </Show>
-          </button>
-        </div>
+        {/* Stacked Vertical Accordion Sections */}
+        <div class="flex-1 min-h-0 overflow-y-auto flex flex-col divide-y divide-gray-800">
+          {/* Accordion Item 1: Workspace */}
+          <div class="flex flex-col shrink-0">
+            <button
+              onClick={() => setIsWorkspaceOpen(!isWorkspaceOpen())}
+              class="w-full flex items-center justify-between px-3 py-2 bg-gray-950/60 hover:bg-gray-800/50 transition-colors text-left cursor-pointer select-none"
+            >
+              <div class="flex items-center gap-2">
+                <span class="text-[9px] text-gray-500 font-mono">{isWorkspaceOpen() ? "▼" : "▶"}</span>
+                <span class="text-xs font-semibold text-gray-300 tracking-wide">Workspace</span>
+              </div>
+              <div class="flex items-center gap-1.5">
+                <Show when={indexingStatus() === "indexing"}>
+                  <span class="inline-flex items-center gap-1 px-1.5 py-0.2 rounded-full text-[10px] bg-amber-950/60 text-amber-300 border border-amber-800/50 animate-pulse">
+                    <span class="w-1.5 h-1.5 rounded-full bg-amber-400"></span>
+                    Indexing...
+                  </span>
+                </Show>
+                <Show when={indexingStatus() === "ready"}>
+                  <span class="inline-flex items-center gap-1 px-1.5 py-0.2 rounded-full text-[10px] bg-emerald-950/60 text-emerald-400">
+                    <span class="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>
+                    Indexed
+                  </span>
+                </Show>
+              </div>
+            </button>
 
-        {/* Panel Content Slot */}
-        <div class="flex-1 min-h-0 overflow-hidden flex flex-col p-2">
-          {/* Tab 1: Notebook */}
-          <Show when={leftPanelTab() === "notebook"}>
-            <NotebookPanel entries={notebookEntries()} />
-          </Show>
-
-          {/* Tab 2: Chats History */}
-          <Show when={leftPanelTab() === "chats"}>
-            <div class="flex-1 flex flex-col overflow-y-auto space-y-1.5 pr-1">
-              <Show
-                when={conversations().length > 0}
-                fallback={
-                  <div class="p-4 text-center text-xs text-gray-500">
-                    No conversation history found. Click "+ New Chat" to begin.
-                  </div>
-                }
-              >
-                <For each={conversations()}>
-                  {(conv) => {
-                    const isSelected = () => activeSession()?.id === conv.id;
-                    return (
-                      <button
-                        onClick={() => switchSession(conv)}
-                        class={`w-full text-left p-2.5 rounded-lg border text-xs transition-colors cursor-pointer flex flex-col gap-1 ${
-                          isSelected()
-                            ? "bg-blue-950/40 border-blue-600/60 text-white"
-                            : "bg-gray-800/30 border-gray-800 hover:bg-gray-800/70 text-gray-300"
-                        }`}
-                      >
-                        <div class="flex items-center justify-between w-full">
-                          <span class="font-medium truncate max-w-[170px]" title={conv.title || "Untitled Chat"}>
-                            {conv.title || "Untitled Chat"}
-                          </span>
-                          <Show when={isSelected()}>
-                            <span class="text-[9px] px-1.5 py-0.5 rounded bg-blue-600 text-white font-mono">Active</span>
-                          </Show>
-                        </div>
-                        <div class="flex items-center justify-between text-[10px] text-gray-500">
-                          <span class="truncate max-w-[120px]">
-                            {conv.workspace_path ? conv.workspace_path.split("/").pop() : "Workspace"}
-                          </span>
-                          <span>{formatTimestamp(conv.created_at)}</span>
-                        </div>
-                      </button>
-                    );
-                  }}
-                </For>
-              </Show>
-            </div>
-          </Show>
-
-          {/* Tab 3: Workspace & Engine Settings */}
-          <Show when={leftPanelTab() === "workspace"}>
-            <div class="flex-1 p-3 space-y-5 overflow-y-auto">
-              <Show
-                when={activeSession()}
-                fallback={
-                  <div class="animate-pulse flex flex-col gap-2">
-                    <div class="h-4 bg-gray-800 rounded w-3/4"></div>
-                    <div class="h-3 bg-gray-800 rounded w-1/2"></div>
-                  </div>
-                }
-              >
+            <Show when={isWorkspaceOpen()}>
+              <div class="p-3 space-y-3 bg-gray-900/40 border-t border-gray-800/40 text-xs">
                 <div>
-                  <h2 class="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-2">
-                    Active Workspace
-                  </h2>
-                  <div class="bg-gray-800/50 p-2.5 rounded-lg border border-gray-700/50">
+                  <h3 class="text-[10px] font-semibold text-gray-500 uppercase tracking-wider mb-1">
+                    Workspace Root
+                  </h3>
+                  <div class="bg-gray-950/60 p-2 rounded border border-gray-800">
                     <p
-                      class="text-xs text-gray-300 font-mono whitespace-normal break-all leading-relaxed"
+                      class="text-[11px] text-gray-300 font-mono whitespace-normal break-all leading-tight"
                       title={activeSession()?.workspace_path || "None"}
                     >
                       {activeSession()?.workspace_path || "No workspace"}
@@ -326,60 +273,132 @@ export default function App() {
                 </div>
 
                 <div>
-                  <h2 class="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-2">
+                  <h3 class="text-[10px] font-semibold text-gray-500 uppercase tracking-wider mb-1">
                     Codebase Index
-                  </h2>
-                  <div class="bg-gray-800/50 p-2.5 rounded-lg border border-gray-700/50 flex flex-col gap-2.5">
+                  </h3>
+                  <div class="bg-gray-950/60 p-2.5 rounded border border-gray-800 flex flex-col gap-2">
                     <div class="flex items-center justify-between">
-                      <span class="text-xs text-gray-400">Status</span>
+                      <span class="text-gray-400 text-[11px]">Watcher & AST</span>
                       <Show when={indexingStatus() === "indexing"}>
-                        <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] bg-amber-950/60 text-amber-300 border border-amber-800/50 animate-pulse">
-                          <span class="w-1.5 h-1.5 rounded-full bg-amber-400"></span>
-                          Indexing...
-                        </span>
+                        <span class="text-amber-400 text-[11px] font-medium animate-pulse">Indexing...</span>
                       </Show>
                       <Show when={indexingStatus() === "ready"}>
-                        <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] bg-emerald-950/60 text-emerald-300 border border-emerald-800/50">
-                          <span class="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>
-                          Indexed & Watching
-                        </span>
+                        <span class="text-emerald-400 text-[11px] font-medium">Ready</span>
                       </Show>
                       <Show when={indexingStatus() === "idle"}>
-                        <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] bg-gray-800 text-gray-400">
-                          Ready
-                        </span>
+                        <span class="text-gray-400 text-[11px]">Idle</span>
                       </Show>
                     </div>
 
                     <button
                       onClick={triggerReindex}
                       disabled={indexingStatus() === "indexing"}
-                      class="w-full mt-1 py-1.5 px-3 rounded text-xs font-medium bg-gray-700 hover:bg-gray-600 disabled:opacity-50 text-gray-200 transition-colors cursor-pointer border border-gray-600/50 flex items-center justify-center gap-1.5"
+                      class="w-full py-1 px-2.5 rounded text-[11px] font-medium bg-gray-800 hover:bg-gray-700 disabled:opacity-50 text-gray-200 transition-colors cursor-pointer border border-gray-700 flex items-center justify-center gap-1.5"
                     >
                       <span>🔄</span>
-                      <span>{indexingStatus() === "indexing" ? "Indexing Codebase..." : "Re-index Workspace"}</span>
+                      <span>{indexingStatus() === "indexing" ? "Indexing..." : "Re-index Workspace"}</span>
                     </button>
                   </div>
                 </div>
 
                 <div>
-                  <h2 class="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-2">
+                  <h3 class="text-[10px] font-semibold text-gray-500 uppercase tracking-wider mb-1">
                     Engine & Model
-                  </h2>
-                  <div class="bg-gray-800/50 p-2.5 rounded-lg border border-gray-700/50 space-y-2">
-                    <div class="flex items-center justify-between text-xs text-gray-300">
-                      <span class="text-gray-400">Engine State</span>
-                      <span class="capitalize text-emerald-400 font-medium">{appState()}</span>
-                    </div>
-                    <div class="flex items-center justify-between text-xs text-gray-300">
-                      <span class="text-gray-400">Model</span>
-                      <span class="font-mono text-[11px]">{activeSession()?.model_name || "Qwen2.5-Coder"}</span>
-                    </div>
+                  </h3>
+                  <div class="bg-gray-950/60 p-2 rounded border border-gray-800 flex items-center justify-between text-[11px]">
+                    <span class="text-gray-400">Model</span>
+                    <span class="font-mono text-gray-200">{activeSession()?.model_name || "Qwen2.5-Coder"}</span>
                   </div>
                 </div>
+              </div>
+            </Show>
+          </div>
+
+          {/* Accordion Item 2: Chat History */}
+          <div class="flex flex-col shrink-0">
+            <button
+              onClick={() => setIsChatsOpen(!isChatsOpen())}
+              class="w-full flex items-center justify-between px-3 py-2 bg-gray-950/60 hover:bg-gray-800/50 transition-colors text-left cursor-pointer select-none"
+            >
+              <div class="flex items-center gap-2">
+                <span class="text-[9px] text-gray-500 font-mono">{isChatsOpen() ? "▼" : "▶"}</span>
+                <span class="text-xs font-semibold text-gray-300 tracking-wide">Chat History</span>
+              </div>
+              <Show when={conversations().length > 0}>
+                <span class="px-1.5 py-0.2 rounded-full bg-gray-800 text-gray-400 font-mono text-[10px]">
+                  {conversations().length}
+                </span>
               </Show>
-            </div>
-          </Show>
+            </button>
+
+            <Show when={isChatsOpen()}>
+              <div class="p-2 space-y-1.5 bg-gray-900/40 border-t border-gray-800/40 max-h-[260px] overflow-y-auto">
+                <Show
+                  when={conversations().length > 0}
+                  fallback={
+                    <div class="p-3 text-center text-xs text-gray-500">
+                      No chat history yet.
+                    </div>
+                  }
+                >
+                  <For each={conversations()}>
+                    {(conv) => {
+                      const isSelected = () => activeSession()?.id === conv.id;
+                      return (
+                        <button
+                          onClick={() => switchSession(conv)}
+                          class={`w-full text-left p-2 rounded border text-xs transition-colors cursor-pointer flex flex-col gap-0.5 ${
+                            isSelected()
+                              ? "bg-blue-950/50 border-blue-600/70 text-white"
+                              : "bg-gray-950/40 border-gray-800 hover:bg-gray-800/60 text-gray-300"
+                          }`}
+                        >
+                          <div class="flex items-center justify-between w-full">
+                            <span class="font-medium truncate max-w-[170px]" title={conv.title || "Untitled Chat"}>
+                              {conv.title || "Untitled Chat"}
+                            </span>
+                            <Show when={isSelected()}>
+                              <span class="text-[9px] px-1 py-0.2 rounded bg-blue-600 text-white font-mono">Active</span>
+                            </Show>
+                          </div>
+                          <div class="flex items-center justify-between text-[10px] text-gray-500">
+                            <span class="truncate max-w-[120px]">
+                              {conv.workspace_path ? conv.workspace_path.split("/").filter(Boolean).pop() : "Workspace"}
+                            </span>
+                            <span>{formatTimestamp(conv.created_at)}</span>
+                          </div>
+                        </button>
+                      );
+                    }}
+                  </For>
+                </Show>
+              </div>
+            </Show>
+          </div>
+
+          {/* Accordion Item 3: Notebook */}
+          <div class="flex flex-col flex-1 min-h-[280px]">
+            <button
+              onClick={() => setIsNotebookOpen(!isNotebookOpen())}
+              class="w-full flex items-center justify-between px-3 py-2 bg-gray-950/60 hover:bg-gray-800/50 transition-colors text-left cursor-pointer select-none shrink-0"
+            >
+              <div class="flex items-center gap-2">
+                <span class="text-[9px] text-gray-500 font-mono">{isNotebookOpen() ? "▼" : "▶"}</span>
+                <span class="text-xs font-semibold text-gray-300 tracking-wide">Notebook</span>
+              </div>
+              <Show when={notebookEntries().length > 0}>
+                <span class="px-1.5 py-0.2 rounded-full bg-blue-900/60 text-blue-300 font-mono text-[10px]">
+                  {notebookEntries().length}
+                </span>
+              </Show>
+            </button>
+
+            <Show when={isNotebookOpen()}>
+              <div class="p-2 flex-1 min-h-0 bg-gray-900/40 border-t border-gray-800/40 flex flex-col overflow-hidden">
+                <NotebookPanel entries={notebookEntries()} />
+              </div>
+            </Show>
+          </div>
         </div>
       </div>
 
