@@ -442,7 +442,15 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
             || q_lower.contains("view")
             || q_lower.contains("route")
             || q_lower.contains("navigation")
-            || q_lower.contains("frontend");
+            || q_lower.contains("frontend")
+            || q_lower.contains("input")
+            || q_lower.contains("bar")
+            || q_lower.contains("button")
+            || q_lower.contains("window")
+            || q_lower.contains("width")
+            || q_lower.contains("height")
+            || q_lower.contains("style")
+            || q_lower.contains("css");
 
         let has_frontend_candidates = candidate_targets.iter().any(|t| {
             let p = t.path.to_lowercase();
@@ -940,7 +948,7 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
         notebook: notebook.deterministic_checkpoint(),
     });
 
-    let phase2 = Phase2Results {
+    let mut phase2 = Phase2Results {
         queries,
         search_details,
         all_path_hits,
@@ -1360,7 +1368,7 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
             .emit(AgentProgress::Status("Step 3B: Host Arbiter — Enforcing evidence backing and committing decisions".to_string()))
             .await;
 
-        let active_leased_paths: HashSet<String> = notebook
+        let mut active_leased_paths: HashSet<String> = notebook
             .active_entries()
             .iter()
             .filter_map(|e| match &e.provenance {
@@ -1373,7 +1381,30 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
         let mut arbiter_dropped_files = Vec::new();
 
         for file in &reconciled_plan.affected_files {
-            if active_leased_paths.is_empty() || active_leased_paths.contains(&file.path) {
+            if active_leased_paths.contains(&file.path) {
+                arbiter_validated_files.push(file.clone());
+            } else if let Ok(file_slice) = runtime.file_reader.read_file(&file.path, 50_000).await {
+                // The plan targeted an unleased file that exists in the workspace.
+                // Dynamically lease it on-demand so Step 4 Edit Gate can target the correct file.
+                let lease_fact_id = notebook.append_tool_fact(
+                    format!(
+                        "Leased {} lines {}-{} on-demand for plan target",
+                        file.path, file_slice.lease.range.start, file_slice.lease.range.end
+                    ),
+                    Provenance::File {
+                        path: file.path.clone(),
+                        symbol: file_slice.lease.symbol.clone(),
+                        range: file_slice.lease.range.clone(),
+                        lease_id: file_slice.lease.id.clone(),
+                    },
+                    Phase::PlanReconciler,
+                    vec![file.path.clone(), "on-demand".to_string()],
+                );
+                cited_entries.push(lease_fact_id);
+                phase2.leased_slices.push(file_slice);
+                active_leased_paths.insert(file.path.clone());
+                arbiter_validated_files.push(file.clone());
+            } else if active_leased_paths.is_empty() {
                 arbiter_validated_files.push(file.clone());
             } else {
                 arbiter_dropped_files.push(file.clone());
@@ -1480,12 +1511,36 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
             .or_else(|| phase2.leased_slices.first().map(|s| s.lease.path.clone()));
 
         if let Some(target_path) = target_path_opt {
-            let target_slice = phase2.leased_slices.iter().find(|s| s.lease.path == target_path);
+            let target_slice = phase2
+                .leased_slices
+                .iter()
+                .filter(|s| s.lease.path == target_path)
+                .max_by_key(|s| {
+                    let is_import_header = s.lease.symbol.as_deref() == Some("header/imports");
+                    let mut score = if is_import_header { 0 } else { 10 };
+                    if let Some(sym) = &s.lease.symbol {
+                        if plan_res.reconciled_plan.objective.to_lowercase().contains(&sym.to_lowercase()) {
+                            score += 20;
+                        }
+                    }
+                    score
+                });
             let target_symbol = target_slice.and_then(|s| s.lease.symbol.clone());
-            let start_line = target_slice.map(|s| s.lease.range.start).unwrap_or(1);
-            let end_line = target_slice.map(|s| s.lease.range.end).unwrap_or(25);
+            let mut start_line = target_slice.map(|s| s.lease.range.start).unwrap_or(1);
+            let mut end_line = target_slice.map(|s| s.lease.range.end).unwrap_or(25);
             let target_lease_id = target_slice.map(|s| s.lease.id.clone()).unwrap_or_else(LeaseId::new);
-            let original_lines = target_slice.map(|s| s.content.clone()).unwrap_or_default();
+            let mut original_lines = target_slice.map(|s| s.content.clone()).unwrap_or_default();
+
+            // If the target range is broad (> 75 lines), focus into the focal window matching plan keywords
+            if end_line.saturating_sub(start_line) > 75 && !original_lines.is_empty() {
+                let plan_words = extract_plan_keywords(&plan_res.reconciled_plan.objective, &plan_res.reconciled_plan.steps);
+                let (f_start, f_end, f_content) = focal_content_window(&original_lines, start_line, &plan_words, 50);
+                if !f_content.trim().is_empty() {
+                    start_line = f_start;
+                    end_line = f_end;
+                    original_lines = f_content;
+                }
+            }
 
             // Sibling code exemplar discovery
             let sibling_paths = find_sibling_exemplars(&repo_map, &target_path, 1);
@@ -1804,40 +1859,45 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
             let final_code = reconciler_output.hardened_code;
             let diff_str = generate_unified_diff(&target_path, start_line, &original_lines, &final_code);
 
-            // Verify lease freshness and validate in-memory syntax
-            let mut syntax_clean = true;
-            if let Ok(file_slice) = runtime.file_reader.read_file(&target_path, 50_000).await {
-                if let Some(ts) = target_slice {
-                    let _is_fresh = verify_lease_freshness(&file_slice.content, &ts.lease);
+            // Only create an edit artifact if actual changes were produced
+            if !diff_str.trim().is_empty() {
+                // Verify lease freshness and validate in-memory syntax
+                let mut syntax_clean = true;
+                if let Ok(file_slice) = runtime.file_reader.read_file(&target_path, 50_000).await {
+                    if let Some(ts) = target_slice {
+                        let _is_fresh = verify_lease_freshness(&file_slice.content, &ts.lease);
+                    }
+                    if let Ok(patched_content) = apply_in_memory_patch(&file_slice.content, start_line, end_line, &final_code) {
+                        syntax_clean = runtime.file_reader.validate_syntax(&target_path, &patched_content).await.unwrap_or(true);
+                    }
                 }
-                if let Ok(patched_content) = apply_in_memory_patch(&file_slice.content, start_line, end_line, &final_code) {
-                    syntax_clean = runtime.file_reader.validate_syntax(&target_path, &patched_content).await.unwrap_or(true);
+
+                let patch_decision_id = notebook.append_decision(
+                    format!("Draft Patch: {} (lines {}-{})", target_path, start_line, end_line),
+                    Provenance::Model { call_id: reconciler_req.call_id.clone() },
+                    Phase::PatchReconciler,
+                    vec![],
+                    vec!["patch".to_string(), "artifact".to_string()],
+                );
+                if !cited_entries.contains(&patch_decision_id) {
+                    cited_entries.push(patch_decision_id);
                 }
-            }
 
-            let patch_decision_id = notebook.append_decision(
-                format!("Draft Patch: {} (lines {}-{})", target_path, start_line, end_line),
-                Provenance::Model { call_id: reconciler_req.call_id.clone() },
-                Phase::PatchReconciler,
-                vec![],
-                vec!["patch".to_string(), "artifact".to_string()],
-            );
-            if !cited_entries.contains(&patch_decision_id) {
-                cited_entries.push(patch_decision_id);
+                edit_artifact = Some(EditArtifact {
+                    patch_id: Uuid::new_v4().to_string(),
+                    target_path: target_path.clone(),
+                    original_start_line: start_line,
+                    original_end_line: end_line,
+                    replacement_code: final_code,
+                    diff: diff_str,
+                    critic_approved: (critic_output.approved || rebuttal_output.accepted_points.is_empty()) && syntax_clean,
+                    critic_notes: critic_output.critique.clone(),
+                    impacted_callers: vec![],
+                    validation_commands: plan_res.reconciled_plan.validation_commands.clone(),
+                });
+            } else {
+                log::info!("No textual changes between original and proposed code; omitting empty edit artifact.");
             }
-
-            edit_artifact = Some(EditArtifact {
-                patch_id: Uuid::new_v4().to_string(),
-                target_path: target_path.clone(),
-                original_start_line: start_line,
-                original_end_line: end_line,
-                replacement_code: final_code,
-                diff: diff_str,
-                critic_approved: (critic_output.approved || rebuttal_output.accepted_points.is_empty()) && syntax_clean,
-                critic_notes: critic_output.critique.clone(),
-                impacted_callers: vec![],
-                validation_commands: plan_res.reconciled_plan.validation_commands.clone(),
-            });
         }
     }
 
@@ -2411,6 +2471,87 @@ fn candidate_exclusion_reason(path: &str, question: &str) -> Option<&'static str
     }
 
     None
+}
+
+fn extract_plan_keywords(objective: &str, steps: &[PlanStep]) -> Vec<String> {
+    let stopwords = [
+        "the", "a", "an", "of", "to", "in", "and", "is", "for", "on", "it", "with", "as",
+        "at", "by", "that", "this", "from", "be", "or", "are", "into", "ensure",
+    ];
+    let mut keywords = Vec::new();
+    let mut add_words = |text: &str| {
+        for w in text.split(|c: char| !c.is_alphanumeric() && c != '_') {
+            let lower = w.to_lowercase();
+            if lower.len() >= 3 && !stopwords.contains(&lower.as_str()) && !keywords.contains(&lower) {
+                keywords.push(lower);
+            }
+        }
+    };
+    add_words(objective);
+    for step in steps {
+        add_words(&step.title);
+        add_words(&step.detail);
+    }
+    keywords
+}
+
+fn focal_content_window(
+    content: &str,
+    base_start_line: usize,
+    keywords: &[String],
+    window_lines: usize,
+) -> (usize, usize, String) {
+    let lines: Vec<&str> = content.lines().collect();
+    if lines.len() <= window_lines {
+        return (base_start_line, base_start_line + lines.len().saturating_sub(1), content.to_string());
+    }
+
+    let mut line_scores = Vec::with_capacity(lines.len());
+    let mut in_render_or_return = false;
+
+    for line in &lines {
+        let lower = line.to_lowercase();
+        if lower.contains("return (") || lower.contains("return <") {
+            in_render_or_return = true;
+        }
+        let mut score = 0usize;
+        for kw in keywords {
+            if lower.contains(kw) {
+                score += 1;
+            }
+        }
+        if in_render_or_return {
+            score *= 2;
+        }
+        line_scores.push(score);
+    }
+
+    let rolling_size = 8.min(lines.len());
+    let mut best_score = 0;
+    let mut best_window_idx = 0;
+
+    for i in 0..=lines.len().saturating_sub(rolling_size) {
+        let w_score: usize = line_scores[i..i + rolling_size].iter().sum();
+        if w_score > best_score {
+            best_score = w_score;
+            best_window_idx = i;
+        }
+    }
+
+    let center_line = best_window_idx + rolling_size / 2;
+    let start_idx = center_line.saturating_sub(window_lines / 2);
+    let end_idx = (start_idx + window_lines).min(lines.len());
+    let adjusted_start_idx = if end_idx == lines.len() {
+        end_idx.saturating_sub(window_lines)
+    } else {
+        start_idx
+    };
+
+    let f_start = base_start_line + adjusted_start_idx;
+    let f_end = base_start_line + end_idx.saturating_sub(1);
+    let f_content = lines[adjusted_start_idx..end_idx].join("\n");
+
+    (f_start, f_end, f_content)
 }
 
 fn arbitrate_triad(

@@ -6,6 +6,8 @@ interface InlineDiffViewerProps {
   diff: string;
   filePath?: string;
   initialExpanded?: boolean;
+  applied?: boolean;
+  onApply?: () => void;
 }
 
 export default function InlineDiffViewer(props: InlineDiffViewerProps) {
@@ -72,13 +74,18 @@ export default function InlineDiffViewer(props: InlineDiffViewerProps) {
     }
   };
 
+  const hasChanges = createMemo(() => {
+    return stats().additions > 0 || stats().deletions > 0;
+  });
+
   return (
-    <div class="w-full my-3 rounded-xl border border-gray-800 bg-[#0d1117] overflow-hidden shadow-sm">
-      {/* Diff Header Bar */}
-      <div
-        onClick={() => setIsExpanded(!isExpanded())}
-        class="flex items-center justify-between px-3.5 py-2.5 bg-gray-900/90 border-b border-gray-800/80 cursor-pointer select-none hover:bg-gray-850 transition-colors"
-      >
+    <Show when={hasChanges()}>
+      <div class="w-full my-3 rounded-xl border border-gray-800 bg-[#0d1117] overflow-hidden shadow-sm">
+        {/* Diff Header Bar */}
+        <div
+          onClick={() => setIsExpanded(!isExpanded())}
+          class="flex items-center justify-between px-3.5 py-2.5 bg-gray-900/90 border-b border-gray-800/80 cursor-pointer select-none hover:bg-gray-850 transition-colors"
+        >
         <div class="flex items-center gap-2 min-w-0">
           {/* File / Git Diff Icon */}
           <svg
@@ -117,6 +124,32 @@ export default function InlineDiffViewer(props: InlineDiffViewerProps) {
 
         {/* Action Controls */}
         <div class="flex items-center gap-2 shrink-0">
+          <Show when={props.applied}>
+            <span class="px-2 py-0.5 rounded bg-emerald-500/15 border border-emerald-500/30 text-emerald-400 font-medium text-xs flex items-center gap-1 select-none">
+              <svg class="w-3 h-3 text-emerald-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                <polyline points="20 6 9 17 4 12" />
+              </svg>
+              <span>Applied to disk</span>
+            </span>
+          </Show>
+
+          <Show when={!props.applied && props.onApply}>
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                props.onApply?.();
+              }}
+              class="px-2.5 py-1 text-xs font-semibold rounded bg-emerald-600 hover:bg-emerald-500 text-white flex items-center gap-1.5 transition-colors shadow-sm"
+              title="Apply this diff to disk"
+            >
+              <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                <polyline points="20 6 9 17 4 12" />
+              </svg>
+              <span>Apply</span>
+            </button>
+          </Show>
+
           <button
             type="button"
             title="Copy diff to clipboard"
@@ -175,6 +208,7 @@ export default function InlineDiffViewer(props: InlineDiffViewerProps) {
           <div class="diff-container min-w-full" innerHTML={diffHtml()}></div>
         </div>
       </Show>
-    </div>
+      </div>
+    </Show>
   );
 }

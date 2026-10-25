@@ -133,37 +133,79 @@ pub fn extract_exemplar_header(content: &str, max_lines: usize) -> String {
     lines.join("\n")
 }
 
-/// Generates a unified git-style diff header and hunk for a replaced line range.
+use similar::{ChangeTag, TextDiff};
+
+/// Generates a real unified git-style diff header and hunks for a replaced line range.
+/// If original and replacement are identical, returns an empty string (no-op diff).
 pub fn generate_unified_diff(
     path: &str,
     start_line: usize,
     original_lines: &str,
     replacement_code: &str,
 ) -> String {
-    let orig: Vec<&str> = if original_lines.is_empty() {
-        Vec::new()
-    } else {
-        original_lines.lines().collect()
-    };
-    let repl: Vec<&str> = if replacement_code.is_empty() {
-        Vec::new()
-    } else {
-        replacement_code.lines().collect()
-    };
-
-    let orig_count = orig.len();
-    let repl_count = repl.len();
-
-    let mut out = format!(
-        "--- a/{}\n+++ b/{}\n@@ -{},{} +{},{} @@\n",
-        path, path, start_line, orig_count, start_line, repl_count
-    );
-
-    for line in orig {
-        out.push_str(&format!("-{}\n", line));
+    if original_lines.trim() == replacement_code.trim() && !original_lines.is_empty() {
+        return String::new();
     }
-    for line in repl {
-        out.push_str(&format!("+{}\n", line));
+
+    let text_diff = TextDiff::from_lines(original_lines, replacement_code);
+    let mut hunks = Vec::new();
+
+    for group in text_diff.grouped_ops(3) {
+        let mut group_lines = Vec::new();
+        let mut orig_count = 0usize;
+        let mut repl_count = 0usize;
+        let mut first_orig_offset = None;
+        let mut first_repl_offset = None;
+
+        for op in &group {
+            if first_orig_offset.is_none() {
+                first_orig_offset = Some(op.old_range().start);
+            }
+            if first_repl_offset.is_none() {
+                first_repl_offset = Some(op.new_range().start);
+            }
+
+            for change in text_diff.iter_changes(op) {
+                let prefix = match change.tag() {
+                    ChangeTag::Delete => {
+                        orig_count += 1;
+                        "-"
+                    }
+                    ChangeTag::Insert => {
+                        repl_count += 1;
+                        "+"
+                    }
+                    ChangeTag::Equal => {
+                        orig_count += 1;
+                        repl_count += 1;
+                        " "
+                    }
+                };
+                group_lines.push(format!("{}{}", prefix, change.value().trim_end_matches(&['\r', '\n'][..])));
+            }
+        }
+
+        if !group_lines.is_empty() {
+            let hunk_start_orig = start_line + first_orig_offset.unwrap_or(0);
+            let hunk_start_repl = start_line + first_repl_offset.unwrap_or(0);
+            hunks.push((hunk_start_orig, orig_count, hunk_start_repl, repl_count, group_lines));
+        }
+    }
+
+    if hunks.is_empty() {
+        return String::new();
+    }
+
+    let mut out = format!("--- a/{}\n+++ b/{}\n", path, path);
+    for (start_orig, count_orig, start_repl, count_repl, lines) in hunks {
+        out.push_str(&format!(
+            "@@ -{},{} +{},{} @@\n",
+            start_orig, count_orig, start_repl, count_repl
+        ));
+        for l in lines {
+            out.push_str(&l);
+            out.push('\n');
+        }
     }
 
     out
@@ -268,5 +310,23 @@ mod tests {
         assert!(diff.contains("+const x = 100;"));
         assert!(diff.contains("+const y = 200;"));
         assert!(diff.contains("+const z = 300;"));
+    }
+
+    #[test]
+    fn test_generate_unified_diff_preserves_context_lines() {
+        let original = "line 1\nline 2\nline 3\nline 4\nline 5";
+        let replacement = "line 1\nline 2\nline MODIFIED\nline 4\nline 5";
+        let diff = generate_unified_diff("src/test.ts", 10, original, replacement);
+
+        assert!(diff.contains("--- a/src/test.ts"));
+        assert!(diff.contains("+++ b/src/test.ts"));
+        assert!(diff.contains(" line 1\n line 2\n-line 3\n+line MODIFIED\n line 4\n line 5"));
+    }
+
+    #[test]
+    fn test_generate_unified_diff_empty_on_identical_code() {
+        let code = "const a = 1;\nconst b = 2;\n";
+        let diff = generate_unified_diff("src/test.ts", 1, code, code);
+        assert_eq!(diff, "");
     }
 }

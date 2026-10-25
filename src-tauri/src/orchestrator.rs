@@ -117,10 +117,10 @@ pub async fn prompt_agent_v2(
 
     let search = TauriCodeSearch {
         app: app.clone(),
-        project_id,
+        project_id: project_id.clone(),
     };
     let reader = WorkspaceFileReader {
-        workspace_path: Some(workspace_root),
+        workspace_path: Some(workspace_root.clone()),
     };
     let progress = TauriProgressSink {
         channel: on_chunk.clone(),
@@ -163,7 +163,47 @@ pub async fn prompt_agent_v2(
         let _ = on_chunk.send(AgentEvent::Notebook(notebook_views));
     }
     if let Some(artifact) = &result.answer.edit_artifact {
-        let _ = on_chunk.send(AgentEvent::Diff(artifact.diff.clone()));
+        if !artifact.diff.trim().is_empty() {
+            let auto_apply = conversation.auto_apply_edits;
+            if auto_apply && artifact.critic_approved {
+                match apply_patch_to_disk(
+                    &workspace_root,
+                    &artifact.target_path,
+                    artifact.original_start_line,
+                    artifact.original_end_line,
+                    &artifact.replacement_code,
+                ) {
+                    Ok(()) => {
+                        log::info!("Auto-applied edit to disk: {}", artifact.target_path);
+                        let _ = on_chunk.send(AgentEvent::Status(format!(
+                            "Applied changes to {}",
+                            artifact.target_path
+                        )));
+
+                        let app_c = app.clone();
+                        let target_rel = artifact.target_path.clone();
+                        let ws_root = workspace_root.clone();
+                        let proj_id = project_id.clone();
+                        tauri::async_runtime::spawn_blocking(move || {
+                            if let Some(pid) = proj_id {
+                                let state = app_c.state::<AppState>();
+                                let target_full = ws_root.join(&target_rel);
+                                let _ = crate::indexer::index_workspace_file(
+                                    &state.codegraph,
+                                    &pid,
+                                    &target_full,
+                                    &target_rel,
+                                );
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        log::error!("Failed to auto-apply edit to disk: {:?}", e);
+                    }
+                }
+            }
+            let _ = on_chunk.send(AgentEvent::Diff(artifact.diff.clone()));
+        }
     }
 
     tauri::async_runtime::spawn_blocking(move || -> Result<_> {
@@ -175,6 +215,93 @@ pub async fn prompt_agent_v2(
     })
     .await
     .context("Failed to join blocking assistant persistence task")??;
+
+    Ok(())
+}
+
+pub fn apply_patch_to_disk(
+    workspace_root: &Path,
+    target_rel_path: &str,
+    start_line: usize,
+    end_line: usize,
+    replacement_code: &str,
+) -> Result<()> {
+    let rel = sanitize_relative_path(target_rel_path)?;
+    let full_path = workspace_root.join(&rel);
+    let canonical = full_path
+        .canonicalize()
+        .with_context(|| format!("Failed to canonicalize target path: {:?}", full_path))?;
+    let root_canonical = workspace_root
+        .canonicalize()
+        .with_context(|| format!("Failed to canonicalize workspace root: {:?}", workspace_root))?;
+    if !canonical.starts_with(&root_canonical) {
+        return Err(anyhow!("Refusing to write outside workspace root"));
+    }
+    let content = std::fs::read_to_string(&canonical)?;
+    let patched = agent_core::patch::apply_in_memory_patch(&content, start_line, end_line, replacement_code)?;
+    std::fs::write(&canonical, patched)?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn set_conversation_auto_apply(
+    app: tauri::AppHandle,
+    session_id: String,
+    auto_apply: bool,
+) -> Result<(), AppError> {
+    let app_clone = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app_clone.state::<AppState>();
+        state.conversations.set_auto_apply_edits(&session_id, auto_apply)
+    })
+    .await
+    .context("Failed to join update conversation auto-apply task")??;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn apply_edit_artifact(
+    app: tauri::AppHandle,
+    session_id: String,
+    target_path: String,
+    start_line: usize,
+    end_line: usize,
+    replacement_code: String,
+) -> Result<(), AppError> {
+    let app_c = app.clone();
+    let sid = session_id.clone();
+    let detail = tauri::async_runtime::spawn_blocking(move || {
+        let state = app_c.state::<AppState>();
+        state.conversations.load_conversation(&sid)
+    })
+    .await
+    .context("Failed to load conversation for edit apply")??
+    .ok_or_else(|| anyhow!("Session not found"))?;
+
+    let workspace_root = crate::resolve_workspace_root(detail.conversation.workspace_path);
+    apply_patch_to_disk(
+        &workspace_root,
+        &target_path,
+        start_line,
+        end_line,
+        &replacement_code,
+    )?;
+
+    let app_clone = app.clone();
+    let target_rel = target_path.clone();
+    let ws_root = workspace_root.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app_clone.state::<AppState>();
+        if let Ok(project) = state.codegraph.register_project("Active Workspace", &ws_root) {
+            let target_full = ws_root.join(&target_rel);
+            let _ = crate::indexer::index_workspace_file(
+                &state.codegraph,
+                &project.id,
+                &target_full,
+                &target_rel,
+            );
+        }
+    });
 
     Ok(())
 }
@@ -242,9 +369,10 @@ impl LlmClient for LlamaServerClient {
             agent_core::Phase::Intake | agent_core::Phase::IntakeCritic => 512,
             agent_core::Phase::CandidateGate | agent_core::Phase::CandidateGateOptimist | agent_core::Phase::CandidateGateSkeptic => 512,
             agent_core::Phase::Extract => 768,
-            agent_core::Phase::PlanProposer | agent_core::Phase::PlanCritic | agent_core::Phase::PlanRebuttal | agent_core::Phase::PlanReconciler => 768,
-            agent_core::Phase::PatchProposer | agent_core::Phase::PatchCritic | agent_core::Phase::PatchRebuttal | agent_core::Phase::PatchReconciler => 768,
-            agent_core::Phase::Synthesize => 1024,
+            agent_core::Phase::PlanProposer | agent_core::Phase::PlanCritic | agent_core::Phase::PlanRebuttal | agent_core::Phase::PlanReconciler => 1024,
+            agent_core::Phase::PatchProposer | agent_core::Phase::PatchReconciler => 2048,
+            agent_core::Phase::PatchCritic | agent_core::Phase::PatchRebuttal => 1024,
+            agent_core::Phase::Synthesize => 1536,
         };
         let req_body = json!({
             "messages": [

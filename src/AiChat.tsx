@@ -28,6 +28,24 @@ export default function AiChat(props: AiChatProps) {
   const [isGenerating, setIsGenerating] = createSignal(false);
   const [activeStatus, setActiveStatus] = createSignal<string | null>(null);
   const [statusElapsedMs, setStatusElapsedMs] = createSignal(0);
+  const [autoApply, setAutoApply] = createSignal(
+    props.session.auto_apply_edits !== undefined
+      ? props.session.auto_apply_edits
+      : true,
+  );
+
+  const toggleAutoApply = async () => {
+    const nextVal = !autoApply();
+    setAutoApply(nextVal);
+    try {
+      await invoke("set_conversation_auto_apply", {
+        sessionId: props.session.id,
+        autoApply: nextVal,
+      });
+    } catch (e) {
+      console.error("Failed to update auto apply mode:", e);
+    }
+  };
 
   let chatContainerRef: HTMLDivElement | undefined;
   let statusStartedAt = 0;
@@ -48,6 +66,9 @@ export default function AiChat(props: AiChatProps) {
     if (!sessionId) return;
     try {
       const details = await invoke<any>("get_session_details", { sessionId });
+      if (details && details.conversation && details.conversation.auto_apply_edits !== undefined) {
+        setAutoApply(details.conversation.auto_apply_edits);
+      }
       if (details && details.messages && details.messages.length > 0) {
         setMessages([
           { role: "system", content: "You are a helpful coding assistant." },
@@ -155,6 +176,7 @@ export default function AiChat(props: AiChatProps) {
               updated[lastIndex] = {
                 ...updated[lastIndex],
                 diff: event.data as string,
+                applied: autoApply(),
               };
             }
             return updated;
@@ -243,7 +265,31 @@ export default function AiChat(props: AiChatProps) {
       </div>
 
       <div class="p-4 bg-gray-950 border-t border-gray-800">
-        <form onSubmit={handleSubmit} class="relative max-w-3xl mx-auto">
+        <div class="flex items-center justify-between max-w-5xl mx-auto mb-2 px-1">
+          <button
+            type="button"
+            onClick={toggleAutoApply}
+            class={`flex items-center gap-1.5 px-2.5 py-1 text-[11px] font-medium rounded-full border transition-all ${
+              autoApply()
+                ? "bg-emerald-950/50 border-emerald-700/60 text-emerald-400 hover:bg-emerald-900/60"
+                : "bg-gray-900 border-gray-700 text-gray-400 hover:bg-gray-800 hover:text-gray-300"
+            }`}
+            title={
+              autoApply()
+                ? "Direct Edits: approved patches are automatically written to disk"
+                : "Review Mode: patches require manual approval before writing to disk"
+            }
+          >
+            <span
+              class={`w-1.5 h-1.5 rounded-full ${
+                autoApply() ? "bg-emerald-400 animate-pulse" : "bg-gray-500"
+              }`}
+            ></span>
+            <span>{autoApply() ? "⚡ Direct Edits" : "👁️ Review Edits"}</span>
+          </button>
+        </div>
+
+        <form onSubmit={handleSubmit} class="relative max-w-5xl mx-auto">
           <textarea
             value={input()}
             onInput={(e) => setInput(e.currentTarget.value)}

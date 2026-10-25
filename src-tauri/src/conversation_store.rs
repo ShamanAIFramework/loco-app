@@ -49,8 +49,14 @@ pub struct Conversation {
     pub title: String,
     pub workspace_path: Option<String>,
     pub model_name: Option<String>,
+    #[serde(default = "default_auto_apply_edits")]
+    pub auto_apply_edits: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+fn default_auto_apply_edits() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -100,6 +106,7 @@ impl ConversationStore {
                 title TEXT NOT NULL,
                 workspace_path TEXT,
                 model_name TEXT,
+                auto_apply_edits INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
              );
@@ -113,6 +120,12 @@ impl ConversationStore {
              CREATE INDEX IF NOT EXISTS idx_messages_conv_created ON messages(conversation_id, created_at);
              CREATE INDEX IF NOT EXISTS idx_conversations_updated ON conversations(updated_at DESC);"
         )?;
+
+        // Migration: add auto_apply_edits column to existing DB if missing
+        let _ = conn.execute(
+            "ALTER TABLE conversations ADD COLUMN auto_apply_edits INTEGER NOT NULL DEFAULT 1;",
+            [],
+        );
 
         Ok(Self {
             conn: Mutex::new(conn),
@@ -131,8 +144,8 @@ impl ConversationStore {
         let now = now_str();
 
         guard.execute(
-            "INSERT INTO conversations (id, title, workspace_path, model_name, created_at, updated_at) 
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO conversations (id, title, workspace_path, model_name, auto_apply_edits, created_at, updated_at) 
+             VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6)",
             params![id, title, workspace_path, model_name, now, now],
         )?;
 
@@ -141,24 +154,37 @@ impl ConversationStore {
             title,
             workspace_path: workspace_path.map(|s| s.to_string()),
             model_name: model_name.map(|s| s.to_string()),
+            auto_apply_edits: true,
             created_at: parse_dt(&now)?,
             updated_at: parse_dt(&now)?,
         })
     }
 
+    pub fn set_auto_apply_edits(&self, id: &str, auto_apply: bool) -> Result<()> {
+        let guard = self.conn.lock().map_err(|_| anyhow!("Mutex poisoned"))?;
+        let now = now_str();
+        guard.execute(
+            "UPDATE conversations SET auto_apply_edits = ?1, updated_at = ?2 WHERE id = ?3",
+            params![if auto_apply { 1 } else { 0 }, now, id],
+        )?;
+        Ok(())
+    }
+
     pub fn list_conversations(&self) -> Result<Vec<Conversation>> {
         let guard = self.conn.lock().map_err(|_| anyhow!("Mutex poisoned"))?;
         let mut stmt = guard.prepare(
-            "SELECT id, title, workspace_path, model_name, created_at, updated_at FROM conversations ORDER BY updated_at DESC",
+            "SELECT id, title, workspace_path, model_name, auto_apply_edits, created_at, updated_at FROM conversations ORDER BY updated_at DESC",
         )?;
         let rows = stmt.query_map([], |row| {
-            let created_raw: String = row.get(4)?;
-            let updated_raw: String = row.get(5)?;
+            let auto_apply_int: i64 = row.get(4).unwrap_or(1);
+            let created_raw: String = row.get(5)?;
+            let updated_raw: String = row.get(6)?;
             Ok(Conversation {
                 id: row.get(0)?,
                 title: row.get(1)?,
                 workspace_path: row.get(2)?,
                 model_name: row.get(3)?,
+                auto_apply_edits: auto_apply_int != 0,
                 created_at: parse_dt(&created_raw).unwrap_or_default(),
                 updated_at: parse_dt(&updated_raw).unwrap_or_default(),
             })
@@ -175,16 +201,18 @@ impl ConversationStore {
         let guard = self.conn.lock().map_err(|_| anyhow!("Mutex poisoned"))?;
 
         let conv_res = guard.query_row(
-            "SELECT title, workspace_path, model_name, created_at, updated_at FROM conversations WHERE id = ?1",
+            "SELECT title, workspace_path, model_name, auto_apply_edits, created_at, updated_at FROM conversations WHERE id = ?1",
             params![id],
             |row| {
+                let auto_apply_int: i64 = row.get(3).unwrap_or(1);
                 Ok(Conversation {
                     id: id.to_string(),
                     title: row.get(0)?,
                     workspace_path: row.get(1)?,
                     model_name: row.get(2)?,
-                    created_at: parse_dt(&row.get::<_, String>(3)?).unwrap_or_default(),
-                    updated_at: parse_dt(&row.get::<_, String>(4)?).unwrap_or_default(),
+                    auto_apply_edits: auto_apply_int != 0,
+                    created_at: parse_dt(&row.get::<_, String>(4)?).unwrap_or_default(),
+                    updated_at: parse_dt(&row.get::<_, String>(5)?).unwrap_or_default(),
                 })
             },
         );

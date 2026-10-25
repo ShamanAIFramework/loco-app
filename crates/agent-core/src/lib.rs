@@ -5,7 +5,7 @@
 
 mod knowledge;
 mod notebook;
-mod patch;
+pub mod patch;
 mod pipeline;
 mod prompt;
 mod trace;

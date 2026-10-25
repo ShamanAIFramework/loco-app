@@ -17,6 +17,8 @@ export interface Message {
   content: string;
   sources?: SourceRef[];
   diff?: string;
+  applied?: boolean;
+  onApply?: () => void;
 }
 
 export interface SourceRef {
@@ -46,6 +48,8 @@ export default function AIConversation(props: AIConversationProps) {
                 content={msg.content}
                 sources={msg.sources}
                 diff={msg.diff}
+                applied={msg.applied}
+                onApply={msg.onApply}
               />
             }
           >
@@ -94,6 +98,8 @@ function AssistantBubble(props: {
   content: string;
   sources?: SourceRef[];
   diff?: string;
+  applied?: boolean;
+  onApply?: () => void;
 }) {
   let contentRef: HTMLDivElement | undefined;
 
@@ -202,8 +208,14 @@ function AssistantBubble(props: {
         ></div>
 
         {/* Dedicated Inline Diff Viewer (when diff is attached to message) */}
-        <Show when={props.diff}>
-          {(diff) => <InlineDiffViewer diff={diff()} />}
+        <Show when={props.diff && props.diff.trim().length > 0}>
+          {(diff) => (
+            <InlineDiffViewer
+              diff={diff()}
+              applied={props.applied}
+              onApply={props.onApply}
+            />
+          )}
         </Show>
 
         {/* Referenced Sources Stacked Vertically Below, with Chips Flowing Horizontally */}

@@ -399,6 +399,8 @@ pub fn run() {
             get_session_details,
             trigger_index_workspace,
             orchestrator::prompt_agent_v2,
+            orchestrator::set_conversation_auto_apply,
+            orchestrator::apply_edit_artifact,
             git_api::get_git_branch,
             git_api::get_git_status,
             git_api::get_git_diff

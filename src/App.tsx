@@ -19,6 +19,7 @@ export interface SessionDetails {
   title: string | null;
   workspace_path: string | null;
   model_name: string | null;
+  auto_apply_edits?: boolean;
   created_at?: string;
   updated_at?: string;
 }
