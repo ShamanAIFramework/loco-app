@@ -182,9 +182,3 @@ cargo run -p agent-cli -- replay ~/.loco/traces/<run_id>.jsonl
 # Run deterministic path-search baseline against a task specification
 cargo run -p agent-cli -- baseline path/to/task.json
 ```
-
----
-
-## 📄 License
-
-This project is licensed under the [MIT License](LICENSE).
