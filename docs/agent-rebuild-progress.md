@@ -313,13 +313,15 @@ Rebuild the orchestrator and `agentv2` behavior so deterministic Rust code contr
   - deterministic retrieval uses already-found seed files plus intake queries to add nearby documentation before extraction, improving subsystem research without model-selected tools
   - Tauri ranks domain-matching docs in the seed's local package/docs scope above distant ancestors while rejecting sibling package docs
   - added regression coverage that nearby context docs are read as leased evidence and that package-local docs outrank global docs without sibling noise
-- Added Stereoscopic Gating Pattern:
-  - Implemented dual-lens dialectical verification across critical pipeline boundaries to eliminate local-model blind spots and recall-vs-precision trade-offs:
-    1. **Stereoscopic Intent Gate**: Evaluates user prompts with `Phase::Intake` (generator) and `Phase::IntakeCritic` (adversary), normalized by `TriadConsensus` to prevent dropped clauses or intent collapse.
-    2. **Stereoscopic Evidence Gate**: Evaluates top 10 retrieved candidates with `Phase::CandidateGateOptimist` (inclusion scout for entrypoints, root shells, state signals) and `Phase::CandidateGateSkeptic` (precision pruner for false positives, stylesheets, utilities).
-  - Built a deterministic Rust Host Arbiter that reconciles votes using CodeGraph AST import edges, topology distance, entrypoint identity, and domain constraints without calling a third LLM.
-  - Added `CodeGraphStore::symbols_for_path` and `CodeSearch::search_file_symbols` to resolve component definitions directly from indexed Tree-sitter symbols.
-  - Added unit and regression tests verifying split-decision arbitration, topology discovery, prompt portability, and noise elimination.
+- Stereoscopic Gating Pattern & Consensus Partitioning:
+  - Dual-lens dialectical verification across pipeline boundaries with intelligent consensus partitioning to eliminate local-model blind spots and latency overhead:
+    1. **Stereoscopic Intent Gate**: Evaluates user prompts with `Phase::Intake` and `Phase::IntakeCritic`, with fast-path consensus and host `TriadConsensus` normalization for disputes.
+    2. **Stereoscopic Evidence Gate**: Evaluates retrieved candidates with `Phase::CandidateGateOptimist` and `Phase::CandidateGateSkeptic`. Unanimous votes bypass arbitration; split decisions invoke `Phase::CandidateGateArbiter` primed with CodeGraph AST topology, entrypoint identity, and domain alignment (with deterministic host fallback).
+    3. **Appellate Planning Gate**: Evaluates plans with `Phase::PlanProposer` and `Phase::PlanCritic`. Unanimous approvals fast-path directly to synthesis; disputes engage `Phase::PlanRebuttal` and `Phase::PlanReconciler`.
+    4. **Appellate Stereoscopic Edit Gate**: Generates and audits diffs with `Phase::PatchProposer` and `Phase::PatchCritic`. Unanimous approvals fast-path to host validation; disputes engage `Phase::PatchRebuttal` and `Phase::PatchReconciler`.
+  - Host-level ground truth: AST import edges, live lease checksum verification, and Tree-sitter syntax validation govern all arbitrated and reconciled decisions before disk writes.
+  - `CodeGraphStore::symbols_for_path` and `CodeSearch::search_file_symbols` resolve component definitions directly from indexed Tree-sitter symbols.
+  - Comprehensive test coverage verifies split-decision arbitration, topology discovery, prompt portability, consensus fast-paths, and noise elimination.
   - Implemented **KV-Cache Invariant Prefixing** for Stereoscopic Gating: candidate snippets precede lens-specific instructions, enabling near-instant prompt processing (~80% faster on local `llama-server`).
   - Added **Tree-Sitter Large Symbol Sub-Chunking**: symbols $> 200$ lines in `vector_search.rs` are partitioned into 60-line windowed sub-chunks with symbol metadata preserved.
   - Implemented **Vector-Bound Slicing**: path matches and CodeGraph topology expansions prioritize exact vector search chunk ranges over fallback line boundaries.

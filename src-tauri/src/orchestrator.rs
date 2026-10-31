@@ -399,7 +399,7 @@ impl LlmClient for LlamaServerClient {
         });
         let max_tokens = match request.phase {
             agent_core::Phase::Intake | agent_core::Phase::IntakeCritic => 512,
-            agent_core::Phase::CandidateGate | agent_core::Phase::CandidateGateOptimist | agent_core::Phase::CandidateGateSkeptic => 512,
+            agent_core::Phase::CandidateGate | agent_core::Phase::CandidateGateOptimist | agent_core::Phase::CandidateGateSkeptic | agent_core::Phase::CandidateGateArbiter => 512,
             agent_core::Phase::Extract => 768,
             agent_core::Phase::PlanProposer | agent_core::Phase::PlanCritic | agent_core::Phase::PlanRebuttal | agent_core::Phase::PlanReconciler => 1024,
             agent_core::Phase::PatchProposer | agent_core::Phase::PatchReconciler => 2048,

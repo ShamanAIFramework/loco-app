@@ -11,10 +11,11 @@ use crate::prompt::{
     patch_rebuttal_instruction, patch_reconciler_instruction, phase_prefix,
     plan_critic_instruction, plan_instruction, plan_rebuttal_instruction,
     plan_reconciler_instruction, prompt_candidate_gate_optimist, prompt_candidate_gate_skeptic,
+    prompt_candidate_gate_arbiter,
     schema_candidate_gate, schema_extract, schema_intake, schema_intake_critic, schema_patch_critic,
     schema_patch_proposer, schema_patch_rebuttal, schema_patch_reconciler, schema_plan,
     schema_plan_critic, schema_plan_rebuttal, schema_synthesize, synthesize_instruction, task_block,
-    CandidateGateItem, PromptParts,
+    CandidateGateItem, CandidateGateDisputeItem, PromptParts,
 };
 use crate::trace::{Trace, TraceEvent};
 use crate::traits::{
@@ -742,10 +743,12 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
                 Err(_) => None,
             };
 
-            // --- Node 3: Deterministic Rust Host Arbiter ---
+            // --- Node 3: Stereoscopic Consensus Matrix & LLM Arbiter ---
             if opt_output.is_none() && skep_output.is_none() {
                 final_targets = candidate_pool.clone();
             } else {
+                let mut disputes: Vec<CandidateGateDisputeItem> = Vec::new();
+
                 for cand in &candidate_pool {
                     let opt_eval = opt_output
                         .as_ref()
@@ -759,7 +762,7 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
 
                     let p_lower = cand.path.to_lowercase();
                     let has_topology_backing = cand.source.contains("CodeGraph topology")
-                        || seed_paths.contains(&cand.path);
+                        || expanded_hits.iter().any(|e| e.path == cand.path);
                     let is_entrypoint_or_shell = p_lower.contains("index.")
                         || p_lower.contains("app.")
                         || p_lower.contains("main.")
@@ -782,8 +785,6 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
                         final_targets.push(cand.clone());
                     } else if !opt_keep && !skep_keep {
                         // Unanimous Drop - with Architectural Anchor Protection:
-                        // If a candidate is a domain-aligned root component or shell directly connected by CodeGraph topology,
-                        // retain it as an architectural anchor even if both models claim lack of a dedicated feature table.
                         let is_architectural_anchor = has_topology_backing && is_entrypoint_or_shell && is_domain_aligned;
                         if is_architectural_anchor {
                             final_targets.push(cand.clone());
@@ -797,28 +798,94 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
                                 reason: format!("Stereoscopic consensus rejected: {}", reason),
                             });
                         }
-                    } else if opt_keep && !skep_keep {
-                        // Split Decision: Optimist wanted to keep, Skeptic wanted to drop
-                        // Deterministic Host Arbiter tie-breaker:
-                        // Favor inclusion if backed by CodeGraph topology, entrypoint/shell identity, or domain alignment
-                        if (has_topology_backing || is_entrypoint_or_shell) && is_domain_aligned {
-                            final_targets.push(cand.clone());
-                        } else {
-                            let skep_reason = skep_eval.map(|e| e.reason.as_str()).unwrap_or("pruned by Skeptic");
-                            pruned_candidates.push(PrunedCandidateDetail {
-                                path: cand.path.clone(),
-                                reason: format!("Stereoscopic Arbiter pruned (unbacked by CodeGraph topology): {}", skep_reason),
-                            });
-                        }
                     } else {
-                        // Split Decision: Skeptic wanted to keep, Optimist wanted to drop
-                        // If even the Skeptic found a compelling reason to keep, retain it if domain aligned
-                        if is_domain_aligned {
+                        // Split Decision: Queue for Node 3 LLM Arbiter
+                        let opt_reason = opt_eval
+                            .map(|e| e.reason.clone())
+                            .unwrap_or_else(|| "Advocated by Optimist".to_string());
+                        let skep_reason = skep_eval
+                            .map(|e| e.reason.clone())
+                            .unwrap_or_else(|| "Challenged by Skeptic".to_string());
+                        let snippet = gate_items
+                            .iter()
+                            .find(|g| g.path == cand.path)
+                            .map(|g| g.snippet.clone())
+                            .unwrap_or_default();
+
+                        disputes.push(CandidateGateDisputeItem {
+                            path: cand.path.clone(),
+                            symbol: cand.symbol.clone(),
+                            start_line: cand.start_line,
+                            end_line: cand.end_line,
+                            source: cand.source.clone(),
+                            snippet,
+                            optimist_keep: opt_keep,
+                            optimist_reason: opt_reason,
+                            skeptic_keep: skep_keep,
+                            skeptic_reason: skep_reason,
+                            host_topology_backing: has_topology_backing,
+                            host_is_entrypoint_or_shell: is_entrypoint_or_shell,
+                            host_is_domain_aligned: is_domain_aligned,
+                        });
+                    }
+                }
+
+                // If there are split decisions, invoke Node 3: LLM Arbiter primed with Host ground truth
+                if !disputes.is_empty() {
+                    runtime
+                        .progress
+                        .emit(AgentProgress::Status("Executing Stereoscopic Gating (Adjudicating split votes with LLM Arbiter)".to_string()))
+                        .await;
+
+                    let arb_prompt = prompt_candidate_gate_arbiter(&task.question, target_intent_summary, &disputes);
+                    let arb_req = LlmRequest {
+                        call_id: call_id("gate-arb"),
+                        phase: Phase::CandidateGateArbiter,
+                        schema_name: "CandidateGateOutput".to_string(),
+                        schema: schema_candidate_gate(),
+                        prompt_parts: None,
+                        prompt: arb_prompt,
+                        temperature: 0.0,
+                    };
+
+                    record_trace!(TraceEvent::PhaseStarted {
+                        phase: Phase::CandidateGateArbiter,
+                    });
+
+                    let arb_output: Option<CandidateGateOutput> = match runtime.llm.complete_json(arb_req.clone()).await {
+                        Ok(resp) => {
+                            record_trace!(TraceEvent::LlmCall {
+                                request: arb_req,
+                                response: resp.clone(),
+                            });
+                            parse_json::<CandidateGateOutput>(&resp.raw_json).ok()
+                        }
+                        Err(_) => None,
+                    };
+
+                    for dispute in &disputes {
+                        let cand = candidate_pool.iter().find(|c| c.path == dispute.path).unwrap();
+                        let arb_eval = arb_output
+                            .as_ref()
+                            .and_then(|a| a.evaluations.iter().find(|e| e.path == dispute.path));
+
+                        let keep = if let Some(eval) = arb_eval {
+                            eval.keep
+                        } else {
+                            // Deterministic fallback if Arbiter call failed
+                            (dispute.host_topology_backing || dispute.host_is_entrypoint_or_shell) && dispute.host_is_domain_aligned
+                        };
+
+                        if keep {
                             final_targets.push(cand.clone());
                         } else {
+                            let reason = arb_eval
+                                .map(|e| e.reason.as_str())
+                                .or_else(|| if !dispute.skeptic_keep { Some(dispute.skeptic_reason.as_str()) } else { None })
+                                .unwrap_or("Pruned by Stereoscopic Arbiter");
                             pruned_candidates.push(PrunedCandidateDetail {
                                 path: cand.path.clone(),
-                                reason: "Stereoscopic Arbiter: Domain mismatch".to_string(),
+                                reason: format!("Stereoscopic Arbiter pruned: {}", reason),
                             });
                         }
                     }
@@ -1252,115 +1319,144 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
             });
         let critic_elapsed_ms = critic_start.elapsed().as_millis() as u64;
 
-        // --- Lens 3: Plan Rebuttal (Scope Arbiter / Critic of the Critic) ---
-        runtime
-            .progress
-            .emit(AgentProgress::Status("Step 3B: Lens 3 — Pragmatic rebuttal & defense".to_string()))
-            .await;
+        // --- Step 3B Consensus Partition: Check for disputes ---
+        let plan_has_disputes = !critic_output.missing_aspects.is_empty()
+            || !critic_output.disputed_steps.is_empty()
+            || !critic_output.unverified_assumptions.is_empty();
 
-        let rebuttal_start = std::time::Instant::now();
-        record_trace!(TraceEvent::PhaseStarted {
-            phase: Phase::PlanRebuttal,
-        });
+        let (rebuttal_output, rebuttal_elapsed_ms, reconciled_plan, reconciler_elapsed_ms, reconciler_call_id) = if plan_has_disputes {
+            // --- Lens 3: Plan Rebuttal (Scope Arbiter / Critic of the Critic) ---
+            runtime
+                .progress
+                .emit(AgentProgress::Status("Step 3B: Lens 3 — Pragmatic rebuttal & defense".to_string()))
+                .await;
 
-        let critic_output_json = serde_json::to_string_pretty(&critic_output).unwrap_or_default();
-        let rebuttal_prompt = format!(
-            "{}\n\n{}\n\n{}",
-            shared_context_prefix,
-            phase_prefix(Phase::PlanRebuttal, "PlanRebuttalOutput"),
-            plan_rebuttal_instruction(&proposed_plan_json, &critic_output_json),
-        );
+            let rebuttal_start = std::time::Instant::now();
+            record_trace!(TraceEvent::PhaseStarted {
+                phase: Phase::PlanRebuttal,
+            });
 
-        let rebuttal_req = LlmRequest {
-            call_id: call_id("plan-rebut"),
-            phase: Phase::PlanRebuttal,
-            schema_name: "PlanRebuttalOutput".to_string(),
-            schema: schema_plan_rebuttal(),
-            prompt_parts: None,
-            prompt: rebuttal_prompt,
-            temperature: 0.0,
-        };
+            let critic_output_json = serde_json::to_string_pretty(&critic_output).unwrap_or_default();
+            let rebuttal_prompt = format!(
+                "{}\n\n{}\n\n{}",
+                shared_context_prefix,
+                phase_prefix(Phase::PlanRebuttal, "PlanRebuttalOutput"),
+                plan_rebuttal_instruction(&proposed_plan_json, &critic_output_json),
+            );
 
-        let rebuttal_resp = match runtime.llm.complete_json(rebuttal_req.clone()).await {
-            Ok(resp) => {
-                record_trace!(TraceEvent::LlmCall {
-                    request: rebuttal_req.clone(),
-                    response: resp.clone(),
+            let rebuttal_req = LlmRequest {
+                call_id: call_id("plan-rebut"),
+                phase: Phase::PlanRebuttal,
+                schema_name: "PlanRebuttalOutput".to_string(),
+                schema: schema_plan_rebuttal(),
+                prompt_parts: None,
+                prompt: rebuttal_prompt,
+                temperature: 0.0,
+            };
+
+            let rebuttal_resp = match runtime.llm.complete_json(rebuttal_req.clone()).await {
+                Ok(resp) => {
+                    record_trace!(TraceEvent::LlmCall {
+                        request: rebuttal_req.clone(),
+                        response: resp.clone(),
+                    });
+                    Some(resp)
+                }
+                Err(err) => {
+                    record_trace!(TraceEvent::ToolCall {
+                        name: "plan_rebuttal_failed".to_string(),
+                        args: json!({ "error": err.to_string() }),
+                        result_count: 0,
+                    });
+                    None
+                }
+            };
+
+            let rebuttal_output = rebuttal_resp
+                .as_ref()
+                .and_then(|r| parse_json::<PlanRebuttalOutput>(&r.raw_json).ok())
+                .unwrap_or_else(|| PlanRebuttalOutput {
+                    rebuttal: "Evaluate critique against existing evidence.".to_string(),
+                    dismissed_critiques: vec![],
+                    accepted_critiques: vec![],
                 });
-                Some(resp)
-            }
-            Err(err) => {
-                record_trace!(TraceEvent::ToolCall {
-                    name: "plan_rebuttal_failed".to_string(),
-                    args: json!({ "error": err.to_string() }),
-                    result_count: 0,
-                });
-                None
-            }
-        };
+            let rebuttal_elapsed_ms = rebuttal_start.elapsed().as_millis() as u64;
 
-        let rebuttal_output = rebuttal_resp
-            .as_ref()
-            .and_then(|r| parse_json::<PlanRebuttalOutput>(&r.raw_json).ok())
-            .unwrap_or_else(|| PlanRebuttalOutput {
-                rebuttal: "Evaluate critique against existing evidence.".to_string(),
+            // --- Lens 4: Plan Reconciler (Synthesis) ---
+            runtime
+                .progress
+                .emit(AgentProgress::Status("Step 3B: Lens 4 — Reconciling final plan".to_string()))
+                .await;
+
+            let reconciler_start = std::time::Instant::now();
+            record_trace!(TraceEvent::PhaseStarted {
+                phase: Phase::PlanReconciler,
+            });
+
+            let rebuttal_output_json = serde_json::to_string_pretty(&rebuttal_output).unwrap_or_default();
+            let reconciler_prompt = format!(
+                "{}\n\n{}\n\n{}",
+                shared_context_prefix,
+                phase_prefix(Phase::PlanReconciler, "EditPlan"),
+                plan_reconciler_instruction(&proposed_plan_json, &critic_output_json, &rebuttal_output_json),
+            );
+
+            let reconciler_req = LlmRequest {
+                call_id: call_id("plan-rec"),
+                phase: Phase::PlanReconciler,
+                schema_name: "EditPlan".to_string(),
+                schema: schema_plan(),
+                prompt_parts: None,
+                prompt: reconciler_prompt,
+                temperature: 0.0,
+            };
+
+            let reconciler_resp = match runtime.llm.complete_json(reconciler_req.clone()).await {
+                Ok(resp) => {
+                    record_trace!(TraceEvent::LlmCall {
+                        request: reconciler_req.clone(),
+                        response: resp.clone(),
+                    });
+                    Some(resp)
+                }
+                Err(err) => {
+                    record_trace!(TraceEvent::ToolCall {
+                        name: "plan_reconciler_failed".to_string(),
+                        args: json!({ "error": err.to_string() }),
+                        result_count: 0,
+                    });
+                    None
+                }
+            };
+
+            let reconciled_plan = reconciler_resp
+                .as_ref()
+                .and_then(|r| parse_json::<EditPlan>(&r.raw_json).ok())
+                .unwrap_or_else(|| proposed_plan.clone());
+            let reconciler_elapsed_ms = reconciler_start.elapsed().as_millis() as u64;
+            let reconciler_call_id = reconciler_resp
+                .as_ref()
+                .map(|r| r.call_id.clone())
+                .unwrap_or_else(|| call_id("arbiter"));
+
+            (rebuttal_output, rebuttal_elapsed_ms, reconciled_plan, reconciler_elapsed_ms, reconciler_call_id)
+        } else {
+            runtime
+                .progress
+                .emit(AgentProgress::Status("Step 3B: Unanimous consensus — Plan accepted without disputes".to_string()))
+                .await;
+
+            let rebuttal_out = PlanRebuttalOutput {
+                rebuttal: "Unanimous consensus: Proposed plan accepted without disputed steps or missing aspects.".to_string(),
                 dismissed_critiques: vec![],
                 accepted_critiques: vec![],
-            });
-        let rebuttal_elapsed_ms = rebuttal_start.elapsed().as_millis() as u64;
-
-        // --- Lens 4: Plan Reconciler (Synthesis) ---
-        runtime
-            .progress
-            .emit(AgentProgress::Status("Step 3B: Lens 4 — Reconciling final plan".to_string()))
-            .await;
-
-        let reconciler_start = std::time::Instant::now();
-        record_trace!(TraceEvent::PhaseStarted {
-            phase: Phase::PlanReconciler,
-        });
-
-        let rebuttal_output_json = serde_json::to_string_pretty(&rebuttal_output).unwrap_or_default();
-        let reconciler_prompt = format!(
-            "{}\n\n{}\n\n{}",
-            shared_context_prefix,
-            phase_prefix(Phase::PlanReconciler, "EditPlan"),
-            plan_reconciler_instruction(&proposed_plan_json, &critic_output_json, &rebuttal_output_json),
-        );
-
-        let reconciler_req = LlmRequest {
-            call_id: call_id("plan-rec"),
-            phase: Phase::PlanReconciler,
-            schema_name: "EditPlan".to_string(),
-            schema: schema_plan(),
-            prompt_parts: None,
-            prompt: reconciler_prompt,
-            temperature: 0.0,
+            };
+            let call_id = critic_resp
+                .as_ref()
+                .map(|r| r.call_id.clone())
+                .unwrap_or_else(|| call_id("plan-consensus"));
+            (rebuttal_out, 0, proposed_plan.clone(), 0, call_id)
         };
-
-        let reconciler_resp = match runtime.llm.complete_json(reconciler_req.clone()).await {
-            Ok(resp) => {
-                record_trace!(TraceEvent::LlmCall {
-                    request: reconciler_req.clone(),
-                    response: resp.clone(),
-                });
-                Some(resp)
-            }
-            Err(err) => {
-                record_trace!(TraceEvent::ToolCall {
-                    name: "plan_reconciler_failed".to_string(),
-                    args: json!({ "error": err.to_string() }),
-                    result_count: 0,
-                });
-                None
-            }
-        };
-
-        let reconciled_plan = reconciler_resp
-            .as_ref()
-            .and_then(|r| parse_json::<EditPlan>(&r.raw_json).ok())
-            .unwrap_or_else(|| proposed_plan.clone());
-        let reconciler_elapsed_ms = reconciler_start.elapsed().as_millis() as u64;
 
         // --- Node 5: Deterministic Rust Host Arbiter ---
         runtime
@@ -1412,11 +1508,6 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
         }
 
         // Commit decisions to Notebook (EntryKind::Decision)
-        let reconciler_call_id = reconciler_resp
-            .as_ref()
-            .map(|r| r.call_id.clone())
-            .unwrap_or_else(|| call_id("arbiter"));
-
         let mut committed_decision_ids = Vec::new();
 
         let obj_id = notebook.append_decision(
@@ -1488,12 +1579,22 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
     // =========================================================================
     // STEP 4: Appellate Stereoscopic Edit Gate (When Task is an Edit)
     // =========================================================================
+    let q_lower = task.question.to_lowercase();
+    let is_query_phrase = q_lower.starts_with("what")
+        || q_lower.starts_with("where")
+        || q_lower.starts_with("how")
+        || q_lower.starts_with("why")
+        || q_lower.starts_with("can you explain")
+        || q_lower.starts_with("explain")
+        || q_lower.starts_with("tell me");
+
     let is_edit_request = intake.intents.iter().any(|i| i.intent == UserIntent::WorkspaceEdit)
-        || task.question.to_lowercase().contains("implement")
-        || task.question.to_lowercase().contains("refactor")
-        || task.question.to_lowercase().contains("edit")
-        || task.question.to_lowercase().contains("fix")
-        || task.question.to_lowercase().contains("patch");
+        || (!is_query_phrase
+            && (q_lower.contains("implement")
+                || q_lower.contains("refactor")
+                || q_lower.contains("fix ")
+                || q_lower.contains("patch ")
+                || (q_lower.contains("edit ") && !q_lower.contains("edits"))));
 
     let mut edit_artifact: Option<EditArtifact> = None;
 
@@ -1613,7 +1714,7 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
                 }
             };
 
-            let proposed_patch = prop_resp
+            let mut proposed_patch = prop_resp
                 .as_ref()
                 .and_then(|r| parse_json::<PatchProposal>(&r.raw_json).ok())
                 .unwrap_or_else(|| PatchProposal {
@@ -1625,6 +1726,11 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
                     replacement_code: original_lines.clone(),
                     justification: "Initial candidate patch".to_string(),
                 });
+            proposed_patch.target_path = target_path.clone();
+            proposed_patch.target_symbol = target_symbol.clone();
+            proposed_patch.start_line = start_line;
+            proposed_patch.end_line = end_line;
+            proposed_patch.lease_id = target_lease_id.clone();
 
             // --- Lens 2: Patch Critic (Antithesis) ---
             runtime
@@ -1682,113 +1788,146 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
                     convention_violations: vec![],
                 });
 
-            // --- Lens 3: Patch Rebuttal (Pragmatic Scope Arbiter) ---
-            runtime
-                .progress
-                .emit(AgentProgress::Status("Step 4: Lens 3 — Pragmatic patch rebuttal".to_string()))
-                .await;
-            record_trace!(TraceEvent::PhaseStarted {
-                phase: Phase::PatchRebuttal,
-            });
+            // --- Step 4 Consensus Partition: Check for disputes ---
+            let patch_has_disputes = !critic_output.approved
+                || !critic_output.disputed_changes.is_empty()
+                || !critic_output.unhandled_edge_cases.is_empty();
 
-            let critic_json = serde_json::to_string_pretty(&critic_output).unwrap_or_default();
-            let rebuttal_prompt = format!(
-                "{}\n\n{}\n\n{}",
-                shared_patch_prefix,
-                phase_prefix(Phase::PatchRebuttal, "PatchRebuttalOutput"),
-                patch_rebuttal_instruction(&proposed_json, &critic_json),
-            );
+            let (rebuttal_output, mut reconciler_output, reconciler_call_id) = if patch_has_disputes {
+                // --- Lens 3: Patch Rebuttal (Pragmatic Scope Arbiter) ---
+                runtime
+                    .progress
+                    .emit(AgentProgress::Status("Step 4: Lens 3 — Pragmatic patch rebuttal".to_string()))
+                    .await;
+                record_trace!(TraceEvent::PhaseStarted {
+                    phase: Phase::PatchRebuttal,
+                });
 
-            let rebuttal_req = LlmRequest {
-                call_id: call_id("patch-rebut"),
-                phase: Phase::PatchRebuttal,
-                schema_name: "PatchRebuttalOutput".to_string(),
-                schema: schema_patch_rebuttal(),
-                prompt_parts: None,
-                prompt: rebuttal_prompt,
-                temperature: 0.0,
-            };
+                let critic_json = serde_json::to_string_pretty(&critic_output).unwrap_or_default();
+                let rebuttal_prompt = format!(
+                    "{}\n\n{}\n\n{}",
+                    shared_patch_prefix,
+                    phase_prefix(Phase::PatchRebuttal, "PatchRebuttalOutput"),
+                    patch_rebuttal_instruction(&proposed_json, &critic_json),
+                );
 
-            let rebuttal_resp = match runtime.llm.complete_json(rebuttal_req.clone()).await {
-                Ok(resp) => {
-                    record_trace!(TraceEvent::LlmCall {
-                        request: rebuttal_req.clone(),
-                        response: resp.clone(),
+                let rebuttal_req = LlmRequest {
+                    call_id: call_id("patch-rebut"),
+                    phase: Phase::PatchRebuttal,
+                    schema_name: "PatchRebuttalOutput".to_string(),
+                    schema: schema_patch_rebuttal(),
+                    prompt_parts: None,
+                    prompt: rebuttal_prompt,
+                    temperature: 0.0,
+                };
+
+                let rebuttal_resp = match runtime.llm.complete_json(rebuttal_req.clone()).await {
+                    Ok(resp) => {
+                        record_trace!(TraceEvent::LlmCall {
+                            request: rebuttal_req.clone(),
+                            response: resp.clone(),
+                        });
+                        Some(resp)
+                    }
+                    Err(err) => {
+                        record_trace!(TraceEvent::ToolCall {
+                            name: "patch_rebuttal_failed".to_string(),
+                            args: json!({ "error": err.to_string() }),
+                            result_count: 0,
+                        });
+                        None
+                    }
+                };
+
+                let rebuttal_output = rebuttal_resp
+                    .as_ref()
+                    .and_then(|r| parse_json::<PatchRebuttalOutput>(&r.raw_json).ok())
+                    .unwrap_or_else(|| PatchRebuttalOutput {
+                        rebuttal: "Proceeding with proposed patch.".to_string(),
+                        dismissed_points: vec![],
+                        accepted_points: vec![],
                     });
-                    Some(resp)
-                }
-                Err(err) => {
-                    record_trace!(TraceEvent::ToolCall {
-                        name: "patch_rebuttal_failed".to_string(),
-                        args: json!({ "error": err.to_string() }),
-                        result_count: 0,
-                    });
-                    None
-                }
-            };
 
-            let rebuttal_output = rebuttal_resp
-                .as_ref()
-                .and_then(|r| parse_json::<PatchRebuttalOutput>(&r.raw_json).ok())
-                .unwrap_or_else(|| PatchRebuttalOutput {
-                    rebuttal: "Proceeding with proposed patch.".to_string(),
+                // --- Lens 4: Patch Reconciler (Hardening) ---
+                runtime
+                    .progress
+                    .emit(AgentProgress::Status("Step 4: Lens 4 — Hardening reconciled patch".to_string()))
+                    .await;
+                record_trace!(TraceEvent::PhaseStarted {
+                    phase: Phase::PatchReconciler,
+                });
+
+                let rebuttal_json = serde_json::to_string_pretty(&rebuttal_output).unwrap_or_default();
+                let reconciler_prompt = format!(
+                    "{}\n\n{}\n\n{}",
+                    shared_patch_prefix,
+                    phase_prefix(Phase::PatchReconciler, "PatchReconcilerOutput"),
+                    patch_reconciler_instruction(&proposed_json, &critic_json, &rebuttal_json),
+                );
+
+                let reconciler_req = LlmRequest {
+                    call_id: call_id("patch-recon"),
+                    phase: Phase::PatchReconciler,
+                    schema_name: "PatchReconcilerOutput".to_string(),
+                    schema: schema_patch_reconciler(),
+                    prompt_parts: None,
+                    prompt: reconciler_prompt,
+                    temperature: 0.0,
+                };
+
+                let reconciler_resp = match runtime.llm.complete_json(reconciler_req.clone()).await {
+                    Ok(resp) => {
+                        record_trace!(TraceEvent::LlmCall {
+                            request: reconciler_req.clone(),
+                            response: resp.clone(),
+                        });
+                        Some(resp)
+                    }
+                    Err(err) => {
+                        record_trace!(TraceEvent::ToolCall {
+                            name: "patch_reconciler_failed".to_string(),
+                            args: json!({ "error": err.to_string() }),
+                            result_count: 0,
+                        });
+                        None
+                    }
+                };
+
+                let reconciler_output = reconciler_resp
+                    .as_ref()
+                    .and_then(|r| parse_json::<PatchReconcilerOutput>(&r.raw_json).ok())
+                    .unwrap_or_else(|| PatchReconcilerOutput {
+                        hardened_code: proposed_patch.replacement_code.clone(),
+                        reconciliation_summary: "Validated proposal without modifications.".to_string(),
+                        remaining_uncertainties: vec![],
+                    });
+
+                (rebuttal_output, reconciler_output, reconciler_req.call_id)
+            } else {
+                runtime
+                    .progress
+                    .emit(AgentProgress::Status("Step 4: Unanimous consensus — Candidate patch approved without disputes".to_string()))
+                    .await;
+
+                let rebuttal_out = PatchRebuttalOutput {
+                    rebuttal: "Unanimous consensus: Patch approved by Critic without disputed changes.".to_string(),
                     dismissed_points: vec![],
                     accepted_points: vec![],
-                });
-
-            // --- Lens 4: Patch Reconciler (Hardening) ---
-            runtime
-                .progress
-                .emit(AgentProgress::Status("Step 4: Lens 4 — Hardening reconciled patch".to_string()))
-                .await;
-            record_trace!(TraceEvent::PhaseStarted {
-                phase: Phase::PatchReconciler,
-            });
-
-            let rebuttal_json = serde_json::to_string_pretty(&rebuttal_output).unwrap_or_default();
-            let reconciler_prompt = format!(
-                "{}\n\n{}\n\n{}",
-                shared_patch_prefix,
-                phase_prefix(Phase::PatchReconciler, "PatchReconcilerOutput"),
-                patch_reconciler_instruction(&proposed_json, &critic_json, &rebuttal_json),
-            );
-
-            let reconciler_req = LlmRequest {
-                call_id: call_id("patch-recon"),
-                phase: Phase::PatchReconciler,
-                schema_name: "PatchReconcilerOutput".to_string(),
-                schema: schema_patch_reconciler(),
-                prompt_parts: None,
-                prompt: reconciler_prompt,
-                temperature: 0.0,
-            };
-
-            let reconciler_resp = match runtime.llm.complete_json(reconciler_req.clone()).await {
-                Ok(resp) => {
-                    record_trace!(TraceEvent::LlmCall {
-                        request: reconciler_req.clone(),
-                        response: resp.clone(),
-                    });
-                    Some(resp)
-                }
-                Err(err) => {
-                    record_trace!(TraceEvent::ToolCall {
-                        name: "patch_reconciler_failed".to_string(),
-                        args: json!({ "error": err.to_string() }),
-                        result_count: 0,
-                    });
-                    None
-                }
-            };
-
-            let mut reconciler_output = reconciler_resp
-                .as_ref()
-                .and_then(|r| parse_json::<PatchReconcilerOutput>(&r.raw_json).ok())
-                .unwrap_or_else(|| PatchReconcilerOutput {
+                };
+                let recon_out = PatchReconcilerOutput {
                     hardened_code: proposed_patch.replacement_code.clone(),
-                    reconciliation_summary: "Validated proposal without modifications.".to_string(),
+                    reconciliation_summary: format!(
+                        "Unanimous consensus: Patch approved by Critic ({})",
+                        critic_output.critique
+                    ),
                     remaining_uncertainties: vec![],
-                });
+                };
+                let call_id = critic_resp
+                    .as_ref()
+                    .map(|r| r.call_id.clone())
+                    .unwrap_or_else(|| call_id("patch-consensus"));
+                (rebuttal_out, recon_out, call_id)
+            };
 
             // --- Partitioned Consensus Check & Bounded Pass 2 ---
             let has_dispute = !critic_output.approved
@@ -1809,14 +1948,14 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
 
                 let _confirmed_id = notebook.append_decision(
                     format!("Patch Staging Confirmed: {} (lines {}-{})", target_path, start_line, end_line),
-                    Provenance::Model { call_id: reconciler_req.call_id.clone() },
+                    Provenance::Model { call_id: reconciler_call_id.clone() },
                     Phase::PatchReconciler,
                     vec![],
                     vec!["patch".to_string(), "confirmed".to_string()],
                 );
                 let _disputed_id = notebook.append_decision(
                     format!("Patch Disputed Issue: {}", disputed_issue),
-                    Provenance::Model { call_id: reconciler_req.call_id.clone() },
+                    Provenance::Model { call_id: reconciler_call_id.clone() },
                     Phase::PatchReconciler,
                     vec![],
                     vec!["patch".to_string(), "disputed".to_string()],
@@ -1874,7 +2013,7 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
 
                 let patch_decision_id = notebook.append_decision(
                     format!("Draft Patch: {} (lines {}-{})", target_path, start_line, end_line),
-                    Provenance::Model { call_id: reconciler_req.call_id.clone() },
+                    Provenance::Model { call_id: reconciler_call_id.clone() },
                     Phase::PatchReconciler,
                     vec![],
                     vec!["patch".to_string(), "artifact".to_string()],
@@ -4122,6 +4261,11 @@ mod tests {
                             { "path": "src/AIConversation.tsx", "keep": false, "reason": "DOM copy helper and prose styling" }
                         ]
                     }"#.to_string(),
+                    Phase::CandidateGateArbiter => r#"{
+                        "evaluations": [
+                            { "path": "src/index.tsx", "keep": true, "reason": "Retain root entrypoint as architectural anchor for App mount" }
+                        ]
+                    }"#.to_string(),
                     _ => "{}".to_string(),
                 };
 
@@ -4294,7 +4438,7 @@ mod tests {
                         "has_contaminated_queries": false,
                         "corrected_intents": []
                     }"#.to_string(),
-                    Phase::CandidateGateOptimist | Phase::CandidateGateSkeptic => r#"{
+                    Phase::CandidateGateOptimist | Phase::CandidateGateSkeptic | Phase::CandidateGateArbiter => r#"{
                         "evaluations": [
                             {
                                 "path": "src/MonolithicRoutes.tsx",
@@ -4473,7 +4617,7 @@ mod tests {
                         "has_contaminated_queries": false,
                         "corrected_intents": null
                     }"#.to_string(),
-                    Phase::CandidateGate | Phase::CandidateGateOptimist | Phase::CandidateGateSkeptic => r#"{
+                    Phase::CandidateGate | Phase::CandidateGateOptimist | Phase::CandidateGateSkeptic | Phase::CandidateGateArbiter => r#"{
                         "evaluations": [
                             { "path": "src/routes.tsx", "keep": true, "reason": "Configures routes" }
                         ]
@@ -4602,7 +4746,7 @@ mod tests {
                         "has_contaminated_queries": false,
                         "corrected_intents": null
                     }"#.to_string(),
-                    Phase::CandidateGate | Phase::CandidateGateOptimist | Phase::CandidateGateSkeptic => r#"{
+                    Phase::CandidateGate | Phase::CandidateGateOptimist | Phase::CandidateGateSkeptic | Phase::CandidateGateArbiter => r#"{
                         "evaluations": [
                             { "path": "src/routes.tsx", "keep": true, "reason": "Configures routes" }
                         ]
@@ -4795,7 +4939,7 @@ mod tests {
                         "has_contaminated_queries": false,
                         "corrected_intents": null
                     }"#.to_string(),
-                    Phase::CandidateGate | Phase::CandidateGateOptimist | Phase::CandidateGateSkeptic => r#"{
+                    Phase::CandidateGate | Phase::CandidateGateOptimist | Phase::CandidateGateSkeptic | Phase::CandidateGateArbiter => r#"{
                         "evaluations": [
                             { "path": "src/routes.tsx", "keep": true, "reason": "Configures routes" }
                         ]
@@ -4951,7 +5095,7 @@ mod tests {
                         "has_contaminated_queries": false,
                         "corrected_intents": null
                     }"#.to_string(),
-                    Phase::CandidateGate | Phase::CandidateGateOptimist | Phase::CandidateGateSkeptic => r#"{
+                    Phase::CandidateGate | Phase::CandidateGateOptimist | Phase::CandidateGateSkeptic | Phase::CandidateGateArbiter => r#"{
                         "evaluations": [
                             { "path": "src/routes.tsx", "keep": true, "reason": "Configures routes" }
                         ]

@@ -12,27 +12,40 @@ This project is a local-first coding agent built around a deterministic Rust har
 
 ## Stereoscopic Gating Pattern
 
-To overcome the recall-vs-precision trade-offs and context limits of local models (7B–14B), critical judgment boundaries use **Stereoscopic Gating** (an asymmetric dialectic reconciled by the deterministic Rust host). Do not collapse critical filtering or classification boundaries into a single monocular prompt.
+To overcome the recall-vs-precision trade-offs and context limits of local models (7B–14B), critical judgment boundaries use **Stereoscopic Gating**—an asymmetric dialectic governed by an **Intelligent Consensus Partition**. Critical filtering, classification, and validation boundaries are never collapsed into a single monocular prompt.
 
 ### Pattern Structure
-1. **Lens 1 (Inclusion / Recall - Thesis)**: A prompt explicitly incentivized to maximize recall, detect systemic/architectural value, entrypoints, root shells, state signals, and indirect callers.
-2. **Lens 2 (Precision / Pruning - Antithesis)**: An independent adversarial prompt incentivized to maximize precision, challenge false positives, eliminate coincidental keyword matches, generic utilities, and noise.
-3. **Node 3 (Deterministic Host Arbiter - Synthesis)**: The Rust engine reconciles votes using ground truth (CodeGraph AST import edges, topology distance, file domain alignment, and token budgets). The host breaks split decisions without calling a third LLM.
+1. **Lens 1 (Inclusion / Proposer / Recall - Thesis)**: A prompt incentivized to maximize recall, detect systemic architectural value, entrypoints, root components, state signals, and solution paths.
+2. **Lens 2 (Precision / Critic / Pruning - Antithesis)**: An independent adversarial prompt incentivized to maximize precision, challenge false positives, eliminate coincidental keyword matches, isolate regressions, and prune noise.
+3. **Consensus Partition (Synthesis & Arbitration)**:
+   - **Unanimous Consensus (Fast Path)**: When both lenses agree (unanimous keep, unanimous drop, or unreserved critique approval), the decision is accepted immediately. Downstream arbitration and rebuttal phases are bypassed entirely to preserve token budget and reduce latency.
+   - **Dispute Resolution (Deep Path)**: When lenses disagree (split keep/drop votes, missing aspects, or active critique disputes), the decision routes to arbitration or appellate reconciliation primed with host ground truth:
+     - *Candidate Evidence*: `Phase::CandidateGateArbiter` resolves split candidate decisions using a tightly constrained prompt primed with ground-truth CodeGraph AST import topology, entrypoint identity, and domain alignment (backed by a deterministic host fallback).
+     - *Implementation Plans & Edit Patches*: Appellate rebuttal and reconciliation phases resolve substantive technical disputes, followed by host-enforced lease freshness and Tree-sitter syntax validation before disk writes.
 
 ### Active Stereoscopic Gates in the Pipeline
 - **Gate 1: Stereoscopic Intent Gate (Input Boundary)**:
   - *Lens 1*: `Phase::Intake` drafts intent decomposition and search queries.
   - *Lens 2*: `Phase::IntakeCritic` actively challenges dropped prompt clauses, intent collapse, and query contamination.
-  - *Host Arbiter*: `TriadConsensus` normalizes the decomposition, restores general questions, and sanitizes queries before execution.
+  - *Synthesis*: Unanimous decompositions proceed directly; disputes are normalized by host `TriadConsensus` to restore dropped questions and sanitize queries before execution.
 - **Gate 2: Stereoscopic Evidence Gate (Retrieval Boundary)**:
   - *Lens 1*: `Phase::CandidateGateOptimist` acts as an Architectural Scout, advocating for framework entrypoints, root components, and view-switching shells.
   - *Lens 2*: `Phase::CandidateGateSkeptic` acts as a Precision Pruner, rejecting stylesheets, isolated utilities, and superficial keyword hits.
-  - *Host Arbiter*: Evaluates the consensus matrix. On split decisions, breaks ties in favor of candidates backed by CodeGraph AST import topology, entrypoint identity, or domain alignment.
+  - *Synthesis*: Unanimous keep/drop decisions are committed immediately. Split decisions invoke `Phase::CandidateGateArbiter` primed with host ground-truth AST topology, entrypoint identity, and domain alignment (with deterministic host fallback).
+- **Gate 3: Appellate Planning Gate (Implementation Boundary)**:
+  - *Lens 1*: `Phase::PlanProposer` drafts implementation steps, risks, and affected files from leased evidence.
+  - *Lens 2*: `Phase::PlanCritic` challenges unverified assumptions, missing architectural aspects, and disputed steps.
+  - *Synthesis*: Unanimous approvals (no missing aspects, disputed steps, or unverified assumptions) advance immediately to synthesis. Disputed plans invoke `Phase::PlanRebuttal` and `Phase::PlanReconciler` to distinguish genuine flaws from speculative nitpicks before committing to the notebook ledger.
+- **Gate 4: Appellate Stereoscopic Edit Gate (Execution & Patch Boundary)**:
+  - *Lens 1*: `Phase::PatchProposer` generates in-memory replacement unified diffs against leased focal windows.
+  - *Lens 2*: `Phase::PatchCritic` audits syntax regressions, disputed changes, and unhandled boundary conditions.
+  - *Synthesis*: Approved diffs without disputes bypass appellate rounds directly to host validation. Disputed patches invoke `Phase::PatchRebuttal` and `Phase::PatchReconciler`. Final diffs are verified by the Rust host for lease freshness and Tree-sitter AST syntax validity before staging in sandboxed Git worktrees.
 
 ### Rules for Future Agents and Loops
 - **Never collapse a Stereoscopic Gate into a single prompt**: Single-perspective prompts on local models inevitably skew into either hyper-permissive noise or hyper-restrictive rejections of context.
-- **Keep the Host as the Arbiter**: Do not invoke a third LLM to arbitrate unless qualitative trade-offs cannot be resolved by ground truth. Prefer host-mediated rules based on CodeGraph AST topology, checksums, and budgets.
-- **Apply Stereoscopic Gating to new decision boundaries**: If adding new capabilities (e.g. implementation plan validation, edit candidate selection, or patch verification), structure them as stereoscopic gates (Proposer/Optimist + Adversary/Critic + Deterministic Host Arbiter).
+- **Apply Consensus Partitioning to all dual-lens boundaries**: Always evaluate unanimous agreement first. Bypass multi-turn rebuttal/arbitration passes when both lenses converge to eliminate redundant local inference overhead.
+- **Ground Arbiters in Host Truth**: When an LLM arbiter or reconciler is required to resolve qualitative disputes, strictly prime the prompt with host-verified ground truth (CodeGraph AST import edges, entrypoint identity, lease checksums, and token budgets). Maintain deterministic host fallback paths when LLM arbitration fails or times out.
+- **Keep File and Worktree Mutation Host-Enforced**: The model generates diffs or plans, but the Rust host exclusively validates leases, parses AST syntax, and commits changes to disk.
 
 ## Prompting Rules For Local Models
 

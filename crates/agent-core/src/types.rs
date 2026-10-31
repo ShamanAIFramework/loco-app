@@ -68,6 +68,7 @@ pub enum Phase {
     CandidateGate,
     CandidateGateOptimist,
     CandidateGateSkeptic,
+    CandidateGateArbiter,
     PlanProposer,
     PlanCritic,
     PlanRebuttal,
@@ -220,10 +221,15 @@ pub struct PlanStepResults {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PatchProposal {
+    #[serde(default)]
     pub target_path: String,
+    #[serde(default)]
     pub target_symbol: Option<String>,
+    #[serde(default)]
     pub start_line: usize,
+    #[serde(default)]
     pub end_line: usize,
+    #[serde(default)]
     pub lease_id: LeaseId,
     pub replacement_code: String,
     pub justification: String,

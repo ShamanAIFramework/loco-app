@@ -15,22 +15,26 @@ Instead of relying on fragile, unconstrained single-prompt ReAct loops or expens
 ## 🌟 Key Innovations
 
 ### 1. Stereoscopic Gating Pattern
-Local models face severe trade-offs between recall (missing critical context) and precision (hallucinating irrelevant files). Loco breaks through these limits using **Stereoscopic Dialectics** reconciled by the deterministic Rust host:
+Local models face severe trade-offs between recall (missing critical context) and precision (hallucinating irrelevant files). Loco resolves these limits using **Stereoscopic Gating** governed by an **Intelligent Consensus Partition**:
 
 ```mermaid
 flowchart TD
     User([User Request / Intent]) --> Lens1["Lens 1: Proposer / Scout\n(Incentivized for High Recall)"]
     User --> Lens2["Lens 2: Critic / Adversary\n(Incentivized for Precision & Pruning)"]
-    Lens1 --> Arbiter{"Deterministic Host Arbiter\n(CodeGraph AST, Line Checksums, Budgets)"}
-    Lens2 --> Arbiter
-    Arbiter --> Reconciled["Committed Evidence / Decision / Patch"]
+    Lens1 --> Consensus{"Consensus Partition\n(Unanimous Agreement?)"}
+    Lens2 --> Consensus
+    Consensus -->|Unanimous Agreement| Fast["Fast Path\n(Immediate Lease / Plan / Diff Acceptance)"]
+    Consensus -->|Disputed Decision| Arbiter["Deep Path: Arbiter / Reconciler\n(Primed with CodeGraph AST, Entrypoint, Leases)"]
+    Arbiter --> HostCheck{"Host Verification\n(Lease Freshness, Tree-sitter Syntax, Budgets)"}
+    Fast --> HostCheck
+    HostCheck --> Reconciled["Committed Evidence / Notebook / Worktree Patch"]
 ```
 
 Loco implements four stereoscopic gates across the pipeline:
-- **Gate 1: Stereoscopic Intent Gate (Input Boundary)**: Decomposes multi-intent compound prompts into workspace actions vs. chat/general questions. Directly fulfills non-workspace items without wasting compute.
-- **Gate 2: Stereoscopic Evidence Gate (Retrieval Boundary)**: Pairs an Architectural Scout (identifying root entrypoints and callers) with a Precision Pruner (rejecting superficial keyword noise), broken by CodeGraph topology.
-- **Gate 3: Appellate Planning Gate (Implementation Boundary)**: Proposer drafts plan &rarr; Critic challenges assumptions &rarr; Rebuttal defends against analysis paralysis &rarr; Reconciler synthesizes &rarr; Host Arbiter verifies leased files.
-- **Gate 4: Appellate Stereoscopic Edit Gate (Execution & Patch Boundary)**: Proposer drafts patch &rarr; Critic audits regressions & boundary conditions &rarr; Rebuttal reconciles disputed logic &rarr; Reconciler outputs replacement &rarr; Host Arbiter verifies lease freshness and Tree-sitter syntax validity.
+- **Gate 1: Stereoscopic Intent Gate (Input Boundary)**: Decomposes multi-intent compound prompts into workspace actions vs. chat/general questions. Unanimous decompositions proceed directly; disputes are normalized via host `TriadConsensus` to restore dropped prompt clauses and sanitize search queries.
+- **Gate 2: Stereoscopic Evidence Gate (Retrieval Boundary)**: Evaluates candidate snippets with an Architectural Scout (`CandidateGateOptimist`) and a Precision Pruner (`CandidateGateSkeptic`). Unanimous keep/drop decisions fast-path; split decisions invoke an LLM Arbiter (`CandidateGateArbiter`) primed with ground-truth CodeGraph AST topology and entrypoint identity.
+- **Gate 3: Appellate Planning Gate (Implementation Boundary)**: Evaluates implementation approaches with a Proposer and an adversarial Critic. Unanimous plans advance directly; disputed plans trigger Rebuttal and Reconciler passes to resolve technical critiques before committing to the notebook ledger.
+- **Gate 4: Appellate Stereoscopic Edit Gate (Execution & Patch Boundary)**: Pairs a Patch Proposer with an adversarial Patch Critic. Clean diffs fast-path directly to host validation; disputed diffs route through Rebuttal and Reconciler before the deterministic Rust host verifies lease freshness and Tree-sitter AST syntax prior to staging in isolated Git worktrees.
 
 ### 2. Multi-Tier Deterministic CodeGraph
 - **Tree-sitter AST Symbol Indexing**: Parses Rust, TypeScript, TSX, and JavaScript into structured symbol declarations, line ranges, and cross-file import edges.

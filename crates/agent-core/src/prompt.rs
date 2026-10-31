@@ -908,6 +908,73 @@ pub fn prompt_candidate_gate_skeptic(
     out
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CandidateGateDisputeItem {
+    pub path: String,
+    pub symbol: Option<String>,
+    pub start_line: u32,
+    pub end_line: u32,
+    pub source: String,
+    pub snippet: String,
+    pub optimist_keep: bool,
+    pub optimist_reason: String,
+    pub skeptic_keep: bool,
+    pub skeptic_reason: String,
+    pub host_topology_backing: bool,
+    pub host_is_entrypoint_or_shell: bool,
+    pub host_is_domain_aligned: bool,
+}
+
+pub fn prompt_candidate_gate_arbiter(
+    task_question: &str,
+    intent_summary: &str,
+    disputes: &[CandidateGateDisputeItem],
+) -> String {
+    let mut out = String::new();
+    out.push_str("CANDIDATE CODE EVALUATION: ARBITER RECONCILIATION\n");
+    out.push_str(&format!("User Request: {}\n", task_question.trim()));
+    out.push_str(&format!("Target Intent: {}\n\n", intent_summary.trim()));
+    out.push_str("EVALUATION PERSPECTIVE: CHIEF ARCHITECT ARBITER (DISPUTE RESOLUTION)\n");
+    out.push_str("Role: You are an impartial Chief Systems Architect adjudicating split votes between the Optimist (Thesis: Keep) and the Skeptic (Antithesis: Drop).\n");
+    out.push_str("Mission: Review each disputed candidate where Optimist and Skeptic disagreed. Determine definitively whether the candidate should be retained (`keep: true`) or rejected (`keep: false`).\n\n");
+    out.push_str("Decision Guidelines:\n");
+    out.push_str("1. Ground Truth Alignment: Verify whether the snippet ACTUALLY contains or directly configures the requested capability, or if the Optimist hallucinated relevance based on coincidental keyword matches.\n");
+    out.push_str("2. Architectural Anchors vs. Distractions: If the snippet does not contain the specific feature, retain it ONLY if the Host Analysis confirms it is a primary entrypoint or root shell necessary for structural context. If it is an unrelated component, utility, or secondary panel, rule in favor of the Skeptic and DROP it.\n");
+    out.push_str("3. Host Deterministic Analysis: Treat the provided Host AST Topology, Entrypoint status, and Domain Alignment as ground-truth facts.\n\n");
+    out.push_str("Disputed Candidates to Arbitrate:\n");
+
+    for (i, d) in disputes.iter().enumerate() {
+        out.push_str(&format!(
+            "--- Disputed Candidate {} ---\nPath: {}\nLines: {}-{}\nSymbol: {}\nSource: {}\n",
+            i + 1,
+            d.path,
+            d.start_line,
+            d.end_line,
+            d.symbol.as_deref().unwrap_or("none"),
+            d.source
+        ));
+        out.push_str("Host Ground-Truth Analysis:\n");
+        out.push_str(&format!(
+            " - CodeGraph AST Topology Backing: {}\n - Entrypoint / Root Shell: {}\n - Domain Alignment: {}\n",
+            if d.host_topology_backing { "YES (Connected to active topology)" } else { "NO (Isolated / no AST edge to root)" },
+            if d.host_is_entrypoint_or_shell { "YES (Application entrypoint or shell)" } else { "NO (Interior component / secondary leaf)" },
+            if d.host_is_domain_aligned { "YES (Domain aligned)" } else { "NO (Domain mismatch)" }
+        ));
+        out.push_str(&format!(
+            "Lens 1 (Optimist): keep = {}, Reason: {}\n",
+            d.optimist_keep, d.optimist_reason
+        ));
+        out.push_str(&format!(
+            "Lens 2 (Skeptic): keep = {}, Reason: {}\n",
+            d.skeptic_keep, d.skeptic_reason
+        ));
+        out.push_str(&format!("Code Snippet:\n```\n{}\n```\n\n", d.snippet.trim()));
+    }
+
+    out.push_str("Return a JSON object matching schema `CandidateGateOutput` with an evaluation (`path`, `keep`, `reason`) for each disputed candidate.\n");
+    out
+}
+
 pub fn schema_extract() -> serde_json::Value {
     json!({
         "type": "object",
@@ -1242,6 +1309,38 @@ mod tests {
         assert!(rendered.contains("LINES 106-108"));
         assert!(rendered.contains("  106: first"));
         assert!(rendered.contains("  108: third"));
+    }
+
+    #[test]
+    fn candidate_gate_arbiter_prompt_contains_host_analysis() {
+        let dispute = CandidateGateDisputeItem {
+            path: "src/SomePanel.tsx".to_string(),
+            symbol: Some("SomePanel".to_string()),
+            start_line: 10,
+            end_line: 50,
+            source: "Content match".to_string(),
+            snippet: "export function SomePanel() {}".to_string(),
+            optimist_keep: true,
+            optimist_reason: "Panel includes button".to_string(),
+            skeptic_keep: false,
+            skeptic_reason: "Unrelated panel, false positive".to_string(),
+            host_topology_backing: false,
+            host_is_entrypoint_or_shell: false,
+            host_is_domain_aligned: true,
+        };
+
+        let rendered = prompt_candidate_gate_arbiter(
+            "Where is the feature button?",
+            "Locate feature button",
+            &[dispute],
+        );
+
+        assert!(rendered.contains("ARBITER RECONCILIATION"));
+        assert!(rendered.contains("Host Ground-Truth Analysis:"));
+        assert!(rendered.contains("CodeGraph AST Topology Backing: NO"));
+        assert!(rendered.contains("Lens 1 (Optimist): keep = true"));
+        assert!(rendered.contains("Lens 2 (Skeptic): keep = false"));
+        assert!(rendered.contains("src/SomePanel.tsx"));
     }
 
     fn common_prefix_len(left: &str, right: &str) -> usize {
