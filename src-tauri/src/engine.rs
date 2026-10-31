@@ -51,6 +51,7 @@ struct EngineStateInner {
     average_tps: f64,
     total_tokens: u64,
     recent_tps: Vec<f64>,
+    model_size_bytes: u64,
 }
 
 /// Thread-safe wrapper for the engine's lifecycle state.
@@ -73,6 +74,7 @@ impl EngineState {
                 average_tps: 0.0,
                 total_tokens: 0,
                 recent_tps: Vec::new(),
+                model_size_bytes: 0,
             }),
         }
     }
@@ -174,15 +176,34 @@ impl EngineState {
                 guard.average_tps =
                     guard.recent_tps.iter().sum::<f64>() / guard.recent_tps.len() as f64;
 
-                // Thresholds for warning about CPU-bound operations:
-                // If producing meaningful tokens at less than 9 t/s on desktop, flag as CPU-bound
-                if tokens >= 12 && tps < 9.0 {
+                // Model-size normalized effective memory bandwidth heuristic:
+                // Generation speed in autoregressive models is bound by streaming weights:
+                // Effective Bandwidth (GB/s) = tokens/sec * model_size (GB).
+                // On Apple Silicon, CPU memory bus achieves only ~20-30 GB/s for generation,
+                // whereas Metal GPU achieves ~150-320 GB/s.
+                let model_gb = if guard.model_size_bytes > 0 {
+                    guard.model_size_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+                } else {
+                    10.0
+                };
+                let effective_bandwidth_gbps = tps * model_gb;
+
+                if guard
+                    .offload_info
+                    .as_deref()
+                    .map(|s| s.to_lowercase().contains("cpu") || s.contains("BLAS"))
+                    .unwrap_or(false)
+                {
+                    guard.is_cpu_bound = true;
+                } else if tokens >= 12 && effective_bandwidth_gbps < 45.0 {
                     guard.is_cpu_bound = true;
                     if guard.offload_info.is_none() {
-                        guard.offload_info = Some("Low throughput (< 9 t/s, likely CPU-bound)".to_string());
+                        guard.offload_info = Some(format!(
+                            "Low throughput ({:.1} GB/s bandwidth, likely CPU)",
+                            effective_bandwidth_gbps
+                        ));
                     }
-                } else if tps >= 15.0 {
-                    // Clearly running on GPU
+                } else {
                     guard.is_cpu_bound = false;
                 }
             }
@@ -216,11 +237,13 @@ impl EngineState {
         port: u16,
         api_key: String,
         child: tauri_plugin_shell::process::CommandChild,
+        model_size_bytes: u64,
     ) {
         if let Ok(mut guard) = self.inner.lock() {
             guard.port = Some(port);
             guard.api_key = Some(api_key);
             guard.child = Some(child);
+            guard.model_size_bytes = model_size_bytes;
         }
     }
 
@@ -277,19 +300,11 @@ async fn initialize_inner(app: &AppHandle) -> Result<()> {
         return Err(anyhow!("Model file missing at {:?}", model_path));
     }
 
-    // Set environment hints for llama.cpp / ggml
-    std::env::set_var("GGML_BACKEND_PATH", "/opt/homebrew/opt/ggml/libexec");
-    std::env::set_var("LLAMA_ARG_DEVICE", "MTL0");
-    std::env::set_var("LLAMA_ARG_N_GPU_LAYERS", "99");
-
     // 5. Spawn the sidecar
     let (mut rx, child) = app
         .shell()
         .sidecar(SIDECAR_NAME)
         .context("Failed to locate sidecar binary")?
-        .env("GGML_BACKEND_PATH", "/opt/homebrew/opt/ggml/libexec")
-        .env("LLAMA_ARG_DEVICE", "MTL0")
-        .env("LLAMA_ARG_N_GPU_LAYERS", "99")
         .args([
             "--host",
             HOST,
@@ -302,6 +317,8 @@ async fn initialize_inner(app: &AppHandle) -> Result<()> {
             &model_path.to_string_lossy(),
             "--ctx-size",
             CTX_SIZE,
+            "--parallel",
+            "1",
             "--device",
             "MTL0",
             "--n-gpu-layers",
@@ -312,7 +329,9 @@ async fn initialize_inner(app: &AppHandle) -> Result<()> {
         .spawn()
         .context("Failed to spawn llama-server sidecar")?;
 
-    engine_state.update_details(port, api_key.clone(), child);
+    let model_size_bytes = std::fs::metadata(&model_path).map(|m| m.len()).unwrap_or(0);
+    engine_state.update_details(port, api_key.clone(), child, model_size_bytes);
+    engine_state.set_offload_status(false, Some("Metal GPU active (MTL0)".to_string()));
 
 fn inspect_engine_line(line: &str, state: &EngineState, app: &AppHandle) {
     let lower = line.to_lowercase();
@@ -337,11 +356,11 @@ fn inspect_engine_line(line: &str, state: &EngineState, app: &AppHandle) {
                 }
             }
         }
-    } else if lower.contains("loaded cpu backend") || lower.contains("backend cpu") {
-        state.set_offload_status(true, Some("CPU backend active (Metal inactive)".to_string()));
+    } else if lower.contains("using device blas") || lower.contains("loaded cpu backend") || lower.contains("backend cpu") {
+        state.set_offload_status(true, Some("CPU backend active (Accelerate/BLAS)".to_string()));
         let _ = app.emit("ai-performance", state.performance_metrics());
-    } else if lower.contains("loaded metal backend") || lower.contains("ggml_metal_init") || lower.contains("mtl0") {
-        state.set_offload_status(false, Some("Metal GPU active".to_string()));
+    } else if lower.contains("using device mtl") || lower.contains("device mtl0") || lower.contains("loaded metal backend") || lower.contains("ggml_metal_init") || lower.contains("libggml-metal") {
+        state.set_offload_status(false, Some("Metal GPU active (MTL0)".to_string()));
         let _ = app.emit("ai-performance", state.performance_metrics());
     }
 }
