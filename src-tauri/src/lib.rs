@@ -120,6 +120,13 @@ fn get_ai_connection(
     state.connection_details()
 }
 
+#[tauri::command]
+fn get_ai_performance(
+    state: tauri::State<'_, engine::EngineState>,
+) -> crate::agent::PerformanceMetrics {
+    state.performance_metrics()
+}
+
 pub fn resolve_workspace_root(requested: Option<String>) -> std::path::PathBuf {
     if let Some(req) = requested {
         let p = std::path::PathBuf::from(req.trim());
@@ -338,6 +345,7 @@ async fn get_session_details(
     let app_clone = app.clone();
     let detail = tauri::async_runtime::spawn_blocking(move || {
         let state = app_clone.state::<AppState>();
+        let _ = state.conversations.trim_trailing_incomplete_messages(&session_id);
         state.conversations.load_conversation(&session_id)
     })
     .await
@@ -394,6 +402,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             greet,
             get_ai_connection,
+            get_ai_performance,
             create_session,
             list_conversations,
             get_session_details,

@@ -283,4 +283,114 @@ impl ConversationStore {
             created_at: parse_dt(&now)?,
         })
     }
+
+    /// Trims any trailing messages that occur after the last assistant message with a valid
+    /// (non-empty) response. If no valid assistant response exists in the conversation,
+    /// all incomplete messages in the conversation are removed.
+    /// Returns the number of removed messages.
+    pub fn trim_trailing_incomplete_messages(&self, conversation_id: &str) -> Result<usize> {
+        let mut guard = self.conn.lock().map_err(|_| anyhow!("Mutex poisoned"))?;
+        let tx = guard.transaction()?;
+
+        // Fetch all messages in chronological order
+        let mut stmt = tx.prepare(
+            "SELECT id, role, content FROM messages 
+             WHERE conversation_id = ?1 
+             ORDER BY created_at ASC, rowid ASC",
+        )?;
+
+        let rows = stmt
+            .query_map(params![conversation_id], |row| {
+                let id: String = row.get(0)?;
+                let role_str: String = row.get(1)?;
+                let content: String = row.get(2)?;
+                Ok((id, role_str, content))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(stmt);
+
+        // Find the index of the last assistant message with non-empty content
+        let mut last_valid_idx = None;
+        for (i, (_id, role_str, content)) in rows.iter().enumerate() {
+            if role_str == Role::Assistant.as_str() && !content.trim().is_empty() {
+                last_valid_idx = Some(i);
+            }
+        }
+
+        // Determine IDs to delete
+        let ids_to_delete: Vec<String> = match last_valid_idx {
+            Some(idx) => rows
+                .iter()
+                .skip(idx + 1)
+                .map(|(id, _, _)| id.clone())
+                .collect(),
+            None => rows.iter().map(|(id, _, _)| id.clone()).collect(),
+        };
+
+        let deleted_count = ids_to_delete.len();
+        if deleted_count > 0 {
+            for id in &ids_to_delete {
+                tx.execute(
+                    "DELETE FROM messages WHERE id = ?1",
+                    params![id],
+                )?;
+            }
+            tx.execute(
+                "UPDATE conversations SET updated_at = ?1 WHERE id = ?2",
+                params![now_str(), conversation_id],
+            )?;
+        }
+
+        tx.commit()?;
+        Ok(deleted_count)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::env;
+
+    #[test]
+    fn test_trim_trailing_incomplete_messages() -> Result<()> {
+        let db_path = env::temp_dir().join(format!("loco_test_conv_{}.sqlite", Uuid::new_v4()));
+        let store = ConversationStore::new(&db_path)?;
+
+        let conv = store.create_conversation(Some("Test"), None, None)?;
+
+        // Case 1: Only user message (unanswered)
+        store.add_message(&conv.id, Role::User, "Hello?")?;
+        let trimmed = store.trim_trailing_incomplete_messages(&conv.id)?;
+        assert_eq!(trimmed, 1);
+        let detail = store.load_conversation(&conv.id)?.unwrap();
+        assert_eq!(detail.messages.len(), 0);
+
+        // Case 2: User message followed by valid assistant message
+        store.add_message(&conv.id, Role::User, "Hello")?;
+        store.add_message(&conv.id, Role::Assistant, "Hi there!")?;
+        let trimmed = store.trim_trailing_incomplete_messages(&conv.id)?;
+        assert_eq!(trimmed, 0);
+        let detail = store.load_conversation(&conv.id)?.unwrap();
+        assert_eq!(detail.messages.len(), 2);
+
+        // Case 3: Complete turn followed by dangling user message
+        store.add_message(&conv.id, Role::User, "Followup question that failed")?;
+        let trimmed = store.trim_trailing_incomplete_messages(&conv.id)?;
+        assert_eq!(trimmed, 1);
+        let detail = store.load_conversation(&conv.id)?.unwrap();
+        assert_eq!(detail.messages.len(), 2);
+        assert_eq!(detail.messages[1].content, "Hi there!");
+
+        // Case 4: Assistant message with empty / whitespace content
+        store.add_message(&conv.id, Role::User, "Another question")?;
+        store.add_message(&conv.id, Role::Assistant, "   ")?;
+        let trimmed = store.trim_trailing_incomplete_messages(&conv.id)?;
+        assert_eq!(trimmed, 2);
+        let detail = store.load_conversation(&conv.id)?.unwrap();
+        assert_eq!(detail.messages.len(), 2);
+        assert_eq!(detail.messages[1].content, "Hi there!");
+
+        let _ = std::fs::remove_file(&db_path);
+        Ok(())
+    }
 }

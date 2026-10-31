@@ -53,6 +53,11 @@ Loco implements four stereoscopic gates across the pipeline:
 - **Right Panel Source Control**: Real-time Git status, branch indicator, untracked file diff previews, and Unified vs. Split view toggles.
 - **Telemetry & Tracing**: Live execution status pills with timers, JSONL trace persistence, and optional Arize Phoenix OpenTelemetry export.
 
+### 6. Constrained Decoding & Grammar-Guided Output (GBNF)
+- **Zero Syntax Hallucination**: Rather than relying on soft system prompts hoping an open-weights model outputs valid JSON, Loco leverages `llama.cpp`'s native **GBNF (GGML Backus-Naur Form)** constrained decoding engine.
+- **Logit-Level Masking**: Typed JSON schemas defined in `agent-core` (for Intake, Candidate Gating, Evidence Extraction, and Planning) are enforced by `llama-server` via grammar state machines. At each token step, logits for non-conforming tokens are masked to $-\infty$, mathematically guaranteeing 100% syntactic compliance.
+- **Model Agnostic**: Decouples structural reliability from model training. Any GGUF-compatible model (e.g., Qwen, Nemotron, Llama, Mistral) can function as a deterministic reasoning coprocessor without custom schema fine-tuning.
+
 ---
 
 ## 🏛️ Architecture Overview

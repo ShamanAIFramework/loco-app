@@ -4,6 +4,7 @@
 //! tracks its startup health, and exposes connection parameters.
 
 use anyhow::{anyhow, Context, Result};
+use crate::agent::PerformanceMetrics;
 use serde::Serialize;
 use std::net::TcpListener;
 use std::sync::Mutex;
@@ -13,7 +14,7 @@ use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_shell::{process::CommandEvent, ShellExt};
 
 const SIDECAR_NAME: &str = "llama-server";
-const MODEL_RESOURCE_PATH: &str = "resources/models/Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf";
+const MODEL_RESOURCE_PATH: &str = "resources/models/default.gguf";
 const HOST: &str = "127.0.0.1";
 const CTX_SIZE: &str = "32768";
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -35,6 +36,8 @@ pub struct AiConnectionDetails {
     pub port: u16,
     pub api_key: String,
     pub state: AiState,
+    pub is_cpu_bound: bool,
+    pub offload_info: Option<String>,
 }
 
 struct EngineStateInner {
@@ -42,6 +45,12 @@ struct EngineStateInner {
     api_key: Option<String>,
     state: AiState,
     child: Option<tauri_plugin_shell::process::CommandChild>,
+    is_cpu_bound: bool,
+    offload_info: Option<String>,
+    current_tps: f64,
+    average_tps: f64,
+    total_tokens: u64,
+    recent_tps: Vec<f64>,
 }
 
 /// Thread-safe wrapper for the engine's lifecycle state.
@@ -58,6 +67,12 @@ impl EngineState {
                 api_key: None,
                 state: AiState::Starting,
                 child: None,
+                is_cpu_bound: false,
+                offload_info: None,
+                current_tps: 0.0,
+                average_tps: 0.0,
+                total_tokens: 0,
+                recent_tps: Vec::new(),
             }),
         }
     }
@@ -72,6 +87,16 @@ impl EngineState {
         guard.state == AiState::Ready
     }
 
+    /// True if the engine is running in CPU-bound mode.
+    #[allow(dead_code)]
+    pub fn is_cpu_bound(&self) -> bool {
+        let guard = match self.inner.lock() {
+            Ok(g) => g,
+            Err(_) => return false,
+        };
+        guard.is_cpu_bound
+    }
+
     /// Retrieves active connection details if successfully bound.
     pub fn connection_details(&self) -> Option<AiConnectionDetails> {
         let guard = self.inner.lock().ok()?;
@@ -80,9 +105,103 @@ impl EngineState {
                 port,
                 api_key: api_key.clone(),
                 state: guard.state,
+                is_cpu_bound: guard.is_cpu_bound,
+                offload_info: guard.offload_info.clone(),
             })
         } else {
             None
+        }
+    }
+
+    pub fn performance_metrics(&self) -> PerformanceMetrics {
+        if let Ok(guard) = self.inner.lock() {
+            PerformanceMetrics {
+                current_tps: guard.current_tps,
+                average_tps: guard.average_tps,
+                total_tokens: guard.total_tokens,
+                is_cpu_bound: guard.is_cpu_bound,
+                offload_info: guard.offload_info.clone(),
+            }
+        } else {
+            PerformanceMetrics {
+                current_tps: 0.0,
+                average_tps: 0.0,
+                total_tokens: 0,
+                is_cpu_bound: false,
+                offload_info: None,
+            }
+        }
+    }
+
+    pub fn set_offload_status(&self, is_cpu: bool, offload_info: Option<String>) {
+        if let Ok(mut guard) = self.inner.lock() {
+            guard.is_cpu_bound = is_cpu;
+            if offload_info.is_some() {
+                guard.offload_info = offload_info;
+            }
+        }
+    }
+
+    pub fn record_inference(
+        &self,
+        tokens: u64,
+        wall_ms: u64,
+        call_tps: Option<f64>,
+    ) -> PerformanceMetrics {
+        if let Ok(mut guard) = self.inner.lock() {
+            let tps = if let Some(rate) = call_tps {
+                if rate > 0.0 {
+                    rate
+                } else if wall_ms > 0 && tokens > 0 {
+                    (tokens as f64) / (wall_ms as f64 / 1000.0)
+                } else {
+                    0.0
+                }
+            } else if wall_ms > 0 && tokens > 0 {
+                (tokens as f64) / (wall_ms as f64 / 1000.0)
+            } else {
+                0.0
+            };
+
+            guard.current_tps = tps;
+            guard.total_tokens += tokens;
+
+            if tps > 0.0 {
+                guard.recent_tps.push(tps);
+                if guard.recent_tps.len() > 15 {
+                    guard.recent_tps.remove(0);
+                }
+                guard.average_tps =
+                    guard.recent_tps.iter().sum::<f64>() / guard.recent_tps.len() as f64;
+
+                // Thresholds for warning about CPU-bound operations:
+                // If producing meaningful tokens at less than 9 t/s on desktop, flag as CPU-bound
+                if tokens >= 12 && tps < 9.0 {
+                    guard.is_cpu_bound = true;
+                    if guard.offload_info.is_none() {
+                        guard.offload_info = Some("Low throughput (< 9 t/s, likely CPU-bound)".to_string());
+                    }
+                } else if tps >= 15.0 {
+                    // Clearly running on GPU
+                    guard.is_cpu_bound = false;
+                }
+            }
+
+            PerformanceMetrics {
+                current_tps: guard.current_tps,
+                average_tps: guard.average_tps,
+                total_tokens: guard.total_tokens,
+                is_cpu_bound: guard.is_cpu_bound,
+                offload_info: guard.offload_info.clone(),
+            }
+        } else {
+            PerformanceMetrics {
+                current_tps: 0.0,
+                average_tps: 0.0,
+                total_tokens: 0,
+                is_cpu_bound: false,
+                offload_info: None,
+            }
         }
     }
 
@@ -158,13 +277,20 @@ async fn initialize_inner(app: &AppHandle) -> Result<()> {
         return Err(anyhow!("Model file missing at {:?}", model_path));
     }
 
+    // Set environment hints for llama.cpp / ggml
+    std::env::set_var("GGML_BACKEND_PATH", "/opt/homebrew/opt/ggml/libexec");
+    std::env::set_var("LLAMA_ARG_DEVICE", "MTL0");
+    std::env::set_var("LLAMA_ARG_N_GPU_LAYERS", "99");
+
     // 5. Spawn the sidecar
     let (mut rx, child) = app
         .shell()
         .sidecar(SIDECAR_NAME)
         .context("Failed to locate sidecar binary")?
+        .env("GGML_BACKEND_PATH", "/opt/homebrew/opt/ggml/libexec")
+        .env("LLAMA_ARG_DEVICE", "MTL0")
+        .env("LLAMA_ARG_N_GPU_LAYERS", "99")
         .args([
-            "serve",
             "--host",
             HOST,
             "--port",
@@ -176,11 +302,49 @@ async fn initialize_inner(app: &AppHandle) -> Result<()> {
             &model_path.to_string_lossy(),
             "--ctx-size",
             CTX_SIZE,
+            "--device",
+            "MTL0",
+            "--n-gpu-layers",
+            "99",
+            "--flash-attn",
+            "on",
         ])
         .spawn()
         .context("Failed to spawn llama-server sidecar")?;
 
     engine_state.update_details(port, api_key.clone(), child);
+
+fn inspect_engine_line(line: &str, state: &EngineState, app: &AppHandle) {
+    let lower = line.to_lowercase();
+    if lower.contains("offloaded") && lower.contains("layers") {
+        if let Some(pos) = lower.find("offloaded") {
+            let slice = &lower[pos..];
+            let words: Vec<&str> = slice.split_whitespace().collect();
+            if let Some(ratio) = words.get(1) {
+                if let Some((off, tot)) = ratio.split_once('/') {
+                    if let (Ok(o), Ok(t)) = (off.parse::<u32>(), tot.parse::<u32>()) {
+                        let is_cpu = o == 0 || (t > 0 && o < t / 2);
+                        let info = if lower.contains("metal") || lower.contains("gpu") {
+                            format!("Metal GPU ({}/{} layers)", o, t)
+                        } else if is_cpu {
+                            format!("CPU-bound ({}/{} GPU layers)", o, t)
+                        } else {
+                            format!("GPU ({}/{} layers)", o, t)
+                        };
+                        state.set_offload_status(is_cpu, Some(info));
+                        let _ = app.emit("ai-performance", state.performance_metrics());
+                    }
+                }
+            }
+        }
+    } else if lower.contains("loaded cpu backend") || lower.contains("backend cpu") {
+        state.set_offload_status(true, Some("CPU backend active (Metal inactive)".to_string()));
+        let _ = app.emit("ai-performance", state.performance_metrics());
+    } else if lower.contains("loaded metal backend") || lower.contains("ggml_metal_init") || lower.contains("mtl0") {
+        state.set_offload_status(false, Some("Metal GPU active".to_string()));
+        let _ = app.emit("ai-performance", state.performance_metrics());
+    }
+}
 
     // 6. Drain CommandEvent receiver
     let app_handle_for_task = app.clone();
@@ -188,10 +352,24 @@ async fn initialize_inner(app: &AppHandle) -> Result<()> {
         while let Some(event) = rx.recv().await {
             match event {
                 CommandEvent::Stdout(line) => {
-                    log::info!(target: "llama", "{}", String::from_utf8_lossy(&line));
+                    let text = String::from_utf8_lossy(&line);
+                    log::info!(target: "llama", "{}", text);
+                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/loco-llama.log") {
+                        use std::io::Write;
+                        let _ = writeln!(f, "{}", text);
+                    }
+                    let state = app_handle_for_task.state::<EngineState>();
+                    inspect_engine_line(&text, &state, &app_handle_for_task);
                 }
                 CommandEvent::Stderr(line) => {
-                    log::info!(target: "llama", "{}", String::from_utf8_lossy(&line));
+                    let text = String::from_utf8_lossy(&line);
+                    log::info!(target: "llama", "{}", text);
+                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/loco-llama.log") {
+                        use std::io::Write;
+                        let _ = writeln!(f, "{}", text);
+                    }
+                    let state = app_handle_for_task.state::<EngineState>();
+                    inspect_engine_line(&text, &state, &app_handle_for_task);
                 }
                 CommandEvent::Error(err) => {
                     log::error!("llama-server error: {}", err);

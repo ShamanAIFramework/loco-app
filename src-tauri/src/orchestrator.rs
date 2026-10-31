@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use tauri::ipc::Channel;
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
@@ -33,17 +33,40 @@ pub async fn prompt_agent_v2(
     question: String,
     on_chunk: Channel<AgentEvent>,
 ) -> Result<(), AppError> {
+    let res = prompt_agent_v2_inner(&app, &session_id, &question, &on_chunk).await;
+    if res.is_err() {
+        let app_c = app.clone();
+        let sid_c = session_id.clone();
+        let _ = tauri::async_runtime::spawn_blocking(move || {
+            let state = app_c.state::<AppState>();
+            let _ = state.conversations.trim_trailing_incomplete_messages(&sid_c);
+        })
+        .await;
+    }
+    res
+}
+
+async fn prompt_agent_v2_inner(
+    app: &tauri::AppHandle,
+    session_id: &str,
+    question: &str,
+    on_chunk: &Channel<AgentEvent>,
+) -> Result<(), AppError> {
     let engine_state = app.state::<EngineState>();
     let conn = engine_state
         .connection_details()
         .ok_or_else(|| anyhow!("Engine sidecar is not ready"))?;
 
     let app_clone = app.clone();
-    let session_id_clone = session_id.clone();
-    let question_clone = question.clone();
+    let session_id_clone = session_id.to_string();
+    let question_clone = question.to_string();
 
     let (conversation, messages) = tauri::async_runtime::spawn_blocking(move || -> Result<_> {
         let state = app_clone.state::<AppState>();
+        // Defensively trim any dangling incomplete messages before adding the new turn
+        let _ = state
+            .conversations
+            .trim_trailing_incomplete_messages(&session_id_clone);
         state
             .conversations
             .add_message(&session_id_clone, Role::User, &question_clone)?;
@@ -60,7 +83,7 @@ pub async fn prompt_agent_v2(
     let workspace_str = workspace_root.to_string_lossy().to_string();
 
     // Ensure the workspace is properly indexed before processing any prompts in this workspace
-    crate::ensure_workspace_indexed(&app, &workspace_root, Some(&on_chunk))
+    crate::ensure_workspace_indexed(app, &workspace_root, Some(on_chunk))
         .await
         .context("Failed to ensure workspace indexing")?;
 
@@ -83,9 +106,9 @@ pub async fn prompt_agent_v2(
     let run_id = Uuid::new_v4().to_string();
     let task = TaskRequest {
         run_id: run_id.clone(),
-        session_id: session_id.clone(),
+        session_id: session_id.to_string(),
         workspace_path: Some(workspace_root.clone()),
-        question: question.clone(),
+        question: question.to_string(),
         conversation: messages
             .iter()
             .map(|msg| ConversationTurn {
@@ -102,10 +125,12 @@ pub async fn prompt_agent_v2(
         port: conn.port,
         api_key: conn.api_key,
         slot: app.state::<AppState>().llm_slot.clone(),
+        app: app.clone(),
+        channel: Some(on_chunk.clone()),
     };
     let metadata = llm.runtime_metadata().await;
     let trace_logger = Arc::new(
-        crate::trace_writer::TraceLogger::new(run_id.clone(), Some(question.clone()))
+        crate::trace_writer::TraceLogger::new(run_id.clone(), Some(question.to_string()))
             .context("Failed to initialize trace logger")?,
     );
     if let Some(model_id) = &metadata.model_id {
@@ -153,6 +178,9 @@ pub async fn prompt_agent_v2(
     write_trace(&run_id, &result.trace).await?;
 
     let final_response = result.answer.content.clone();
+    if final_response.trim().is_empty() {
+        return Err(anyhow!("Model produced an empty response").into());
+    }
     let sources = collect_answer_sources(&result.answer);
     let notebook_views = collect_notebook_views(&result.answer.notebook);
     let _ = on_chunk.send(AgentEvent::Chunk(final_response.clone()));
@@ -206,11 +234,13 @@ pub async fn prompt_agent_v2(
         }
     }
 
+    let app_clone = app.clone();
+    let session_id_str = session_id.to_string();
     tauri::async_runtime::spawn_blocking(move || -> Result<_> {
-        let state = app.state::<AppState>();
+        let state = app_clone.state::<AppState>();
         state
             .conversations
-            .add_message(&session_id, Role::Assistant, &final_response)?;
+            .add_message(&session_id_str, Role::Assistant, &final_response)?;
         Ok(())
     })
     .await
@@ -311,6 +341,8 @@ struct LlamaServerClient {
     port: u16,
     api_key: String,
     slot: Arc<Semaphore>,
+    app: tauri::AppHandle,
+    channel: Option<Channel<AgentEvent>>,
 }
 
 impl LlamaServerClient {
@@ -434,15 +466,32 @@ impl LlmClient for LlamaServerClient {
             .to_string();
         let usage = &value["usage"];
         let wall_ms = started.elapsed().as_millis() as u64;
+        let decode_tokens = usage["completion_tokens"].as_u64().unwrap_or(0);
+
+        let call_tps = value
+            .get("timings")
+            .and_then(|t| t.get("predicted_per_second"))
+            .and_then(|v| v.as_f64());
+
+        let engine_state = self.app.state::<crate::engine::EngineState>();
+        let perf = engine_state.record_inference(decode_tokens, wall_ms, call_tps);
+
+        let _ = self.app.emit("ai-performance", &perf);
+        if let Some(channel) = &self.channel {
+            let _ = channel.send(AgentEvent::Performance(perf.clone()));
+        }
 
         log::info!(
-            "[llama-server] [{:?}] Finished call_id={} in {}ms (queue_wait={}ms, prompt_tokens={:?}, decode_tokens={:?})",
+            "[llama-server] [{:?}] Finished call_id={} in {}ms (queue_wait={}ms, prompt_tokens={:?}, decode_tokens={}, tps={:.1}, avg_tps={:.1}, cpu_bound={})",
             request.phase,
             request.call_id,
             wall_ms,
             queue_wait_ms,
             usage["prompt_tokens"].as_u64(),
-            usage["completion_tokens"].as_u64()
+            decode_tokens,
+            perf.current_tps,
+            perf.average_tps,
+            perf.is_cpu_bound
         );
 
         Ok(LlmResponse {

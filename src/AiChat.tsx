@@ -1,8 +1,17 @@
-import { createSignal, createEffect, onCleanup, Show } from "solid-js";
+import { createSignal, createEffect, onMount, onCleanup, Show } from "solid-js";
 import { invoke, Channel } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import AIConversation, { Message, SourceRef } from "./AIConversation";
 import { SessionDetails } from "./App";
 import { NotebookEntryView } from "./types/notebook";
+
+export interface PerformanceMetrics {
+  current_tps: number;
+  average_tps: number;
+  total_tokens: number;
+  is_cpu_bound: boolean;
+  offload_info?: string | null;
+}
 
 interface AiChatProps {
   session: SessionDetails;
@@ -12,8 +21,8 @@ interface AiChatProps {
 
 // Define the structured event we expect from Rust
 interface AgentEvent {
-  type: "Status" | "Chunk" | "Sources" | "Notebook" | "Diff";
-  data: string | SourceRef[] | NotebookEntryView[];
+  type: "Status" | "Chunk" | "Sources" | "Notebook" | "Diff" | "Performance";
+  data: string | SourceRef[] | NotebookEntryView[] | PerformanceMetrics;
 }
 
 export default function AiChat(props: AiChatProps) {
@@ -33,6 +42,25 @@ export default function AiChat(props: AiChatProps) {
       ? props.session.auto_apply_edits
       : true,
   );
+  const [perfMetrics, setPerfMetrics] = createSignal<PerformanceMetrics | null>(null);
+  const [errorMessage, setErrorMessage] = createSignal<string | null>(null);
+
+  onMount(async () => {
+    try {
+      const initial = await invoke<PerformanceMetrics>("get_ai_performance");
+      if (initial) setPerfMetrics(initial);
+    } catch (e) {
+      console.warn("Could not fetch initial AI performance:", e);
+    }
+
+    const unlisten = await listen<PerformanceMetrics>("ai-performance", (event) => {
+      setPerfMetrics(event.payload);
+    });
+
+    onCleanup(() => {
+      unlisten();
+    });
+  });
 
   const toggleAutoApply = async () => {
     const nextVal = !autoApply();
@@ -64,15 +92,35 @@ export default function AiChat(props: AiChatProps) {
   createEffect(async () => {
     const sessionId = props.session.id;
     if (!sessionId) return;
+    setErrorMessage(null);
     try {
       const details = await invoke<any>("get_session_details", { sessionId });
       if (details && details.conversation && details.conversation.auto_apply_edits !== undefined) {
         setAutoApply(details.conversation.auto_apply_edits);
       }
       if (details && details.messages && details.messages.length > 0) {
+        // Find the index of the last assistant message with a valid (non-empty) response
+        let lastValidAssistantIndex = -1;
+        for (let i = 0; i < details.messages.length; i++) {
+          const m = details.messages[i];
+          if (
+            m.role &&
+            m.role.toLowerCase() === "assistant" &&
+            typeof m.content === "string" &&
+            m.content.trim().length > 0
+          ) {
+            lastValidAssistantIndex = i;
+          }
+        }
+
+        const validMessages =
+          lastValidAssistantIndex >= 0
+            ? details.messages.slice(0, lastValidAssistantIndex + 1)
+            : [];
+
         setMessages([
           { role: "system", content: "You are a helpful coding assistant." },
-          ...details.messages.map((m: any) => ({
+          ...validMessages.map((m: any) => ({
             role: m.role.toLowerCase() as "user" | "assistant" | "system",
             content: m.content,
           })),
@@ -123,6 +171,7 @@ export default function AiChat(props: AiChatProps) {
     e?.preventDefault();
     const currentInput = input().trim();
     if (!currentInput || isGenerating()) return;
+    setErrorMessage(null);
 
     // 1. Instantly append user message to UI
     setMessages((prev) => [...prev, { role: "user", content: currentInput }]);
@@ -183,6 +232,8 @@ export default function AiChat(props: AiChatProps) {
           });
         } else if (event.type === "Notebook") {
           props.onNotebookUpdate?.(event.data as NotebookEntryView[]);
+        } else if (event.type === "Performance") {
+          setPerfMetrics(event.data as PerformanceMetrics);
         }
       };
 
@@ -194,13 +245,24 @@ export default function AiChat(props: AiChatProps) {
       });
     } catch (error) {
       console.error("Inference Error:", error);
-      setMessages((prev) => [
-        ...prev,
-        {
-          role: "assistant",
-          content: "**Error:** Failed to execute request via local engine.",
-        },
-      ]);
+      setInput(currentInput);
+      setErrorMessage("Failed to execute request via local engine. The incomplete input was pruned.");
+      setMessages((prev) => {
+        let lastValidAssistantIndex = -1;
+        for (let i = 0; i < prev.length; i++) {
+          if (
+            prev[i].role === "assistant" &&
+            typeof prev[i].content === "string" &&
+            prev[i].content.trim().length > 0
+          ) {
+            lastValidAssistantIndex = i;
+          }
+        }
+        if (lastValidAssistantIndex >= 0) {
+          return prev.slice(0, lastValidAssistantIndex + 1);
+        }
+        return [{ role: "system", content: "You are a helpful coding assistant." }];
+      });
     } finally {
       setIsGenerating(false);
       updateStatus(null);
@@ -213,12 +275,81 @@ export default function AiChat(props: AiChatProps) {
         <h2 class="text-sm font-semibold text-gray-200">
           {props.session.title}
         </h2>
+        <div class="flex items-center gap-2">
+          <Show when={perfMetrics() && perfMetrics()!.average_tps > 0}>
+            <div
+              class="flex items-center gap-1.5 px-2.5 py-0.5 rounded-full border text-[11px] font-mono transition-colors"
+              classList={{
+                "border-amber-700/80 bg-amber-950/60 text-amber-300": perfMetrics()!.is_cpu_bound,
+                "border-gray-800 bg-gray-900/80 text-gray-400": !perfMetrics()!.is_cpu_bound,
+              }}
+              title={
+                perfMetrics()!.is_cpu_bound
+                  ? `Inference is CPU-bound! Speed: ${perfMetrics()!.average_tps.toFixed(1)} t/s (${perfMetrics()!.offload_info || "CPU"})`
+                  : `Average generation speed: ${perfMetrics()!.average_tps.toFixed(1)} t/s (Current: ${perfMetrics()!.current_tps.toFixed(1)} t/s) • ${perfMetrics()!.offload_info || "Metal GPU"}`
+              }
+            >
+              <span
+                class="w-1.5 h-1.5 rounded-full"
+                classList={{
+                  "bg-amber-400 animate-pulse": perfMetrics()!.is_cpu_bound,
+                  "bg-emerald-400": !perfMetrics()!.is_cpu_bound,
+                }}
+              ></span>
+              <span>{perfMetrics()!.average_tps.toFixed(1)} t/s</span>
+              <Show when={perfMetrics()!.is_cpu_bound}>
+                <span class="text-[9px] font-sans font-bold text-amber-400 uppercase tracking-wider ml-0.5">CPU</span>
+              </Show>
+            </div>
+          </Show>
+        </div>
       </div>
 
       <div
         ref={chatContainerRef}
         class="flex-1 overflow-y-auto py-4 space-y-6 scroll-smooth"
       >
+        {/* Prominent warning banner when operations are CPU-bound */}
+        <Show when={perfMetrics()?.is_cpu_bound}>
+          <div class="mx-4 my-2 p-3 rounded-xl border border-amber-600/40 bg-amber-950/40 text-amber-200 shadow-sm flex items-start justify-between gap-3 text-xs animate-pulse">
+            <div class="flex items-start gap-2.5">
+              <span class="text-base leading-none mt-0.5">⚠️</span>
+              <div>
+                <div class="font-semibold text-amber-100 flex items-center gap-1.5">
+                  <span>CPU-Bound Inference Detected</span>
+                  <span class="font-mono text-[11px] px-1.5 py-0.2 rounded bg-amber-900/60 text-amber-300 border border-amber-700/50">
+                    {perfMetrics()?.average_tps ? `${perfMetrics()!.average_tps.toFixed(1)} t/s` : "Low throughput"}
+                  </span>
+                </div>
+                <p class="text-amber-300/90 mt-1 leading-relaxed">
+                  The local engine appears to be executing on CPU cores rather than Metal GPU acceleration. Inference will be noticeably slower (~4–8x slower).
+                </p>
+                <Show when={perfMetrics()?.offload_info}>
+                  <div class="mt-1 text-[11px] font-mono text-amber-400/90">
+                    Engine Status: {perfMetrics()?.offload_info}
+                  </div>
+                </Show>
+              </div>
+            </div>
+          </div>
+        </Show>
+
+        <Show when={errorMessage()}>
+          <div class="mx-4 my-2 p-3 rounded-xl border border-red-800/60 bg-red-950/40 text-red-200 text-xs flex items-center justify-between gap-2 shadow-sm">
+            <div class="flex items-center gap-2">
+              <span class="text-base leading-none">⚠️</span>
+              <span>{errorMessage()}</span>
+            </div>
+            <button
+              type="button"
+              onClick={() => setErrorMessage(null)}
+              class="text-red-400 hover:text-red-200 text-xs font-semibold px-2 py-0.5 rounded border border-red-800/40 hover:bg-red-900/30 transition-colors"
+            >
+              Dismiss
+            </button>
+          </div>
+        </Show>
+
         <AIConversation messages={messages()} />
 
         {/* Dynamic Status Pill for Tool Execution */}
@@ -231,9 +362,24 @@ export default function AiChat(props: AiChatProps) {
                   <span class="min-w-0 whitespace-normal break-words text-gray-300">
                     {activeStatus()}
                   </span>
-                  <span class="ml-auto shrink-0 tabular-nums text-gray-500">
-                    {formatElapsed(statusElapsedMs())}
-                  </span>
+                  <div class="ml-auto shrink-0 flex items-center gap-1.5 text-gray-500">
+                    <Show when={perfMetrics() && perfMetrics()!.current_tps > 0}>
+                      <span
+                        class="font-mono text-[10px]"
+                        classList={{
+                          "text-amber-400 font-semibold": perfMetrics()!.is_cpu_bound,
+                          "text-gray-400": !perfMetrics()!.is_cpu_bound,
+                        }}
+                        title="Instantaneous token generation speed"
+                      >
+                        {perfMetrics()!.current_tps.toFixed(1)} t/s
+                      </span>
+                      <span class="text-gray-600">•</span>
+                    </Show>
+                    <span class="tabular-nums">
+                      {formatElapsed(statusElapsedMs())}
+                    </span>
+                  </div>
                 </div>
               </div>
             </div>

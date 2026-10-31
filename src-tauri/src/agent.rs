@@ -29,6 +29,15 @@ pub struct NotebookEntryView {
     pub depends_on: Vec<String>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PerformanceMetrics {
+    pub current_tps: f64,
+    pub average_tps: f64,
+    pub total_tokens: u64,
+    pub is_cpu_bound: bool,
+    pub offload_info: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "type", content = "data")]
 pub enum AgentEvent {
@@ -37,4 +46,5 @@ pub enum AgentEvent {
     Sources(Vec<SourceRef>),
     Notebook(Vec<NotebookEntryView>),
     Diff(String),
+    Performance(PerformanceMetrics),
 }

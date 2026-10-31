@@ -1,7 +1,7 @@
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { createSignal, onMount, Show, For } from "solid-js";
-import AiChat from "./AiChat";
+import AiChat, { PerformanceMetrics } from "./AiChat";
 import GitPanel from "./GitPanel";
 import NotebookPanel from "./NotebookPanel";
 import { NotebookEntryView } from "./types/notebook";
@@ -12,6 +12,8 @@ interface AiConnectionDetails {
   state: string;
   port: number;
   api_key: string;
+  is_cpu_bound?: boolean;
+  offload_info?: string;
 }
 
 export interface SessionDetails {
@@ -52,6 +54,7 @@ export default function App() {
   const [isCreatingSession, setIsCreatingSession] = createSignal(false);
   const [sessionError, setSessionError] = createSignal<string | null>(null);
   const [notebookEntries, setNotebookEntries] = createSignal<NotebookEntryView[]>([]);
+  const [perfMetrics, setPerfMetrics] = createSignal<PerformanceMetrics | null>(null);
 
   // Accordion section collapse/expand states
   const [isWorkspaceOpen, setIsWorkspaceOpen] = createSignal(true);
@@ -183,6 +186,15 @@ export default function App() {
       }
     });
 
+    await listen<PerformanceMetrics>("ai-performance", (event) => {
+      setPerfMetrics(event.payload);
+    });
+
+    try {
+      const initialPerf = await invoke<PerformanceMetrics>("get_ai_performance");
+      if (initialPerf) setPerfMetrics(initialPerf);
+    } catch {}
+
     await fetchConnectionDetails();
   });
 
@@ -306,9 +318,34 @@ export default function App() {
                   <h3 class="text-[10px] font-semibold text-gray-500 uppercase tracking-wider mb-1">
                     Engine & Model
                   </h3>
-                  <div class="bg-gray-950/60 p-2 rounded border border-gray-800 flex items-center justify-between text-[11px]">
-                    <span class="text-gray-400">Model</span>
-                    <span class="font-mono text-gray-200">{activeSession()?.model_name || "Qwen2.5-Coder"}</span>
+                  <div class="bg-gray-950/60 p-2 rounded border border-gray-800 flex flex-col gap-1.5 text-[11px]">
+                    <div class="flex items-center justify-between">
+                      <span class="text-gray-400">Model</span>
+                      <span class="font-mono text-gray-200">{activeSession()?.model_name || "default.gguf"}</span>
+                    </div>
+                    <div class="flex items-center justify-between">
+                      <span class="text-gray-400">Acceleration</span>
+                      <span
+                        class="font-mono flex items-center gap-1.5 text-[10px]"
+                        classList={{
+                          "text-amber-400 font-semibold": perfMetrics()?.is_cpu_bound,
+                          "text-emerald-400": !perfMetrics()?.is_cpu_bound,
+                        }}
+                      >
+                        <span class={`w-1.5 h-1.5 rounded-full ${perfMetrics()?.is_cpu_bound ? "bg-amber-400 animate-pulse" : "bg-emerald-400"}`}></span>
+                        {perfMetrics()?.is_cpu_bound
+                          ? "CPU (Slow ⚠️)"
+                          : (perfMetrics()?.offload_info || "Metal GPU")}
+                      </span>
+                    </div>
+                    <Show when={perfMetrics() && perfMetrics()!.average_tps > 0}>
+                      <div class="flex items-center justify-between border-t border-gray-900 pt-1">
+                        <span class="text-gray-400">Avg Speed</span>
+                        <span class="font-mono text-gray-200">
+                          {perfMetrics()!.average_tps.toFixed(1)} t/s
+                        </span>
+                      </div>
+                    </Show>
                   </div>
                 </div>
               </div>
