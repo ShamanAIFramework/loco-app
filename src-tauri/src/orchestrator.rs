@@ -201,10 +201,10 @@ async fn prompt_agent_v2_inner(
                     artifact.original_end_line,
                     &artifact.replacement_code,
                 ) {
-                    Ok(()) => {
-                        log::info!("Auto-applied edit to disk: {}", artifact.target_path);
+                    Ok(_) => {
+                        log::info!("Auto-applied and verified edit to disk: {}", artifact.target_path);
                         let _ = on_chunk.send(AgentEvent::Status(format!(
-                            "Applied changes to {}",
+                            "Applied and verified changes to {}",
                             artifact.target_path
                         )));
 
@@ -249,13 +249,65 @@ async fn prompt_agent_v2_inner(
     Ok(())
 }
 
+pub fn run_workspace_validation(workspace_root: &Path) -> Result<(String, String)> {
+    let pkg_json = workspace_root.join("package.json");
+    let cargo_toml = workspace_root.join("Cargo.toml");
+
+    let (program, args) = if pkg_json.exists() {
+        let has_bun = Command::new("bun")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+
+        if has_bun {
+            ("bun", vec!["run", "build"])
+        } else {
+            ("npm", vec!["run", "build"])
+        }
+    } else if cargo_toml.exists() {
+        ("cargo", vec!["check"])
+    } else {
+        return Ok((
+            "none".to_string(),
+            "No supported workspace build configuration found; skipped".to_string(),
+        ));
+    };
+
+    let cmd_str = format!("{} {}", program, args.join(" "));
+    let output = Command::new(program)
+        .current_dir(workspace_root)
+        .args(&args)
+        .output()
+        .with_context(|| format!("Failed to execute validation command `{}`", cmd_str))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let combined = if stderr.trim().is_empty() {
+        stdout
+    } else {
+        format!("{}\n{}", stdout, stderr)
+    };
+
+    if !output.status.success() {
+        return Err(anyhow!(
+            "Validation command `{}` failed (exit code {:?}):\n{}",
+            cmd_str,
+            output.status.code(),
+            combined.trim()
+        ));
+    }
+
+    Ok((cmd_str, combined))
+}
+
 pub fn apply_patch_to_disk(
     workspace_root: &Path,
     target_rel_path: &str,
     start_line: usize,
     end_line: usize,
     replacement_code: &str,
-) -> Result<()> {
+) -> Result<String> {
     let rel = sanitize_relative_path(target_rel_path)?;
     let full_path = workspace_root.join(&rel);
     let canonical = full_path
@@ -267,10 +319,42 @@ pub fn apply_patch_to_disk(
     if !canonical.starts_with(&root_canonical) {
         return Err(anyhow!("Refusing to write outside workspace root"));
     }
-    let content = std::fs::read_to_string(&canonical)?;
-    let patched = agent_core::patch::apply_in_memory_patch(&content, start_line, end_line, replacement_code)?;
-    std::fs::write(&canonical, patched)?;
-    Ok(())
+    let original_content = std::fs::read_to_string(&canonical)?;
+
+    // 1. Align replacement boundaries if model targeted an inner block/element
+    let (aligned_start, aligned_end) = agent_core::patch::align_replacement_range(
+        &original_content,
+        start_line,
+        end_line,
+        replacement_code,
+    );
+
+    // 2. Formulate in-memory patch
+    let patched = agent_core::patch::apply_in_memory_patch(
+        &original_content,
+        aligned_start,
+        aligned_end,
+        replacement_code,
+    )?;
+
+    // 3. Tree-sitter AST Syntax Validation
+    crate::indexer::validate_syntax_with_tree_sitter(target_rel_path, &patched)
+        .with_context(|| format!("Patch rejected: Tree-sitter AST syntax error in {}", target_rel_path))?;
+
+    // 4. Staging write to disk
+    std::fs::write(&canonical, &patched)?;
+
+    // 5. Post-Edit Testing & Validation Cycle
+    if let Err(val_err) = run_workspace_validation(workspace_root) {
+        // Automatic Rollback!
+        let _ = std::fs::write(&canonical, &original_content);
+        return Err(anyhow!(
+            "Post-edit validation failed! Changes have been rolled back.\n{}",
+            val_err
+        ));
+    }
+
+    Ok(patched)
 }
 
 #[tauri::command]
@@ -1290,6 +1374,22 @@ impl FileReader for WorkspaceFileReader {
         })
         .await
         .context("Failed to join lease verification task")?
+    }
+
+    async fn validate_syntax(&self, path: &str, content: &str) -> Result<bool> {
+        let p = path.to_string();
+        let c = content.to_string();
+        tauri::async_runtime::spawn_blocking(move || {
+            match crate::indexer::validate_syntax_with_tree_sitter(&p, &c) {
+                Ok(()) => Ok(true),
+                Err(err) => {
+                    log::warn!("Tree-sitter AST syntax validation failed for {}: {}", p, err);
+                    Ok(false)
+                }
+            }
+        })
+        .await
+        .context("Failed to join syntax validation task")?
     }
 }
 

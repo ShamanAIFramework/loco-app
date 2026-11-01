@@ -20,6 +20,91 @@ pub fn extract_line_range(content: &str, start_line: usize, end_line: usize) -> 
     Ok(slice.join("\n"))
 }
 
+/// Intelligently aligns the target line range when `replacement` corresponds to an inner
+/// element or statement within a broader focal window.
+///
+/// For instance, if the leased target range covers lines 398-447 (which includes container divs
+/// and surrounding forms), but the model generated replacement code for just the inner `<button>...</button>`,
+/// this locates the exact `<button ... </button>` sub-range inside lines 398-447 to prevent
+/// accidentally destroying outer container tags.
+pub fn align_replacement_range(
+    content: &str,
+    start_line: usize,
+    end_line: usize,
+    replacement: &str,
+) -> (usize, usize) {
+    let rep_trimmed = replacement.trim();
+    if rep_trimmed.is_empty() {
+        return (start_line, end_line);
+    }
+
+    let file_lines: Vec<&str> = content.lines().collect();
+    if start_line == 0 || start_line > file_lines.len() {
+        return (start_line, end_line);
+    }
+    let actual_end = end_line.min(file_lines.len());
+    if actual_end < start_line {
+        return (start_line, end_line);
+    }
+
+    let target_lines = &file_lines[(start_line - 1)..actual_end];
+    let rep_lines: Vec<&str> = rep_trimmed
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .collect();
+
+    if rep_lines.is_empty() || rep_lines.len() >= target_lines.len() {
+        return (start_line, end_line);
+    }
+
+    let first_rep = rep_lines[0];
+    let last_rep = rep_lines[rep_lines.len() - 1];
+
+    let open_prefix = if first_rep.starts_with('<') {
+        first_rep.split_whitespace().next().unwrap_or(first_rep)
+    } else {
+        first_rep
+    };
+
+    let mut matches = Vec::new();
+    for (i, line) in target_lines.iter().enumerate() {
+        let trimmed = line.trim();
+        let is_start_match = if open_prefix.starts_with('<') {
+            trimmed.starts_with(open_prefix)
+        } else {
+            trimmed.starts_with(first_rep) || trimmed.contains(first_rep)
+        };
+
+        if is_start_match {
+            for j in i..target_lines.len() {
+                let end_trimmed = target_lines[j].trim();
+                let is_end_match = if last_rep.starts_with("</") {
+                    end_trimmed == last_rep || end_trimmed.ends_with(last_rep)
+                } else if last_rep == "}" || last_rep == "};" {
+                    end_trimmed == last_rep
+                } else {
+                    end_trimmed == last_rep || end_trimmed.ends_with(last_rep)
+                };
+
+                if is_end_match {
+                    matches.push((start_line + i, start_line + j));
+                    break;
+                }
+            }
+        }
+    }
+
+    if matches.len() == 1 {
+        let (aligned_start, aligned_end) = matches[0];
+        if aligned_start > start_line || aligned_end < end_line {
+            return (aligned_start, aligned_end);
+        }
+    }
+
+    (start_line, end_line)
+}
+
 /// Replace 1-based line range `start_line..=end_line` (inclusive) with `replacement`.
 ///
 /// Preserves the original file's newline convention (LF or CRLF) and trailing newline.
@@ -328,5 +413,39 @@ mod tests {
         let code = "const a = 1;\nconst b = 2;\n";
         let diff = generate_unified_diff("src/test.ts", 1, code, code);
         assert_eq!(diff, "");
+    }
+
+    #[test]
+    fn test_align_replacement_range_narrows_to_inner_element() {
+        let content = [
+            "<div>",
+            "  <div class=\"outer\">",
+            "    <button onClick={toggle}>",
+            "      <span>Old Label</span>",
+            "    </button>",
+            "  </div>",
+            "  <form onSubmit={submit}>",
+            "    <textarea />",
+            "  </form>",
+            "</div>",
+        ]
+        .join("\n");
+
+        let replacement = [
+            "    <button onClick={toggle}>",
+            "      <span>New Label</span>",
+            "    </button>",
+        ]
+        .join("\n");
+
+        // Target range initially covers lines 1 to 10
+        let (aligned_start, aligned_end) = align_replacement_range(&content, 1, 10, &replacement);
+        assert_eq!(aligned_start, 3);
+        assert_eq!(aligned_end, 5);
+
+        let patched = apply_in_memory_patch(&content, aligned_start, aligned_end, &replacement).unwrap();
+        assert!(patched.contains("<div>\n  <div class=\"outer\">"));
+        assert!(patched.contains("<form onSubmit={submit}>"));
+        assert!(patched.contains("<span>New Label</span>"));
     }
 }

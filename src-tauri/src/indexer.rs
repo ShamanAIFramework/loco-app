@@ -4,7 +4,7 @@
 
 use crate::codegraph::{CodeGraphStore, Symbol};
 use crate::AppState;
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use notify_debouncer_mini::notify::RecommendedWatcher;
 use notify_debouncer_mini::{new_debouncer, notify::RecursiveMode, Debouncer};
 use sha2::{Digest, Sha256};
@@ -427,6 +427,68 @@ fn extract_symbols_with_tree_sitter(path: &str, content: &str) -> Vec<ParsedSymb
     symbols
 }
 
+/// Validates file syntax using Tree-sitter parsers.
+///
+/// Returns `Ok(())` if the syntax is valid or if the language is unsupported.
+/// Returns `Err` if Tree-sitter detects an AST syntax error (e.g. unclosed tag, mismatched braces).
+pub fn validate_syntax_with_tree_sitter(path: &str, content: &str) -> Result<()> {
+    let mut parser = Parser::new();
+    let extension = Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or_default();
+    let language = match extension {
+        "rs" => tree_sitter_rust::LANGUAGE.into(),
+        "ts" | "js" | "jsx" => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        "tsx" => tree_sitter_typescript::LANGUAGE_TSX.into(),
+        _ => return Ok(()),
+    };
+    if parser.set_language(&language).is_err() {
+        return Ok(());
+    }
+    let Some(tree) = parser.parse(content, None) else {
+        return Err(anyhow!("Failed to parse syntax tree for {}", path));
+    };
+
+    check_node_for_syntax_and_jsx_errors(tree.root_node(), content)
+}
+
+fn check_node_for_syntax_and_jsx_errors(node: Node<'_>, content: &str) -> Result<()> {
+    if node.is_error() || node.is_missing() {
+        return Err(anyhow!(
+            "Tree-sitter syntax error at line {}:{}",
+            node.start_position().row + 1,
+            node.start_position().column + 1
+        ));
+    }
+
+    if node.kind() == "jsx_element" {
+        let open_tag = node.child_by_field_name("open_tag");
+        let close_tag = node.child_by_field_name("close_tag");
+        if let (Some(open), Some(close)) = (open_tag, close_tag) {
+            let open_name = open.child_by_field_name("name").map(|n| &content[n.byte_range()]);
+            let close_name = close.child_by_field_name("name").map(|n| &content[n.byte_range()]);
+            if let (Some(o), Some(c)) = (open_name, close_name) {
+                if o != c {
+                    return Err(anyhow!(
+                        "JSX tag mismatch at line {}: <{}> closed by </{}>",
+                        open.start_position().row + 1,
+                        o,
+                        c
+                    ));
+                }
+            }
+        }
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        check_node_for_syntax_and_jsx_errors(child, content)?;
+    }
+
+    Ok(())
+}
+
 fn collect_tree_sitter_symbols(
     node: Node<'_>,
     content: &str,
@@ -780,6 +842,29 @@ export default function GitPanel(props: { workspacePath: string }) {
         assert!(symbols
             .iter()
             .any(|symbol| symbol.name == "fetchStatus" && symbol.kind == "function"));
+    }
+
+    #[test]
+    fn tree_sitter_validates_ast_syntax_and_detects_errors() {
+        let valid_tsx = r#"
+export function Button() {
+    return <button>Click me</button>;
+}
+"#;
+        assert!(validate_syntax_with_tree_sitter("src/Button.tsx", valid_tsx).is_ok());
+
+        let invalid_tsx = r#"
+export function Button() {
+    return <button>Click me</div>;
+}
+"#;
+        assert!(validate_syntax_with_tree_sitter("src/Button.tsx", invalid_tsx).is_err());
+
+        let valid_rust = "fn main() { println!(\"ok\"); }";
+        assert!(validate_syntax_with_tree_sitter("src/main.rs", valid_rust).is_ok());
+
+        let invalid_rust = "fn main() { println!(\"unclosed\" ";
+        assert!(validate_syntax_with_tree_sitter("src/main.rs", invalid_rust).is_err());
     }
 
     #[test]

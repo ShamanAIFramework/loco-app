@@ -2,8 +2,8 @@ use std::collections::HashSet;
 use crate::knowledge::{detect_stack_tags, KnowledgeDomain, KnowledgeEngine};
 use crate::notebook::{EntryId, LeaseId, Notebook, Provenance};
 use crate::patch::{
-    apply_in_memory_patch, extract_exemplar_header, find_sibling_exemplars, generate_unified_diff,
-    verify_lease_freshness,
+    align_replacement_range, apply_in_memory_patch, extract_exemplar_header, extract_line_range,
+    find_sibling_exemplars, generate_unified_diff, verify_lease_freshness,
 };
 use crate::prompt::{
     evidence_block, extract_instruction, global_prefix, intake_critic_instruction,
@@ -1988,23 +1988,32 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
 
             // --- Host In-Memory Patch & Diff Generation ---
             let final_code = reconciler_output.hardened_code;
-            let diff_str = generate_unified_diff(&target_path, start_line, &original_lines, &final_code);
+            let full_file_content = runtime
+                .file_reader
+                .read_file(&target_path, 50_000)
+                .await
+                .map(|s| s.content)
+                .unwrap_or_else(|_| original_lines.clone());
+
+            let (aligned_start, aligned_end) = align_replacement_range(&full_file_content, start_line, end_line, &final_code);
+            let original_target_slice = extract_line_range(&full_file_content, aligned_start, aligned_end)
+                .unwrap_or_else(|_| original_lines.clone());
+
+            let diff_str = generate_unified_diff(&target_path, aligned_start, &original_target_slice, &final_code);
 
             // Only create an edit artifact if actual changes were produced
             if !diff_str.trim().is_empty() {
                 // Verify lease freshness and validate in-memory syntax
                 let mut syntax_clean = true;
-                if let Ok(file_slice) = runtime.file_reader.read_file(&target_path, 50_000).await {
-                    if let Some(ts) = target_slice {
-                        let _is_fresh = verify_lease_freshness(&file_slice.content, &ts.lease);
-                    }
-                    if let Ok(patched_content) = apply_in_memory_patch(&file_slice.content, start_line, end_line, &final_code) {
-                        syntax_clean = runtime.file_reader.validate_syntax(&target_path, &patched_content).await.unwrap_or(true);
-                    }
+                if let Some(ts) = target_slice {
+                    let _is_fresh = verify_lease_freshness(&full_file_content, &ts.lease);
+                }
+                if let Ok(patched_content) = apply_in_memory_patch(&full_file_content, aligned_start, aligned_end, &final_code) {
+                    syntax_clean = runtime.file_reader.validate_syntax(&target_path, &patched_content).await.unwrap_or(false);
                 }
 
                 let patch_decision_id = notebook.append_decision(
-                    format!("Draft Patch: {} (lines {}-{})", target_path, start_line, end_line),
+                    format!("Draft Patch: {} (lines {}-{})", target_path, aligned_start, aligned_end),
                     Provenance::Model { call_id: reconciler_call_id.clone() },
                     Phase::PatchReconciler,
                     vec![],
@@ -2017,8 +2026,8 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
                 edit_artifact = Some(EditArtifact {
                     patch_id: Uuid::new_v4().to_string(),
                     target_path: target_path.clone(),
-                    original_start_line: start_line,
-                    original_end_line: end_line,
+                    original_start_line: aligned_start,
+                    original_end_line: aligned_end,
                     replacement_code: final_code,
                     diff: diff_str,
                     critic_approved: (critic_output.approved || rebuttal_output.accepted_points.is_empty()) && syntax_clean,

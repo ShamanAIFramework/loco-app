@@ -426,12 +426,7 @@ export default function AiChat(props: AiChatProps) {
                 : "Review Mode: patches require manual approval before writing to disk"
             }
           >
-            <span
-              class={`w-1.5 h-1.5 rounded-full ${
-                autoApply() ? "bg-emerald-400 animate-pulse" : "bg-gray-500"
-              }`}
-            ></span>
-            <span>{autoApply() ? "⚡ Direct Edits" : "👁️ Review Edits"}</span>
+            <span>{autoApply() ? "mode: direct edits" : "mode: review edits"}</span>
           </button>
         </div>
 
