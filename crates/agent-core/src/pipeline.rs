@@ -269,34 +269,34 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
                 .await;
 
             // 1. Path search
-            let path_hits = runtime.code_search.search(q, 5).await.unwrap_or_default();
+            let path_hits = runtime.code_search.search(q, 10).await.unwrap_or_default();
             record_trace!(TraceEvent::ToolCall {
                 name: "search".to_string(),
-                args: json!({ "query": q, "limit": 5 }),
+                args: json!({ "query": q, "limit": 10 }),
                 result_count: path_hits.len(),
             });
 
             // 2. Symbol search (Tree-sitter)
-            let symbol_hits = runtime.code_search.search_symbols(q, 5).await.unwrap_or_default();
+            let symbol_hits = runtime.code_search.search_symbols(q, 10).await.unwrap_or_default();
             record_trace!(TraceEvent::ToolCall {
                 name: "search_symbols".to_string(),
-                args: json!({ "query": q, "limit": 5 }),
+                args: json!({ "query": q, "limit": 10 }),
                 result_count: symbol_hits.len(),
             });
 
             // 3. Vector search (Semantic embeddings)
-            let vector_hits = runtime.code_search.search_vector(q, 5).await.unwrap_or_default();
+            let vector_hits = runtime.code_search.search_vector(q, 10).await.unwrap_or_default();
             record_trace!(TraceEvent::ToolCall {
                 name: "search_vector".to_string(),
-                args: json!({ "query": q, "limit": 5 }),
+                args: json!({ "query": q, "limit": 10 }),
                 result_count: vector_hits.len(),
             });
 
             // 4. Content search (Regex / Ripgrep)
-            let content_hits = runtime.code_search.search_content(q, 5).await.unwrap_or_default();
+            let content_hits = runtime.code_search.search_content(q, 10).await.unwrap_or_default();
             record_trace!(TraceEvent::ToolCall {
                 name: "search_content".to_string(),
-                args: json!({ "query": q, "limit": 5 }),
+                args: json!({ "query": q, "limit": 10 }),
                 result_count: content_hits.len(),
             });
 
@@ -383,7 +383,7 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
                 }
                 continue;
             }
-            if ch.score < 40 {
+            if ch.score < 20 {
                 continue;
             }
             let start = ch.start_line.saturating_sub(4).max(1);
@@ -893,14 +893,6 @@ pub async fn run_agent(task: TaskRequest, runtime: AgentRuntime<'_>) -> Result<A
             }
         } else {
             final_targets = candidate_pool.clone();
-        }
-
-        // Safety fallback: if all targets were pruned, retain top candidate from vetted candidate_pool
-        // NEVER pull from raw unfiltered all_symbol_hits!
-        if final_targets.is_empty() {
-            if let Some(top_cand) = candidate_pool.into_iter().find(|c| candidate_exclusion_reason(&c.path, &task.question).is_none()) {
-                final_targets.push(top_cand);
-            }
         }
 
         let mut leased_header_paths: HashSet<String> = HashSet::new();

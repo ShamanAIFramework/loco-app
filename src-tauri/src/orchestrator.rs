@@ -2679,19 +2679,53 @@ fn collect_content_hits(
     let query_lower = query.to_lowercase();
     let query_normalized = normalize_identifier(query);
     let path_lower = path.to_lowercase();
+
+    // Extract multi-word sub-phrases from query (e.g., "direct edits", "edits button")
+    let raw_words: Vec<&str> = query
+        .split(|ch: char| !ch.is_alphanumeric())
+        .filter(|w| w.len() > 1)
+        .collect();
+    let mut sub_phrases = Vec::new();
+    if raw_words.len() >= 2 {
+        for window in raw_words.windows(2) {
+            let phrase = format!("{} {}", window[0].to_lowercase(), window[1].to_lowercase());
+            let norm = format!("{}{}", normalize_identifier(window[0]), normalize_identifier(window[1]));
+            sub_phrases.push((phrase, norm));
+        }
+    }
+    if raw_words.len() >= 3 {
+        for window in raw_words.windows(3) {
+            let phrase = format!("{} {} {}", window[0].to_lowercase(), window[1].to_lowercase(), window[2].to_lowercase());
+            let norm = format!("{}{}{}", normalize_identifier(window[0]), normalize_identifier(window[1]), normalize_identifier(window[2]));
+            sub_phrases.push((phrase, norm));
+        }
+    }
+
     for (idx, line) in lines.iter().enumerate() {
         let line_lower = line.to_lowercase();
         let line_normalized = normalize_identifier(line);
         let mut score = 0i64;
+
         if !query_lower.is_empty() && line_lower.contains(&query_lower) {
+            score += 100;
+        } else if !query_normalized.is_empty() && line_normalized.contains(&query_normalized) {
             score += 80;
         }
-        if !query_normalized.is_empty() && line_normalized.contains(&query_normalized) {
-            score += 55;
-        }
+
         if regex.map(|regex| regex.is_match(line)).unwrap_or(false) {
             score += 90;
         }
+
+        // Sub-phrase matches (e.g. "direct edits")
+        for (phrase, norm) in &sub_phrases {
+            if line_lower.contains(phrase) {
+                score += 85;
+            } else if !norm.is_empty() && line_normalized.contains(norm) {
+                score += 65;
+            }
+        }
+
+        // Distinct terms matching on this line
         let term_matches = terms
             .iter()
             .filter(|term| {
@@ -2699,18 +2733,23 @@ fn collect_content_hits(
                     || line_normalized.contains(&normalize_identifier(term))
             })
             .count();
-        if term_matches == 0 && score == 0 {
-            continue;
+
+        if term_matches >= 2 {
+            score += (term_matches as i64) * 25;
+        } else if term_matches == 1 && score == 0 {
+            score += 5;
         }
-        score += (term_matches as i64) * 12;
+
         if !terms.is_empty() && term_matches == terms.len() {
             score += 40;
         }
+
         for term in terms {
             if path_lower.contains(term) {
                 score += 4;
             }
         }
+
         if line_lower.contains("class")
             || line_lower.contains("function")
             || line_lower.contains("const")
@@ -2719,8 +2758,12 @@ fn collect_content_hits(
             score += 3;
         }
 
-        let start_idx = idx.saturating_sub(4);
-        let end_idx = (idx + 4).min(lines.len().saturating_sub(1));
+        if score == 0 {
+            continue;
+        }
+
+        let start_idx = idx.saturating_sub(6);
+        let end_idx = (idx + 6).min(lines.len().saturating_sub(1));
         push_or_merge_content_hit(
             ContentHit {
                 path: path.to_string(),
@@ -2739,6 +2782,7 @@ fn push_or_merge_content_hit(hit: ContentHit, hits: &mut Vec<ContentHit>) {
         existing.path == hit.path
             && existing.start_line <= hit.end_line
             && hit.start_line <= existing.end_line
+            && existing.end_line.max(hit.end_line).saturating_sub(existing.start_line.min(hit.start_line)) <= 75
     }) {
         existing.start_line = existing.start_line.min(hit.start_line);
         existing.end_line = existing.end_line.max(hit.end_line);
@@ -2910,6 +2954,52 @@ mod tests {
 
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].path, "src/AiChat.tsx");
+    }
+
+    #[test]
+    fn content_search_sub_phrase_matches_and_outscores_single_term_repetition() {
+        let aichat_content = [
+            "  <button",
+            "    type=\"button\"",
+            "    onClick={toggleAutoApply}",
+            "    title=\"Direct Edits: approved patches are automatically written to disk\"",
+            "  >",
+            "    <span>{autoApply() ? \"⚡ Direct Edits\" : \"👁️ Review Edits\"}</span>",
+            "  </button>",
+        ]
+        .join("\n");
+
+        let gitpanel_content = [
+            "  <button type=\"button\" onClick={toggleOutputFormat}>Split</button>",
+            "  <button type=\"button\" onClick={handleCopyDiff}>Copy</button>",
+            "  <button type=\"button\" onClick={refreshGitStatus}>Refresh</button>",
+        ]
+        .join("\n");
+
+        let mut aichat_hits = Vec::new();
+        collect_content_hits(
+            "src/AiChat.tsx",
+            &aichat_content,
+            &search_terms("direct edits button"),
+            None,
+            "direct edits button",
+            &mut aichat_hits,
+        );
+
+        let mut gitpanel_hits = Vec::new();
+        collect_content_hits(
+            "src/GitPanel.tsx",
+            &gitpanel_content,
+            &search_terms("direct edits button"),
+            None,
+            "direct edits button",
+            &mut gitpanel_hits,
+        );
+
+        assert!(!aichat_hits.is_empty());
+        assert!(!gitpanel_hits.is_empty());
+        assert!(aichat_hits[0].score > gitpanel_hits[0].score * 3);
+        assert_eq!(aichat_hits[0].path, "src/AiChat.tsx");
     }
 
     #[test]
